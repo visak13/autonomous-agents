@@ -1,0 +1,448 @@
+/* (c) Spec-definition chat surface — a distinct full workspace view. */
+.spec-surface {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-app);
+}
+
+.spec-surface-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+.spec-surface-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  color: var(--text-primary);
+}
+.spec-surface-sub {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.spec-surface-back {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.spec-surface-back:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.spec-surface-back:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- landing: define-new form + re-open list, side by side --- */
+.spec-landing {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 440px) minmax(0, 1fr);
+  gap: var(--space-5);
+  align-content: start;
+  padding: var(--space-6);
+}
+@media (max-width: 900px) {
+  .spec-landing { grid-template-columns: minmax(0, 1fr); }
+}
+
+.spec-open-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+/* --- open-session form --- */
+.spec-open {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+.spec-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.spec-field-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.spec-field-input {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-ui);
+}
+.spec-field-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* --- conversation layout: transcript + draft preview --- */
+.spec-convo {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.spec-convo-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-4);
+  border-right: 1px solid var(--border-subtle);
+  gap: var(--space-3);
+}
+.spec-transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.spec-hint {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.spec-bubble {
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  max-width: 92%;
+}
+.spec-user {
+  align-self: flex-end;
+  background: var(--bubble-user);
+}
+.spec-agent {
+  align-self: flex-start;
+  background: var(--bubble-agent);
+}
+.spec-bubble-role {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin-bottom: var(--space-1);
+}
+.spec-bubble-body {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.spec-bubble.thinking .spec-bubble-body {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.spec-composer {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-end;
+}
+.spec-composer-input {
+  flex: 1;
+  resize: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  padding: var(--space-3);
+}
+.spec-composer-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.spec-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.spec-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.spec-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.spec-primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.spec-secondary {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.spec-secondary:hover { color: var(--text-primary); }
+
+.spec-danger {
+  background: transparent;
+  color: var(--status-failed);
+  border: 1px solid var(--status-failed);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.spec-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--status-failed) 12%, transparent);
+}
+.spec-danger:disabled { opacity: 0.5; cursor: not-allowed; }
+.spec-danger:focus-visible { outline: 2px solid var(--status-failed); outline-offset: 2px; }
+
+.spec-error {
+  color: var(--status-failed);
+  font-size: var(--text-sm);
+  margin: var(--space-1) 0 0;
+}
+
+/* --- draft preview pane --- */
+.spec-draft {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-4);
+  background: var(--bg-surface);
+  overflow-y: auto;
+  gap: var(--space-3);
+}
+.spec-draft-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+.spec-draft-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.spec-draft-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.spec-draft-name {
+  margin: 0;
+  font-size: var(--text-md);
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+.spec-draft-round {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.spec-draft-desc {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.spec-draft-section {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.spec-draft-markdown {
+  margin: 0;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.spec-draft-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.spec-banner {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+.spec-banner-ok {
+  color: var(--status-done);
+  background: color-mix(in srgb, var(--status-done) 12%, transparent);
+}
+.spec-banner-muted {
+  color: var(--text-muted);
+  background: var(--bg-surface-2);
+}
+
+@media (max-width: 900px) {
+  .spec-convo { grid-template-columns: minmax(0, 1fr); }
+  .spec-draft { display: none; }
+}
+
+/* =========================================================================
+   (s4/RC7) RE-EDITABLE surface — the registered-spec list + the re-open editor
+   ========================================================================= */
+
+/* --- the "pick a spec to re-open" list --- */
+.spec-registered {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.spec-reg-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.spec-reg-row {
+  width: 100%;
+  text-align: left;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "name source"
+    "desc desc";
+  gap: var(--space-1) var(--space-3);
+  align-items: baseline;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.spec-reg-row:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-elevated);
+}
+.spec-reg-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.spec-reg-name {
+  grid-area: name;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.spec-reg-desc {
+  grid-area: desc;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.spec-reg-source {
+  grid-area: source;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* --- the re-open editor (direct PUT edit) --- */
+.spec-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-5) var(--space-6);
+  overflow-y: auto;
+}
+.spec-editor-error {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+.spec-editor-body {
+  flex: 1;
+  min-height: 0;
+  width: min(820px, 100%);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.spec-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.spec-editor-meta {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.spec-field-grow {
+  flex: 1;
+  min-height: 0;
+}
+.spec-editor-textarea {
+  flex: 1;
+  min-height: 240px;
+  resize: vertical;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: var(--space-3);
+  white-space: pre;
+  overflow: auto;
+}
+.spec-editor-textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.spec-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.spec-editor-dirty {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}

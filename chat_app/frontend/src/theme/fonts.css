@@ -1,0 +1,30 @@
+/*
+ * Self-hosted English webfonts (NO Japanese serifs — spec constraint).
+ *
+ * Both are LATIN-SUBSET VARIABLE woff2 (one file spans the whole weight axis),
+ * served from the SPA's own /static/fonts/ dir (copied verbatim from
+ * frontend/public/fonts by Vite — see vite.config base="/static/"). Self-hosted
+ * so the app needs no third-party origin at runtime; font-display:swap so text
+ * paints immediately in the fallback and swaps with zero blocking.
+ *
+ *  - Fraunces : a sturdy, high-contrast English display serif for headings.
+ *               Used at HEAVIER weights (600-700) so titles stay crisp over the
+ *               textured watercolour wash (favour weight over delicate strokes).
+ *  - Inter    : a highly-readable English grotesque for body + UI, run a little
+ *               heavier (450-600) for the same reason.
+ */
+@font-face {
+  font-family: "Inter";
+  src: url("/static/fonts/inter-latin-wght.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Fraunces";
+  src: url("/static/fonts/fraunces-latin-wght.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}

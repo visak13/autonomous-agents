@@ -1,0 +1,25 @@
+{
+  "name": "reactive-agents-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Claude-Code-like SPA shell for the ReactiveAgents chat app (task chat + live PLAN/DAG view + inline/downloadable artifacts), consuming the decoupled non-freezing backend.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.7",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.3"
+  }
+}

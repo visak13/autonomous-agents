@@ -1,0 +1,27 @@
+[project]
+name = "llm-framework"
+version = "0.1.0"
+description = "Standalone phi4-mini LLM framework (transport layer). Zero Claude in runtime."
+requires-python = ">=3.11"
+# Dependency-light by design: httpx for HTTP + the OpenTelemetry *API* only
+# (s6/b1 transport span instrumentation). Token counting uses an in-repo
+# heuristic estimator (llm_framework.tokens) to AVOID tiktoken — which
+# downloads encoder model files on first use. See d10 (lean for phi's context).
+#
+# opentelemetry-api is the tracing *interface* only (no SDK/exporter); the
+# transport attaches to the GLOBAL provider that agent_runtime.tracing (a1)
+# builds + registers, so it never constructs a second provider and never
+# back-imports agent_runtime (which would cycle: agent_runtime -> llm_framework).
+# Tracing degrades to a no-op if even the api is absent, so the framework still
+# runs on httpx alone.
+dependencies = [
+    "httpx>=0.27",
+    "opentelemetry-api>=1.42.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_framework"]

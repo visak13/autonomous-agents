@@ -1,0 +1,62 @@
+# =============================================================================
+# DEEP-RESEARCH shape (blueprint §2a/§2c/§2d, decision d2/d5)
+# =============================================================================
+# A FIXED, BOUNDED plan shape the planner SELECTS (it is NOT an open critic-gated
+# loop). It is the local-Gemma port of eda-base3's research-synthesize, iterated
+# to depth with an added critic role.
+#
+# Mechanics (user-specified):
+#   * The SAME specialization is reused across EVERY round; only the node ROLE
+#     differs (role-prompt template + per-role output schema — see roles.py).
+#   * Each non-final round = {research node + critic node}.
+#   * The FINAL round = {research node + synthesis node + verify node}.
+#   * Each round gains VISIBILITY into all previously-researched layers.
+#   * The LOOP COUNT is bounded by max_iter (the SHAPE), NOT by the critic's
+#     verdict. The critic's verdict is recorded but never terminates the loop.
+#
+# This file is the DECLARATIVE definition the runtime READS and HONORS. It is a
+# plain, human-editable text file (TOML); the s4 "Shapes" UI lists it and lets the
+# user override `max_iter` (persisted in shared SQLite). The GENERIC
+# `agent_runtime.shapes.unroll_shape` UNROLLS this template into a bounded ACYCLIC
+# role-tagged DAG (each round's nodes depend on every prior node → growing
+# visibility into all earlier layers), which the SAME generic AgentRuntime then
+# executes like any other DAG — so the "cyclic" shape never violates the PlanDAG
+# acyclic invariant AND there is no per-shape executor (adding a cyclic shape is
+# adding one text file; a3 re-architecture).
+
+name = "deep-research"
+description = """Iterative depth-first research: ~9 rounds of {research + critic} \
+then 1 final round of {research + synthesis + verify}. ONE specialization reused \
+across all rounds, behaviour set only by node role; each round sees all prior \
+researched layers; bounded by max_iter (not the critic)."""
+
+# UI-OVERRIDABLE CEILING (d5). Default ≈10 rounds = 9×{research+critic} + 1 final
+# round of {research+synthesis+verify}. The s4 Shapes screen persists an override
+# in SQLite; the runtime honors the effective value (override if set, else this).
+max_iter = 10
+
+# Absolute safety bound the runtime NEVER exceeds, no matter what the UI sets —
+# protects the shared GPU from a runaway override.
+hard_cap = 24
+
+# EXECUTION discipline: this shape is UNROLLED (it declares round_roles/final_roles)
+# into a bounded acyclic role-tagged DAG with growing-visibility edges, then run by
+# the generic AgentRuntime. The "deep-research" token marks it as the cyclic family
+# (the router keys off round_roles/final_roles, not this name); once unrolled the
+# edges serialise the rounds, so the dispatch mode is immaterial.
+execution = "deep-research"
+
+# Node roles emitted each NON-FINAL round, in order. Both run the SAME spec.
+round_roles = ["research", "critic"]
+
+# Node roles emitted in the SINGLE FINAL round, in order (replaces the last
+# round's {research, critic} with {research, synthesis, verify}).
+final_roles = ["research", "synthesis", "verify"]
+
+# EDGE POLICY is generic + fixed (not per-shape): `unroll_shape` makes every node
+# depend on EVERY previously-authored node, so the rounds run in order and each
+# node's inputs carry all earlier layers (findings + critic follow-ups) — full
+# growing visibility, acyclic by construction. Nothing to declare here, which keeps
+# the on-disk shape format minimal + schema-friendly (d14): a cyclic shape is fully
+# described by { name, description, max_iter, hard_cap, round_roles, final_roles,
+# execution } — a clean structure a structured-output call could later generate.

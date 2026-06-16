@@ -1,0 +1,48 @@
+# ===========================================================================
+# Custom Ollama Modelfile — ReactiveAgents runtime model
+# Base: gemma4:e2b-it-qat (Google Gemma 4 edge E2B, int4 QAT -> GGUF Q4_0)
+# Tuned on the RTX 4050 Laptop GPU (6 GB) per s8/a2 measurements.
+# Build:  ollama create gemma4-e2b-agent -f Modelfile.gemma4-e2b-agent
+# ===========================================================================
+FROM gemma4:e2b-it-qat
+
+# --- Context window --------------------------------------------------------
+# 8192 is ample for the chat + plan-DAG calls. This model uses sliding-window
+# attention (only 3 of 35 layers keep a global KV cache), so context is CHEAP
+# on VRAM: measured size_vram only 1.438 GiB @4K and 1.559 GiB @128K (f16 KV).
+# The full 131072 max would still fit with ~4.4 GiB headroom if ever needed.
+PARAMETER num_ctx 8192
+
+# --- Deterministic structured output --------------------------------------
+# temperature 0 measured 8/8 valid JSON AND 8/8 valid plan-DAG on the real
+# planner prompt (think disabled). top_p/top_k kept at gemma's sane bounds.
+PARAMETER temperature 0
+PARAMETER top_p 0.95
+PARAMETER top_k 64
+PARAMETER repeat_penalty 1.0
+
+# --- Output budget ---------------------------------------------------------
+# With THINKING DISABLED (the runtime passes the API field think=false on
+# structured calls) the planner JSON is ~376 eval tokens; 1024 is a safe
+# content ceiling. NOTE: if a call ENABLES thinking (think=true) for richer
+# plans, it must raise the per-request num_predict to ~4096 to fit the
+# chain-of-thought trace before the JSON content — otherwise the CoT runs past
+# the cap and the content comes back EMPTY (the s8/a2 root-cause).
+PARAMETER num_predict 1024
+
+# --- System prompt ---------------------------------------------------------
+# Neutral fallback only. The ReactiveAgents runtime sends its OWN system
+# message per task (planner factory description / composed spec rulesets),
+# which Ollama uses in preference to this default — so this is just a sane
+# baseline for a bare /api/generate call and does NOT fight the agent.
+SYSTEM """You are the local reasoning model for the ReactiveAgents app. Be precise and follow the caller's output-format instructions exactly."""
+
+# --- Runtime knobs that are NOT Modelfile params (set by server/transport) --
+# * think=false  -> request field on /api/chat (disables CoT for structured
+#                   output; the decisive agentic-fitness lever). Not bakeable.
+# * keep_alive   -> request field or OLLAMA_KEEP_ALIVE env; use "30m" or -1 to
+#                   keep the model warm (cold load ~8-10 s -> warm TTFT ~0.38 s).
+# * Server env (set on `ollama serve`): OLLAMA_FLASH_ATTENTION=1,
+#   OLLAMA_NUM_PARALLEL=1, OLLAMA_MAX_LOADED_MODELS=1. Leave KV cache at the
+#   default f16 (q8_0/q4_0 gave NO VRAM benefit on this SWA model and cost ~5%
+#   tok/s).

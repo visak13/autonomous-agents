@@ -1,0 +1,12 @@
+# =============================================================================
+# iterative-deep-research shape — AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION by the
+# local Gemma model (d14(2)); the user never hand-writes this file. The runtime
+# loads it via agent_runtime.shapes.load_shapes like any built-in shape.
+# =============================================================================
+name = "iterative-deep-research"
+description = "Iteratively research a topic in depth across several rounds. In each round, a research node digs deeper and a critic node checks the findings and rejects shallow source-list summaries, leading to a final round of research, synthesis, and verification."
+execution = "deep-research"
+max_iter = 4
+hard_cap = 24
+round_roles = ["research", "critic"]
+final_roles = ["research", "synthesis", "verify"]

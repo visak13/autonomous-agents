@@ -1,0 +1,35 @@
+[project]
+name = "specialization"
+version = "0.1.0"
+description = "Specialization engine: compiled-spec model + d10-split on-disk registry (planner-facing index vs sub-agent loader). In-process, dependency-light (d2/d10)."
+requires-python = ">=3.11"
+# Dependency-light by design (d10): a compiled spec is just a markdown-with-
+# frontmatter doc on disk and the registry is a plain directory of those docs,
+# so the engine needs ZERO runtime dependencies — stdlib pathlib + a no-regex
+# frontmatter scanner (same house-style as memory.store) cover it. Add deps here
+# only when a real compile/research path needs them.
+#
+# d11: uv WORKSPACE MEMBER with NO isolated .venv. It resolves into the single
+# shared root .venv (C:\Projects\ReactiveAgents\.venv) so it imports
+# llm_framework / reactive_tools / memory in the same in-process interpreter (d2).
+#
+# reactive-tools: the WEB-RESEARCH path (research.py) reuses the free no-key
+# web_search/web_fetch tools through the ToolHook (d6). The import is LAZY
+# (only build_research_hook pulls it in), so the engine still imports — and is
+# unit-tested against a mock — with no network; the declared dep keeps the
+# workspace graph honest (d11).
+# llm-framework: the COMPILER (compiler.py) drives the real llm_framework chain
+# (build_default_chain) to condense a spec body — offline via FakeTransport by
+# default (d7), live phi via OllamaTransport deferred. Declared so the d11
+# workspace graph is honest; both resolve into the one shared root .venv.
+dependencies = [
+    "reactive-tools",
+    "llm-framework",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["specialization"]

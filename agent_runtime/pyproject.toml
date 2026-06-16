@@ -1,0 +1,36 @@
+[project]
+name = "agent-runtime"
+version = "0.1.0"
+description = "Autonomous DAG-emitting planner + in-process agent runtime + self-heal (d2/d6/d10). Pluggable phi transport (stub offline / live Ollama)."
+requires-python = ">=3.11"
+# Dependency-light by design (d10): the planner is a single structured phi call
+# over a body-free factory+lookup context, the runtime is plain asyncio task
+# tracking, and self-heal is a bounded re-launch loop — all stdlib + the sibling
+# members. ZERO third-party runtime deps of its own.
+#
+# d11: uv WORKSPACE MEMBER with NO isolated .venv. It resolves into the single
+# shared root .venv (C:\Projects\ReactiveAgents\.venv) so it imports
+# llm_framework / reactive_tools / specialization in the SAME in-process
+# interpreter (d2 — one process).
+#
+# - llm-framework: the planner drives its Chain + structured_output (JSON repair)
+#   and the pluggable Transport (FakeTransport stub offline / OllamaTransport live).
+# - reactive-tools: the runtime publishes node lifecycle on the in-process
+#   EventPlane and invokes tools through the ToolHook (d2).
+# - specialization: the planner consumes the body-free SpecRegistry.index()
+#   lookup; a sub-agent loads its ONE compiled spec via SpecLoader (d10 split).
+dependencies = [
+    "llm-framework",
+    "openinference-semantic-conventions>=0.1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.42.1",
+    "opentelemetry-sdk>=1.42.1",
+    "reactive-tools",
+    "specialization",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_runtime"]

@@ -1,0 +1,12 @@
+# =============================================================================
+# iterative-writing-improvement shape — AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION by the
+# local Gemma model (d14(2)); the user never hand-writes this file. The runtime
+# loads it via agent_runtime.shapes.load_shapes like any built-in shape.
+# =============================================================================
+name = "iterative-writing-improvement"
+description = "Iteratively improve a piece of writing through drafting, reviewing, and synthesis cycles."
+execution = "deep-research"
+max_iter = 3
+hard_cap = 24
+round_roles = ["research", "critic"]
+final_roles = ["research", "synthesis", "verify"]

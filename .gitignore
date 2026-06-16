@@ -1,0 +1,16 @@
+# Secrets — NEVER commit. The SMTP/Gmail app-password lives in .env (a1, d7/d8).
+.env
+*.env
+.env.*
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Local runtime artifacts
+artifacts/
+var/
+evidence/

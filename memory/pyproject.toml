@@ -1,0 +1,26 @@
+[project]
+name = "memory"
+version = "0.1.0"
+description = "In-process memory: CPU-only all-MiniLM-L6-v2 (384d ONNX/int8) embedder + sqlite-vec store. No torch-GPU, no Ollama (d3)."
+requires-python = ">=3.11"
+# d3 / banned_options: memory embeds IN-PROCESS on CPU so it never contends with
+# phi4-mini on the shared GPU. fastembed gives a pure onnxruntime CPU path for
+# all-MiniLM-L6-v2 and pulls NO torch (measured: sentence-transformers+backend=
+# "onnx" drags the full torch stack; fastembed does not). sqlite-vec is the
+# in-process KNN store (house-style: in-process for small/medium corpora, no
+# standing vector-DB service). numpy is fastembed-transitive, pinned explicit.
+#
+# d11: uv WORKSPACE MEMBER with NO isolated .venv — resolves into the single
+# shared root .venv so it imports llm_framework / reactive_tools in one process.
+dependencies = [
+    "fastembed>=0.8",
+    "sqlite-vec>=0.1.9",
+    "numpy>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memory"]

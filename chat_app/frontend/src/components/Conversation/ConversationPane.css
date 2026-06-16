@@ -1,0 +1,214 @@
+.conversation {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  background: var(--bg-app);
+}
+
+.conversation-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.conversation-hint {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.conversation-error {
+  color: var(--status-failed);
+  font-size: var(--text-sm);
+  background: color-mix(in srgb, var(--status-failed) 12%, transparent);
+  border: 1px solid var(--status-failed);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.bubble {
+  max-width: 760px;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+}
+.bubble-user {
+  align-self: flex-end;
+  background: var(--bubble-user);
+}
+.bubble-agent {
+  align-self: flex-start;
+  background: var(--bubble-agent);
+}
+
+.bubble-role {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  /* a2 review fix: --text-muted (#6a6053) only reaches 4.28:1 on the apricot-tinted
+     --bubble-user, below WCAG-AA 4.5:1. --text-secondary lifts it to ~6.5:1 on the
+     user bubble (and raises night contrast too) — role labels are a heading-class
+     surface, so the stronger token is also the more semantic choice. */
+  color: var(--text-secondary);
+  margin-bottom: var(--space-1);
+}
+
+.bubble-body {
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.thinking .bubble-body {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.thinking-text {
+  margin-left: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: bounce 1.2s ease-in-out infinite;
+}
+.dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+/* composer */
+.composer-shell {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border-subtle);
+}
+/* The shell carries the one continuous top border; the lambda tab inside it
+ * provides only its internal separators, never a doubled top edge. */
+.composer-shell .lambda-tab {
+  border-top: none;
+}
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+  /* Reserve the bottom-right brain-overlay zone (CoT launcher is position:fixed
+   * ~space-5 from the right, 52px wide) so the Send button never sits UNDER it.
+   * Without this the launcher overlaps Send and intercepts a real pointer click
+   * (s7/a4 runtime-proof finding — trusted-click hit-test caught it). */
+  padding: var(--space-3) calc(var(--space-5) + 64px) var(--space-5) var(--space-5);
+  background: var(--bg-app);
+}
+.composer-input {
+  flex: 1;
+  resize: none;
+  min-height: 44px;
+  max-height: 160px;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  line-height: 1.4;
+}
+.composer-input::placeholder {
+  color: var(--text-muted);
+}
+.composer-send {
+  flex: 0 0 auto;
+  padding: var(--space-3) var(--space-5);
+  height: 44px;
+  border-radius: var(--radius-md);
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.composer-send:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.composer-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* empty state */
+.conversation-empty {
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+}
+.empty-card {
+  max-width: 460px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+.empty-logo {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--text-xl);
+  font-weight: 700;
+}
+.empty-card h1 {
+  margin: 0;
+  font-size: var(--text-xl);
+  color: var(--text-primary);
+}
+.empty-card p {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.empty-cta {
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-md);
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.empty-cta:hover {
+  background: var(--accent-hover);
+}
+
+@keyframes bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  50% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}

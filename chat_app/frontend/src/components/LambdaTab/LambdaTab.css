@@ -1,0 +1,146 @@
+/* (b) Lambda tab — collapsible, read-only, sits in the chat-input header. */
+.lambda-tab {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.lambda-tab-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  text-align: left;
+}
+.lambda-tab-toggle:hover {
+  color: var(--text-primary);
+}
+.lambda-tab-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.lambda-tab-glyph {
+  font-weight: 700;
+  color: var(--accent);
+}
+.lambda-tab-label {
+  font-weight: 600;
+}
+.lambda-tab-count {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--space-2);
+}
+.lambda-tab-chevron {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.lambda-tab-panel {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-4) var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface-2);
+}
+
+.lambda-tab-note {
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-style: italic;
+}
+.lambda-tab-hint {
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.lambda-tab-error {
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+  color: var(--status-failed);
+}
+
+.lambda-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.lambda-row {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-surface);
+}
+.lambda-row[data-status="closed"] {
+  opacity: 0.6;
+}
+
+.lambda-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.lambda-row-label {
+  font-weight: 600;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lambda-row-status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+}
+.lambda-active {
+  color: var(--status-done);
+  background: color-mix(in srgb, var(--status-done) 14%, transparent);
+}
+.lambda-closed {
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+}
+
+.lambda-row-observes {
+  margin-top: var(--space-1);
+}
+.lambda-row-observes code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.lambda-row-meta {
+  margin-top: var(--space-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.lambda-meta-chip {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--space-2);
+  font-family: var(--font-mono);
+}

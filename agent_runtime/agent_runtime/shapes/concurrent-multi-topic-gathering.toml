@@ -1,0 +1,8 @@
+# =============================================================================
+# concurrent-multi-topic-gathering shape — AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION by the
+# local Gemma model (d14(2)); the user never hand-writes this file. The runtime
+# loads it via agent_runtime.shapes.load_shapes like any built-in shape.
+# =============================================================================
+name = "concurrent-multi-topic-gathering"
+description = "Gather information on several different topics simultaneously, with each topic handled by an independent, concurrent node, and then combine all gathered information into a single summary and email it."
+execution = "concurrent"

@@ -1,0 +1,32 @@
+# =============================================================================
+# MODULAR-PARALLEL shape (blueprint §2a, decision d5) — the local-Gemma port of
+# eda-base3's `modular` plan shape.
+# =============================================================================
+# A FIXED execution DISCIPLINE the planner SELECTS when a query decomposes into
+# INDEPENDENT sub-tasks that can make progress at the same time. The planner
+# authors the nodes + their `depends_on` edges (the DAG is model-derived, d6);
+# this shape governs HOW the runtime dispatches them:
+#
+#   * CONCURRENT: EVERY ready node launches at once. On each turn the runtime
+#     dispatches the WHOLE wave of nodes whose dependencies are all done — they
+#     run together as tracked asyncio tasks on the one shared event loop (d2),
+#     bounded only by the runtime's `max_concurrency` (so a fan-out can never
+#     swamp the single shared GPU). `depends_on` edges still order dependent
+#     steps; only INDEPENDENT ready nodes overlap.
+#
+# This is the right shape for "do A, B and C, then combine" style queries. For a
+# chain where each step needs the previous one, the planner selects `linear`.
+#
+# The readiness gate + wave-dispatch FSM are a PURE-PYTHON port of eda-base3's
+# `fsm/plan_fsm.py` (`_first_ready_action` + `plan_next_action`) — see
+# `agent_runtime/scheduler.py`. No model call drives the dispatch; Gemma only
+# SELECTS the shape (see `agent_runtime/shape_selector.py`).
+
+name = "modular-parallel"
+description = """Concurrent modular execution: independent ready steps run at the \
+same time, while `depends_on` edges still order dependent steps. Choose this when \
+the query splits into sub-tasks that can progress in parallel before being \
+combined."""
+
+# Wave dispatch — every independent ready node launches together.
+execution = "concurrent"

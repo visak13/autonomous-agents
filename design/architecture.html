@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>ReactiveAgents — Architecture Design Document &amp; Build Contract</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161c24; --panel2:#1c242f; --ink:#e6edf3; --muted:#9fb0c0;
+    --accent:#4fc3f7; --accent2:#7ee787; --warn:#f0883e; --danger:#ff7b72;
+    --line:#2a3441; --field:#0b0f14; --chip:#243140;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    padding:0 0 120px 0;
+  }
+  header.doc{
+    position:sticky; top:0; z-index:50;
+    background:linear-gradient(180deg,#10171f,#0f1419);
+    border-bottom:1px solid var(--line);
+    padding:18px 28px; display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  }
+  header.doc h1{font-size:19px; margin:0; letter-spacing:.2px}
+  header.doc .sub{color:var(--muted); font-size:13px}
+  .toolbar{margin-left:auto; display:flex; gap:8px; flex-wrap:wrap}
+  button{
+    background:var(--chip); color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 14px; font-size:13px; cursor:pointer;
+  }
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent); color:#04141d; border-color:var(--accent); font-weight:600}
+  button.good{background:var(--accent2); color:#06210f; border-color:var(--accent2); font-weight:600}
+  .wrap{max-width:1080px; margin:0 auto; padding:24px 28px}
+  .lede{color:var(--muted); margin:6px 0 22px}
+  section.sub{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    margin:18px 0; overflow:hidden;
+  }
+  .sub-head{
+    display:flex; align-items:flex-start; gap:14px; padding:16px 20px;
+    background:var(--panel2); border-bottom:1px solid var(--line); cursor:pointer;
+  }
+  .num{
+    flex:0 0 34px; height:34px; width:34px; border-radius:9px;
+    background:var(--accent); color:#04141d; font-weight:700;
+    display:flex; align-items:center; justify-content:center; font-size:15px;
+  }
+  .sub-title{font-size:16px; font-weight:650; margin:0}
+  .sub-why{color:var(--muted); font-size:13px; margin:4px 0 0}
+  .decisions{margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end}
+  .chip{
+    background:var(--chip); border:1px solid var(--line); color:var(--accent);
+    border-radius:999px; padding:2px 10px; font-size:11px; white-space:nowrap;
+  }
+  .chip.warn{color:var(--warn)}
+  .sub-body{padding:18px 20px; display:block}
+  .sub-body.collapsed{display:none}
+  .grid{display:grid; grid-template-columns:1fr; gap:16px}
+  .field{display:flex; flex-direction:column; gap:6px}
+  .field label{font-size:13px; color:var(--muted); font-weight:600; letter-spacing:.2px}
+  .field .hint{font-size:12px; color:#7d8d9c; font-weight:400}
+  input[type=text], textarea, select{
+    background:var(--field); color:var(--ink); border:1px solid var(--line);
+    border-radius:9px; padding:10px 12px; font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;
+    width:100%; resize:vertical;
+  }
+  textarea{min-height:78px}
+  input:focus,textarea:focus,select:focus{outline:none; border-color:var(--accent)}
+  .agree{display:flex; align-items:center; gap:8px; margin-top:6px; font-size:13px; color:var(--muted)}
+  .agree input{width:16px; height:16px; accent-color:var(--accent2)}
+  .ref{
+    background:#0c1218; border:1px dashed var(--line); border-radius:10px;
+    padding:12px 14px; font-size:12.5px; color:var(--muted); margin-top:4px;
+  }
+  .ref b{color:var(--ink)}
+  .ledger{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px 20px; margin:18px 0;
+  }
+  .ledger h2{margin:0 0 10px; font-size:16px}
+  .ledger ul{margin:0; padding-left:18px}
+  .ledger li{margin:6px 0; color:var(--muted); font-size:13.5px}
+  .ledger li b{color:var(--ink)}
+  .superseded{color:var(--danger); text-decoration:line-through; opacity:.8}
+  .banned li{color:var(--danger)}
+  .pill{display:inline-block; background:#221a12; border:1px solid var(--warn); color:var(--warn);
+    border-radius:6px; padding:1px 7px; font-size:11px; margin-left:6px}
+  .signoff{
+    background:linear-gradient(180deg,#13251a,#0f1c14); border:1px solid var(--accent2);
+    border-radius:14px; padding:22px 24px; margin:26px 0;
+  }
+  .signoff h2{margin:0 0 6px; color:var(--accent2)}
+  .signoff .row{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px}
+  .status{
+    position:fixed; bottom:0; left:0; right:0; background:#0c1218; border-top:1px solid var(--line);
+    padding:10px 28px; font-size:12.5px; color:var(--muted); display:flex; gap:18px; align-items:center; z-index:60;
+  }
+  .status .dot{height:9px; width:9px; border-radius:50%; background:var(--warn)}
+  .status .dot.ok{background:var(--accent2)}
+  code{background:#0c1218; border:1px solid var(--line); border-radius:5px; padding:1px 6px; font-size:12.5px; color:var(--accent2)}
+  .muted{color:var(--muted)}
+  .twocol{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  /* d9 / d10 — the user's sharpest corrections: make these visually unmistakable */
+  section.sub.highlight{border:2px solid var(--accent2); box-shadow:0 0 0 1px var(--accent2) inset, 0 8px 30px rgba(126,231,135,.08)}
+  section.sub.highlight .sub-head{background:linear-gradient(180deg,#15271b,#13201a)}
+  section.sub.highlight .num{background:var(--accent2); color:#06210f}
+  .badge-key{
+    display:inline-block; background:#13251a; border:1px solid var(--accent2); color:var(--accent2);
+    border-radius:6px; padding:1px 9px; font-size:11px; font-weight:700; margin-top:6px; letter-spacing:.3px;
+  }
+  @media(max-width:760px){.twocol,.signoff .row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="doc">
+  <div>
+    <h1>ReactiveAgents — Architecture Design Document <span class="muted">/ Build Contract</span></h1>
+    <div class="sub">A standalone, in-process, phi4-mini–powered multi-agent system. Edit every field, agree to each subsystem, then sign off.</div>
+  </div>
+  <div class="toolbar">
+    <button onclick="expandAll(true)">Expand all</button>
+    <button onclick="expandAll(false)">Collapse all</button>
+    <button class="primary" onclick="saveDoc()">Save draft</button>
+    <button class="good" onclick="exportDoc()">Export agreed contract (JSON)</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <p class="lede">
+    This document is the <b>build contract</b>: the design is locked only when you have read, optionally edited, and
+    <b>agreed</b> to each of the nine subsystems below, and then signed off at the bottom. Every field is editable —
+    type your changes directly. Nothing here calls the network; the page works fully offline. Drafts persist in your
+    browser (localStorage); the green <b>Export</b> button writes a JSON snapshot of the agreed contract you can hand back.
+  </p>
+
+  <!-- ===================== DECISION LEDGER (read-only reference) ===================== -->
+  <div class="ledger">
+    <h2>Decision ledger — active &amp; load-bearing (read-only reference)</h2>
+    <ul>
+      <li><b>d1</b> — Runtime is <b>pure phi4-mini</b> (Ollama <code>http://localhost:11435</code>, OpenAI-compatible + native API) for ALL reasoning/planning. <b>Zero Claude</b> in the agent runtime; the agent is standalone.</li>
+      <li><b>d2</b> — Concurrency is <b>in-process</b>: lightweight RxPY/asyncio reactive layer (NOT eda-base3's broker/pool HTTP services). Agents launched &amp; tracked in-process as tasks/coroutines (NOT claude.exe shell-forking).</li>
+      <li><b>d3</b> — Memory uses an <b>in-process CPU embedder</b> all-MiniLM-L6-v2 (384d, ONNX/int8) + sqlite-vec; structure-first then hybrid BM25+dense, RRF-fused. <b>Forbidden:</b> Ollama/nomic embeddings (GPU thrash vs phi4-mini).</li>
+      <li><b>d4</b> — Token discipline is <b>Claude-Code-style context management</b> (in-window + auto-compaction + manual compact), NOT a hard per-call pass/fail gate. Served by selective recall &amp; the context-scoping principle (d10).</li>
+      <li class="superseded"><b>d5</b> — (SUPERSEDED by d9) auto-compile of specializations. <span class="pill">do NOT reflect d5</span></li>
+      <li><b>d6</b> — Planner autonomy: the planner builds its <b>own DAG</b> (e.g. research→write-md→write-html) with no hard-coded task prompts; web access is free, no-key (DuckDuckGo HTML search + page fetch/extract).</li>
+      <li><b>d7</b> — Build order &amp; acceptance: (1) this interactive HTML design doc, user-agreed FIRST; (2) core phi library; (3) reactive+tool, memory, specialization engine, planner+runtime; (4) full chat UI; (5) end-to-end demo. <b>Adapt-bar:</b> the agent autonomously trains TWO specializations (markdown + html) and writes a detailed report on one topic via each (research→write→write, planner-chosen).</li>
+      <li><b>d8</b> — Host constraints (Windows): Python+uv per-component <code>.venv</code>; verify gates are file-based / runtime-capture only (never shell-command gates); never name/image-wide python/node kills (stop only specific PIDs you started); GPU is shared — CPU embeddings + Ollama keep_alive unload to avoid contention.</li>
+      <li><b>d9</b> — Specialization lifecycle (corrects d5): the <b>UI defines</b> a specialization → it <b>web-researches the "how"</b> → <b>user-approval compile gate</b> (HITL, not silent auto-compile) → compiled spec stored in a <b>lookup/registry</b>, reused later by sub-agents. No learnings flowback.</li>
+      <li><b>d10</b> — <b>Context-scoping = memory optimization.</b> The planner is aware ONLY of the abstract factory + the specialization <b>lookup index</b> (never full spec bodies or heavy phased prompts). Each launched sub-agent is aware ONLY of its task + the single compiled spec it loads. Keeps phi's small window lean while the task still completes autonomously.</li>
+    </ul>
+  </div>
+
+  <div class="ledger banned">
+    <h2 style="color:var(--danger)">Rejected options (banned — must not appear in the design)</h2>
+    <ul class="banned">
+      <li>Reproducing eda-base3's broker/pool HTTP microservices and claude.exe shell-forking spawn model — this is a single-host, single-process standalone app; in-process RxPY + in-process agent tasks are lighter and match "launch agents and track them, not multiple shells."</li>
+      <li>Ollama-hosted (nomic-embed-text) embeddings for memory — phi4-mini and nomic offload each other on the shared GPU (thrash); CPU MiniLM in-process eliminates the contention.</li>
+    </ul>
+    <div class="ref" style="margin-top:12px">
+      <b>Read-only grounding:</b> eda-base3's <i>skills-architecture</i> is referenced ONLY for the
+      <b>specialization-lookup + role-scoped-context</b> pattern (d9/d10). ReactiveAgents is a STANDALONE,
+      non-coding, real-world-data agent — <b>not</b> a clone of the Claude-Code harness. Do not import its broker/pool/shell model.
+    </div>
+  </div>
+
+  <div id="sections"></div>
+
+  <!-- ===================== SIGN-OFF ===================== -->
+  <div class="signoff" id="signoff">
+    <h2>✓ Approval &amp; sign-off — locks the build contract</h2>
+    <p class="muted" style="margin:4px 0 0">
+      The build proceeds to step (2) — the core phi library — only after this is signed. By signing you agree the nine
+      subsystems above (as edited) are the contract. <b id="agreeCount">0 / 9</b> subsystems currently marked agreed.
+    </p>
+    <div class="row">
+      <div class="field">
+        <label>Approver name</label>
+        <input type="text" id="approver" placeholder="Your name" />
+      </div>
+      <div class="field">
+        <label>Date</label>
+        <input type="text" id="approveDate" placeholder="YYYY-MM-DD" />
+      </div>
+    </div>
+    <div class="field" style="margin-top:14px">
+      <label>Outstanding changes / conditions of approval <span class="hint">(optional — anything still to adjust)</span></label>
+      <textarea id="approveNotes" placeholder="e.g. 'Agreed, but raise the compaction threshold default to 6000 tokens.'"></textarea>
+    </div>
+    <div class="agree" style="margin-top:14px">
+      <input type="checkbox" id="finalAgree" />
+      <label for="finalAgree" style="color:var(--ink); font-weight:600">
+        I have reviewed and AGREE to this architecture as the build contract for ReactiveAgents.
+      </label>
+    </div>
+    <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap">
+      <button class="good" onclick="signOff()">Sign off &amp; lock</button>
+      <button onclick="exportDoc()">Export agreed contract (JSON)</button>
+    </div>
+    <div id="signResult" class="ref" style="display:none; margin-top:14px"></div>
+  </div>
+</div>
+
+<div class="status">
+  <span class="dot" id="saveDot"></span>
+  <span id="saveState">Unsaved draft</span>
+  <span class="muted">·</span>
+  <span id="agreeState">0 / 9 subsystems agreed</span>
+  <span class="muted">·</span>
+  <span class="muted">Self-contained · offline · no network calls</span>
+</div>
+
+<script>
+// ============================================================================
+// ReactiveAgents architecture design — subsystem model.
+// Each subsystem renders editable fields the user can change and agree to.
+// All state persists to localStorage; nothing touches the network.
+// ============================================================================
+const SUBSYSTEMS = [
+  {
+    id: "phi_framework",
+    title: "phi LLM framework — Spring-style chainable call pipeline",
+    why: "The core library every agent calls phi4-mini through. d1.",
+    decisions: ["d1"],
+    fields: [
+      {k:"endpoint", label:"phi endpoint", hint:"Ollama, OpenAI-compatible + native API", type:"text",
+       v:"http://localhost:11435  (model: phi4-mini; OpenAI-compat /v1 + native /api)"},
+      {k:"pipeline", label:"Chainable pipeline stages", hint:"Spring-style; each stage is composable & order-able", type:"area",
+       v:"1) prompt assembly\n2) structured-output parse/repair (JSON-schema + malformed-JSON repair)\n3) tool-hook (intercept tool calls)\n4) memory injection (selective recall into context)\n5) compaction (drop/summarize at threshold)"},
+      {k:"extend", label:"Runtime extensibility", hint:"Add stages WITHOUT editing the core", type:"area",
+       v:"Stages are lambdas registered at runtime: chain.use(lambda ctx: ...). New behavior (e.g. a custom guardrail) is added by appending a lambda; the core pipeline class is never touched. Lambda-chainable, like a Spring filter chain."},
+      {k:"keepalive", label:"GPU hygiene", hint:"d8 — shared GPU", type:"text",
+       v:"Ollama keep_alive set to unload phi when idle; embeddings stay on CPU (never on the GPU)."}
+    ]
+  },
+  {
+    id: "reactive_tools",
+    title: "In-process reactive layer + tool-hook",
+    why: "Lightweight event plane and the agent's hands. d2.",
+    decisions: ["d2"],
+    fields: [
+      {k:"plane", label:"Event plane", hint:"In-process only — NOT broker/pool HTTP", type:"area",
+       v:"Lightweight RxPY / asyncio event plane. subscribe() to streams (reasoning tokens, progress, tool events, agent lifecycle). Pure in-process pub/sub — no HTTP broker, no external services."},
+      {k:"tools", label:"Tool-hook surface", hint:"How the agent invokes tools", type:"area",
+       v:"read-file, write-file, web-search (free, no-key — DuckDuckGo HTML), web fetch/extract (page → clean text). Tools are invoked through the phi framework's tool-hook stage; results flow back on the reactive plane."},
+      {k:"websearch", label:"Web access constraint", hint:"d6 — no API keys, no paid tools", type:"text",
+       v:"Free no-key search (DuckDuckGo HTML) + page fetch/extract. No paid APIs, no keys."}
+    ]
+  },
+  {
+    id: "memory",
+    title: "Memory layer — CPU embeddings + hybrid recall",
+    why: "Durable facts + compaction summaries, recalled cheaply. d3.",
+    decisions: ["d3"],
+    fields: [
+      {k:"embedder", label:"Embedder", hint:"CPU only — zero GPU contention", type:"text",
+       v:"all-MiniLM-L6-v2 (384d, ONNX / int8), in-process on CPU. FORBIDDEN: Ollama/nomic embeddings."},
+      {k:"store", label:"Vector store", hint:"", type:"text", v:"sqlite-vec (single-file, in-process)"},
+      {k:"recall", label:"Recall strategy", hint:"structure-first, then hybrid", type:"area",
+       v:"Structure-first: filter by markdown frontmatter (e.g. type/tags/scope). Then hybrid retrieval: BM25 (lexical) + dense (MiniLM), RRF-fused into one ranked set. Selective — only the most relevant chunks injected into phi's window."},
+      {k:"sources", label:"Memory sources", hint:"two kinds", type:"area",
+       v:"1) Durable markdown-frontmatter facts (long-lived knowledge).\n2) Auto-compaction summaries (rolled-up conversation, see subsystem 7)."}
+    ]
+  },
+  {
+    id: "specialization",
+    title: "Specialization engine — define → research → approve → register",
+    why: "How an SME is created and reused. d9 (supersedes d5).",
+    decisions: ["d9"],
+    highlight: "d9 — SPECIALIZATION LIFECYCLE (sharpest correction)",
+    fields: [
+      {k:"define", label:"1 · Define (in the UI)", hint:"the user names the specialization", type:"area",
+       v:"The chat UI is where a specialization is DEFINED (e.g. 'markdown report writer', 'html report writer')."},
+      {k:"research", label:"2 · Research the 'how'", hint:"autonomous web research", type:"area",
+       v:"The specialization uses the web-search tool to research the 'how' — gathering the craft/rules for that stack autonomously (planner step 1)."},
+      {k:"gate", label:"3 · User-approval compile gate", hint:"HITL — NOT auto-compiled", type:"area",
+       v:"The compiled spec is produced ONLY when the USER APPROVES (human-in-the-loop compile gate). This corrects d5's silent auto-compile."},
+      {k:"registry", label:"4 · Register & reuse", hint:"lookup/registry; later steps", type:"area",
+       v:"The compiled specialization is stored in a lookup/registry. In LATER plan steps the planner calls a sub-agent with the compiled spec. No learnings flowback."}
+    ]
+  },
+  {
+    id: "planner",
+    title: "Autonomous planner — builds its own DAG",
+    why: "phi reasons out the task graph itself. d6.",
+    decisions: ["d6"],
+    fields: [
+      {k:"dag", label:"DAG construction", hint:"no hard-coded task prompts", type:"area",
+       v:"The planner reads the goal and constructs its OWN DAG (e.g. research → write-md → write-html). There are NO hard-coded task prompts — phi decides the steps and their dependencies, Claude-Code style."},
+      {k:"craft", label:"Prompting craft", hint:"guide, don't spoon-feed", type:"area",
+       v:"Use eda-base3-style prompting craft to make phi reason well, but do NOT spoon-feed it phased prompts. phi must reason autonomously."},
+      {k:"scope", label:"Planner context scope", hint:"d10 — minimal", type:"text",
+       v:"Planner sees ONLY the abstract factory + the specialization lookup INDEX — never full spec bodies (see subsystem 9)."}
+    ]
+  },
+  {
+    id: "runtime_selfheal",
+    title: "In-process agent runtime + self-heal",
+    why: "Agents run as tracked coroutines and repair themselves. d2.",
+    decisions: ["d2"],
+    fields: [
+      {k:"runtime", label:"Agent runtime", hint:"in-process, tracked — not shell-forked", type:"area",
+       v:"Agents run IN-PROCESS as tracked tasks/coroutines (registered & monitored), NOT as forked claude.exe shells. The runtime knows each agent's logical step and status."},
+      {k:"selfheal", label:"Self-heal loop", hint:"detect → correct → re-launch", type:"area",
+       v:"Detect a failed logical step → correct → re-launch THAT logic in-process. Examples: malformed-phi-JSON repair (re-prompt with the schema), re-plan on tool error. The faulty step is re-run, not the whole task."}
+    ]
+  },
+  {
+    id: "compaction",
+    title: "Claude-Code-style compaction",
+    why: "Keep the conversation in-window cheaply. d4.",
+    decisions: ["d4"],
+    fields: [
+      {k:"auto", label:"Auto-compaction", hint:"token threshold", type:"text",
+       v:"When the conversation crosses a token threshold, older turns are auto-summarized into a compaction summary (which becomes a memory source, subsystem 3)."},
+      {k:"manual", label:"Manual compact command", hint:"user-triggered", type:"text",
+       v:"A manual /compact command lets the user compact on demand."},
+      {k:"nogate", label:"Not a hard gate", hint:"d4", type:"text",
+       v:"Token management is in-window context management — NOT a per-call pass/fail gate that blocks work."}
+    ]
+  },
+  {
+    id: "chat_ui",
+    title: "Full chat UI — live stream, persisted history, artifacts",
+    why: "The human surface for the whole system. d7.",
+    decisions: ["d7"],
+    fields: [
+      {k:"stream", label:"Live stream", hint:"SSE of reasoning + progress", type:"area",
+       v:"Live SSE stream of phi's reasoning tokens and step/progress events (fed from the reactive plane, subsystem 2)."},
+      {k:"history", label:"Persisted history", hint:"re-openable", type:"area",
+       v:"Chat history is PERSISTED. Old chats are re-openable with their full history AND their artifacts intact."},
+      {k:"artifacts", label:"Artifacts", hint:"inline + downloadable", type:"area",
+       v:"Produced artifacts (e.g. the markdown & html reports) render INLINE in the chat and are DOWNLOADABLE."}
+    ]
+  },
+  {
+    id: "context_scoping",
+    title: "Context-scoping principle — strict role-scoped minimal context",
+    why: "The primary memory-optimization constraint across the system. d10.",
+    decisions: ["d10"],
+    highlight: "d10 — CONTEXT-SCOPING (sharpest correction)",
+    fields: [
+      {k:"planner_ctx", label:"Planner awareness", hint:"factory + lookup ONLY", type:"area",
+       v:"The PLANNER is aware ONLY of the abstract factory + the specialization LOOKUP (an index/registry of available specs by name/role). It NEVER holds full spec bodies or heavy phased prompts."},
+      {k:"agent_ctx", label:"Sub-agent awareness", hint:"task + one spec ONLY", type:"area",
+       v:"A launched SUB-AGENT is aware ONLY of the task at hand + the SINGLE compiled specialization it loads for that task. Nothing else enters its context."},
+      {k:"why", label:"Why (load-bearing)", hint:"serves d4 — small window", type:"area",
+       v:"eda-base3's phased prompts are heavy/redundant; that redundancy must NOT all live in memory. Strict role-scoped minimal context keeps phi's small window lean while the task still completes autonomously. This constraint shapes the LLM framework, planner, and agent runtime together."}
+    ]
+  }
+];
+
+const KEY = "reactiveagents.architecture.v1";
+const root = document.getElementById("sections");
+
+function render(){
+  root.innerHTML = "";
+  SUBSYSTEMS.forEach((s, i) => {
+    const sec = document.createElement("section");
+    sec.className = "sub" + (s.highlight ? " highlight" : "");
+    const chips = s.decisions.map(d => `<span class="chip">${d}</span>`).join("");
+    const badge = s.highlight ? `<div class="badge-key">★ ${escapeHtml(s.highlight)} — editable below</div>` : "";
+    let bodyFields = "";
+    s.fields.forEach(f => {
+      const idAttr = `${s.id}__${f.k}`;
+      const control = f.type === "area"
+        ? `<textarea id="${idAttr}" data-field>${escapeHtml(f.v)}</textarea>`
+        : `<input type="text" id="${idAttr}" data-field value="${escapeAttr(f.v)}" />`;
+      bodyFields += `
+        <div class="field">
+          <label>${escapeHtml(f.label)} ${f.hint?`<span class="hint">— ${escapeHtml(f.hint)}</span>`:""}</label>
+          ${control}
+        </div>`;
+    });
+    sec.innerHTML = `
+      <div class="sub-head" onclick="toggle('${s.id}')">
+        <div class="num">${i+1}</div>
+        <div>
+          <p class="sub-title">${escapeHtml(s.title)}</p>
+          <p class="sub-why">${escapeHtml(s.why)}</p>
+          ${badge}
+        </div>
+        <div class="decisions">${chips}</div>
+      </div>
+      <div class="sub-body" id="body__${s.id}">
+        <div class="grid">${bodyFields}</div>
+        <div class="agree">
+          <input type="checkbox" id="agree__${s.id}" data-agree onchange="updateAgree()" />
+          <label for="agree__${s.id}">I have reviewed (and edited) this subsystem and <b>agree</b> to it.</label>
+        </div>
+      </div>`;
+    root.appendChild(sec);
+  });
+  load();
+  updateAgree();
+  // mark dirty on any edit
+  document.querySelectorAll("[data-field]").forEach(el =>
+    el.addEventListener("input", () => setSaved(false)));
+}
+
+function escapeHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function escapeAttr(s){return escapeHtml(s).replace(/"/g,"&quot;");}
+
+function toggle(id){
+  const b = document.getElementById("body__"+id);
+  b.classList.toggle("collapsed");
+}
+function expandAll(open){
+  document.querySelectorAll(".sub-body").forEach(b =>
+    b.classList.toggle("collapsed", !open));
+}
+
+function collect(){
+  const data = {subsystems:{}, agreed:{}, signoff:{}};
+  SUBSYSTEMS.forEach(s => {
+    data.subsystems[s.id] = {};
+    s.fields.forEach(f => {
+      const el = document.getElementById(`${s.id}__${f.k}`);
+      if(el) data.subsystems[s.id][f.k] = el.value;
+    });
+    const ag = document.getElementById("agree__"+s.id);
+    data.agreed[s.id] = !!(ag && ag.checked);
+  });
+  data.signoff = {
+    approver: val("approver"), date: val("approveDate"),
+    notes: val("approveNotes"), agreed: !!document.getElementById("finalAgree").checked
+  };
+  return data;
+}
+function val(id){const e=document.getElementById(id); return e?e.value:"";}
+
+function saveDoc(){
+  localStorage.setItem(KEY, JSON.stringify(collect()));
+  setSaved(true);
+}
+function load(){
+  let raw; try{ raw = JSON.parse(localStorage.getItem(KEY)||"null"); }catch(e){ raw=null; }
+  if(!raw) return;
+  SUBSYSTEMS.forEach(s => {
+    s.fields.forEach(f => {
+      const el = document.getElementById(`${s.id}__${f.k}`);
+      if(el && raw.subsystems && raw.subsystems[s.id] && raw.subsystems[s.id][f.k]!=null)
+        el.value = raw.subsystems[s.id][f.k];
+    });
+    const ag = document.getElementById("agree__"+s.id);
+    if(ag && raw.agreed) ag.checked = !!raw.agreed[s.id];
+  });
+  if(raw.signoff){
+    setIf("approver", raw.signoff.approver);
+    setIf("approveDate", raw.signoff.date);
+    setIf("approveNotes", raw.signoff.notes);
+    document.getElementById("finalAgree").checked = !!raw.signoff.agreed;
+  }
+  setSaved(true);
+}
+function setIf(id,v){const e=document.getElementById(id); if(e&&v!=null) e.value=v;}
+
+function setSaved(ok){
+  document.getElementById("saveDot").classList.toggle("ok", ok);
+  document.getElementById("saveState").textContent = ok ? "Draft saved" : "Unsaved changes";
+}
+
+function updateAgree(){
+  const n = SUBSYSTEMS.filter(s => {
+    const ag = document.getElementById("agree__"+s.id); return ag && ag.checked;
+  }).length;
+  document.getElementById("agreeState").textContent = `${n} / ${SUBSYSTEMS.length} subsystems agreed`;
+  document.getElementById("agreeCount").textContent = `${n} / ${SUBSYSTEMS.length}`;
+}
+
+function exportDoc(){
+  const data = collect();
+  data.exported_at = new Date().toISOString();
+  data.contract = "ReactiveAgents architecture build contract";
+  const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "reactiveagents-architecture-contract.json";
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function signOff(){
+  const data = collect();
+  const allAgreed = SUBSYSTEMS.every(s => data.agreed[s.id]);
+  const out = document.getElementById("signResult");
+  out.style.display = "block";
+  if(!data.signoff.agreed){
+    out.innerHTML = "<b style='color:var(--danger)'>Not locked.</b> Tick the final agreement checkbox to sign off.";
+    return;
+  }
+  if(!allAgreed){
+    const missing = SUBSYSTEMS.filter(s=>!data.agreed[s.id]).map((s,i)=>s.title);
+    out.innerHTML = "<b style='color:var(--warn)'>Conditional sign-off.</b> The final box is ticked but "
+      + missing.length + " subsystem(s) are not individually agreed yet: <br>• " + missing.join("<br>• ");
+    return;
+  }
+  saveDoc();
+  out.innerHTML = "<b style='color:var(--accent2)'>✓ Contract locked.</b> All 9 subsystems agreed and signed by <b>"
+    + (data.signoff.approver||"(unnamed)") + "</b>"
+    + (data.signoff.date?(" on "+data.signoff.date):"")
+    + ". Build may proceed to step (2): the core phi library."
+    + (data.signoff.notes? ("<br><span class='muted'>Conditions: "+escapeHtml(data.signoff.notes)+"</span>") : "");
+}
+
+render();
+window.addEventListener("beforeunload", saveDoc);
+</script>
+</body>
+</html>

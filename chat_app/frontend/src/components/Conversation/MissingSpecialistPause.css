@@ -1,0 +1,180 @@
+/* Missing-specialist resolution surface (s10-a8). Sits in the conversation flow
+ * as a distinct, attention-drawing card — the pause is actionable, never a
+ * dead-end. Uses the shared design tokens so it matches the rest of the SPA. */
+.ms-pause {
+  align-self: stretch;
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bubble-agent));
+}
+
+.ms-pause-head {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+.ms-pause-badge {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--text-md);
+}
+.ms-pause-title {
+  margin: 0;
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+.ms-pause-sub {
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.ms-pause-nodes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.ms-pause-node {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-app);
+}
+.ms-pause-node-task {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+.ms-pause-node-needs {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.ms-pause-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.ms-pause-primary,
+.ms-pause-secondary,
+.ms-pause-ghost {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.ms-pause-primary {
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.ms-pause-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.ms-pause-secondary {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+.ms-pause-secondary:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.ms-pause-ghost {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.ms-pause-primary:disabled,
+.ms-pause-secondary:disabled,
+.ms-pause-ghost:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ms-pause-error {
+  margin: 0;
+  color: var(--status-failed);
+  font-size: var(--text-sm);
+  background: color-mix(in srgb, var(--status-failed) 12%, transparent);
+  border: 1px solid var(--status-failed);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+}
+.ms-pause-banner {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+}
+
+/* inline "Define a specialist" step */
+.ms-define {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.ms-define-lead {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.ms-define-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.ms-define-label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+.ms-define-input {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+}
+.ms-define-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* the embedded spec-authoring chat needs a bounded height so it doesn't push the
+ * composer off-screen; it scrolls internally like the dedicated screen. */
+.ms-define-host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.ms-define-host .spec-convo {
+  max-height: 460px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}

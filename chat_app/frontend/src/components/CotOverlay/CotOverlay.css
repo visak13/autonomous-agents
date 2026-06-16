@@ -1,0 +1,253 @@
+/* (a) Chain-of-thought brain-icon overlay — pinned bottom-right corner. */
+.cot-overlay {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-3);
+  pointer-events: none; /* children re-enable; the wrapper never eats clicks */
+}
+
+/* --- launcher (the collapsed brain icon) --- */
+.cot-launcher {
+  pointer-events: auto;
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-pop);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+.cot-launcher:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+}
+.cot-launcher:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cot-launcher-active {
+  border-color: var(--accent);
+}
+
+.cot-launcher-icon {
+  display: block;
+}
+
+/* pulsing ring while a tool call is in flight */
+.cot-launcher-pulse {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: cot-pulse 1.4s ease-out infinite;
+}
+@keyframes cot-pulse {
+  0% { transform: scale(0.9); opacity: 0.8; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
+
+.cot-launcher-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* --- expanded panel --- */
+.cot-panel {
+  pointer-events: auto;
+  width: 320px;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+  animation: cot-rise 140ms ease;
+}
+@keyframes cot-rise {
+  from { transform: translateY(8px) scale(0.98); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+.cot-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface-2);
+}
+.cot-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.cot-brain {
+  font-size: var(--text-md);
+}
+.cot-collapse {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-lg);
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+}
+.cot-collapse:hover {
+  color: var(--text-primary);
+}
+.cot-collapse:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cot-panel-status {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.cot-live {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--status-running);
+  font-weight: 600;
+}
+.cot-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-running);
+  animation: cot-blink 1s ease-in-out infinite;
+}
+@keyframes cot-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.cot-idle {
+  color: var(--text-muted);
+}
+
+.cot-feed {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-2);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.cot-empty {
+  padding: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.cot-item {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-surface-2);
+}
+.cot-item[data-status="pending"] {
+  border-color: var(--status-running);
+}
+.cot-item[data-status="error"] {
+  border-color: var(--status-failed);
+}
+
+.cot-item-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.cot-item-icon {
+  font-size: var(--text-sm);
+}
+.cot-item[data-status="pending"] .cot-item-icon {
+  color: var(--status-running);
+}
+.cot-item[data-status="ok"] .cot-item-icon {
+  color: var(--status-done);
+}
+.cot-item[data-status="error"] .cot-item-icon {
+  color: var(--status-failed);
+}
+.cot-item-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cot-item-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+}
+.cot-item-badge.cot-pending { color: var(--status-running); }
+.cot-item-badge.cot-ok { color: var(--status-done); }
+.cot-item-badge.cot-error { color: var(--status-failed); }
+
+.cot-item-args {
+  margin-top: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.cot-item-result {
+  margin-top: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+.cot-item-result[data-status="error"] {
+  color: var(--status-failed);
+}
+
+@media (max-width: 1100px) {
+  .cot-panel { width: 280px; }
+}

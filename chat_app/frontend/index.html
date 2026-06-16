@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ecdfc4" />
+    <title>ReactiveAgents</title>
+    <!-- Preload the LCP full-page wash (AVIF) at high priority. Browsers without
+         AVIF ignore the type-mismatched hint and fetch WebP/JPEG via image-set. -->
+    <link
+      rel="preload"
+      as="image"
+      href="/static/bg/kitsune-bg-1280.avif"
+      type="image/avif"
+      fetchpriority="high"
+    />
+    <!-- Preload the self-hosted variable fonts (latin subset) used on first paint. -->
+    <link
+      rel="preload"
+      as="font"
+      href="/static/fonts/inter-latin-wght.woff2"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      as="font"
+      href="/static/fonts/fraunces-latin-wght.woff2"
+      type="font/woff2"
+      crossorigin
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

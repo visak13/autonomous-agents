@@ -1,0 +1,47 @@
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-app);
+}
+
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr) 360px;
+  min-height: 0;
+}
+
+/* The spec-definition surface (and any other single-pane view) takes the full
+ * body width — no sidebar/aside grid. */
+.app-body-single {
+  display: flex;
+  grid-template-columns: none;
+}
+
+.app-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border-subtle);
+}
+
+.app-aside {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+@media (max-width: 1100px) {
+  .app-body {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+  .app-aside {
+    display: none;
+  }
+}

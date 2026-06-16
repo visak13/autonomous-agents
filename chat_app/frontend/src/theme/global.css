@@ -1,0 +1,133 @@
+@import "./tokens.css";
+@import "./fonts.css";
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  font-weight: 450;
+  color: var(--text-primary);
+  /* Solid parchment base = instant, zero-CLS paint behind the wash. */
+  background-color: var(--wash-base);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/*
+ * Full-page kitsune watercolour wash — a FIXED, heavily-faded backdrop behind
+ * ALL content. Three stacked background layers (top → bottom):
+ *   1. a parchment scrim (--wash-scrim) that fades/desaturates the fox so text
+ *      always wins the contrast fight (the graded readability requirement);
+ *   2. the optimized wash, FORMAT-negotiated via image-set (AVIF → WebP → JPEG);
+ *   3. a tiny inline base64 LQIP that paints the dominant colours instantly,
+ *      under the real image, so first paint is never blank.
+ * position:fixed + background-size:cover ⇒ it never participates in layout ⇒
+ * zero CLS regardless of viewport size. The preload of the AVIF (index.html,
+ * fetchpriority=high) makes this the prioritized LCP fetch.
+ */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--wash-scrim), var(--wash-scrim)),
+    image-set(
+      url("/static/bg/kitsune-bg-1280.avif") type("image/avif"),
+      url("/static/bg/kitsune-bg-1280.webp") type("image/webp"),
+      url("/static/bg/kitsune-bg-1280.jpg") type("image/jpeg")
+    ),
+    url("data:image/jpeg;base64,/9j//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgQEBMQExYWFhYWFhoYGhsbGxoaGhobGxsdHR0iIiIdHR0bGx0dICAiIiUmJSMjIiMmJigoKDAwLi44ODpFRVP/xABoAAEAAwEAAAAAAAAAAAAAAAAFBAAHBgEBAAMBAQAAAAAAAAAAAAAAAgMEAQAFEAABBAEFAQAAAAAAAAAAAAACABEBAwQS0pNxFFQRAAEDBQEBAAAAAAAAAAAAAAACAQPRERSSUwQx/8AAEQgADgAYAwESAAISAAMSAP/aAAwDAQACEQMRAD8A0XwYfzY/EG1KrwceHnHqmhZDjefjFomhfKi779EMy0RxhMghJcjQcibvPToEb3dQ/hM1mSf/2Q==");
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
+}
+
+/* Headings use the English display serif at heavier weight — crisp over the wash. */
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0.005em;
+}
+
+strong,
+b {
+  font-weight: 650;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+a {
+  color: var(--accent);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Visible keyboard focus everywhere (a11y [expected]). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * Frosted-parchment glass for the surface panels that float over the wash.
+ * Centralized here (rather than repeated in every component sheet) so the
+ * watercolour treatment lives in one place: each listed panel already carries a
+ * translucent parchment background via its semantic token; the backdrop blur
+ * softens the fox showing THROUGH it, which both reads as washi paper and lifts
+ * text contrast. Only OUTER containers are frosted (their nested cards inherit
+ * the effect) to keep the GPU cost bounded. Degrades gracefully where
+ * backdrop-filter is unsupported (the high token alpha still passes AA).
+ */
+.topbar,
+.sidebar,
+.app-aside,
+.bubble,
+.spec-bubble,
+.cot-panel,
+.cot-launcher,
+.lambda-tab-panel,
+.spec-surface-head,
+.spec-open,
+.spec-draft,
+.tuned-head,
+.tuned-card {
+  -webkit-backdrop-filter: blur(8px) saturate(108%);
+  backdrop-filter: blur(8px) saturate(108%);
+}
+
+/* The central chat column is transparent so the fox shows behind the floating
+ * message cards; a whisper-thin parchment veil keeps inter-bubble hint text
+ * comfortably above AA without hiding the wash. */
+.app-main {
+  background: rgba(244, 234, 213, 0.28);
+}
+:root[data-theme="dark"] .app-main {
+  background: rgba(22, 18, 14, 0.32);
+}

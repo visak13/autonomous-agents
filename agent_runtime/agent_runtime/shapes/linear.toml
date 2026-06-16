@@ -1,0 +1,30 @@
+# =============================================================================
+# LINEAR shape (blueprint §2a, decision d5) — the local-Gemma port of eda-base3's
+# `linear` plan shape.
+# =============================================================================
+# A FIXED execution DISCIPLINE the planner SELECTS when a query's steps must run
+# STRICTLY ONE AFTER ANOTHER. The planner still authors the nodes (the DAG is
+# model-derived, d6); this shape only governs HOW the runtime dispatches them:
+#
+#   * SEQUENTIAL: at most ONE node is ever in flight. The runtime launches the
+#     `first_ready_action` (the first pending node whose dependencies are all
+#     done), waits for it to finish, then launches the next — strict single-file
+#     order. No fan-out, even when independent nodes are ready.
+#
+# This is the right shape for a chain where each step genuinely needs the prior
+# step's result, or where the user wants deterministic, one-thing-at-a-time
+# progress. For independent steps that may overlap, the planner selects
+# `modular-parallel` instead.
+#
+# The readiness gate + dispatch FSM that realise this are a PURE-PYTHON port of
+# eda-base3's `fsm/plan_fsm.py` (`_first_ready_action` + `plan_next_action`) —
+# see `agent_runtime/scheduler.py`. No model call drives the dispatch; Gemma only
+# SELECTS the shape (see `agent_runtime/shape_selector.py`).
+
+name = "linear"
+description = """Strictly sequential execution: run the steps one after another, \
+a single node in flight at a time, each starting only once the previous has \
+finished. Choose this when steps depend on each other or must not overlap."""
+
+# Strict single-file dispatch — the runtime never fans out under this shape.
+execution = "sequential"

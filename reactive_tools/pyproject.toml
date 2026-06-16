@@ -1,0 +1,29 @@
+[project]
+name = "reactive-tools"
+version = "0.1.0"
+description = "In-process reactive event plane + tool layer for the reactive agent. No broker/pool/sockets/Claude (d2)."
+requires-python = ">=3.11"
+# Dependency-light by design (d10): asyncio is the base, so the event plane
+# needs ZERO runtime dependencies. RxPY (reactivex) was deemed acceptable "if
+# used lightly", but a small asyncio pub/sub covers publish + multi-subscriber
+# async delivery with nothing to install — leaner for phi's context-budget host
+# and keeps the offline-first build honest. Add deps here only when a real tool
+# needs them.
+#
+# d11: this is a uv WORKSPACE MEMBER — it has NO isolated .venv. It resolves
+# into the single shared root .venv (C:\Projects\ReactiveAgents\.venv) so it can
+# import llm_framework in the same in-process interpreter (d2).
+# web_search = ddgs (free DuckDuckGo, no key); web_fetch = httpx + trafilatura
+# (markdown extraction). Both mandated by decision d4 for the s2 web tools.
+dependencies = [
+    "httpx",
+    "ddgs",
+    "trafilatura",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reactive_tools"]
