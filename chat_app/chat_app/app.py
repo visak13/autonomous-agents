@@ -69,6 +69,7 @@ from agent_runtime import (
     AbstractPlanFactory,
     AgentRuntime,
     Planner,
+    register_discovery_tools,
     stub,
 )
 from specialization.seed import seed_canonical_rulesets
@@ -246,7 +247,7 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
     # not registered on this hook at all (build_default_hook no longer adds it).
     # The cron tools share the SAME SQLite db (<data_dir>/chat.db) the chat store
     # uses, so a cron_add row is visible to the s6 firing scheduler.
-    register_agentic_tools(hook, cron_data_dir=data)
+    agentic_registry = register_agentic_tools(hook, cron_data_dir=data)
 
     # 2) memory — in-process sqlite-vec store + the hardened recall facade (d3).
     #    The CPU MiniLM embedder is lazy, so this opens only the sqlite handle.
@@ -274,18 +275,31 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
     # canonical names each boot). The full specialization-management surface
     # (authoring, re-edit, missing-spec fallback) is s4's job, not here.
     seed_canonical_rulesets(registry)
+    # P2.2 (carry-forward from P2-1-review item 2): WIRE the get_shapes / get_specs
+    # DISCOVERY tools onto the PLANNER'S SERVED tool surface + context. They were
+    # built in P2.1 but DARK on the served route (register_discovery_tools was
+    # called nowhere outside tests), so the planner could never query the shape/spec
+    # catalogs at run time. Registered on the SAME GrowableToolRegistry the agentic
+    # tools use (it binds handlers onto ``hook``), so both tools land in
+    # ``hook.registry.catalog()`` — which is exactly the body-free tool catalog the
+    # AbstractPlanFactory injects into the planner context — and are dispatchable via
+    # the hook on the event plane. ``specs_dir`` is the live on-disk spec registry so
+    # get_specs reflects specs compiled since startup (d10: descriptions only, never a
+    # body). shapes_dir defaults to the packaged shapes catalog.
+    register_discovery_tools(agentic_registry, specs_dir=data / "specs")
     if live:
         from llm_framework import OllamaTransport
 
-        # s8/b1 swap (d17): the runtime model is the optimized Gemma-4 E2B custom
-        # tag on the NATIVE Ollama :11434 (transport defaults), NOT phi4-mini on the
-        # foreign Docker :11435. ``api="native"`` is required so the structured
-        # planner call can pass the top-level ``think=False`` field. keep_alive is
-        # WARM ("30m") so the cold ~8-10 s load is paid once and turns reuse the
-        # resident model (warm TTFT ~0.38 s); the model's 1.44 GiB resident footprint
-        # leaves ample headroom on the shared 6 GB GPU (a3 measured).
+        # s8/b8 swap (d25/d31/d35): the runtime model is the optimized Gemma-4 **E4B**
+        # custom tag (``gemma4-e4b-candidate-ctx32k``) on the NATIVE Ollama :11434
+        # (transport DEFAULT_MODEL), superseding the e2b tag (gone, d42). ``api="native"``
+        # is required so the structured planner call can pass the top-level
+        # ``think=False`` field. keep_alive is ``-1`` (RESIDENT, d36/d21): the GPU is
+        # gemma's SOLE consumer, so keeping the model warm across every turn kills the
+        # per-call reload thrash (~30x on a multi-node run) — E4B text-only Q4 fits the
+        # 6 GB card at 0% offload (s10/s11), so resident is safe.
         live_transport = OllamaTransport(
-            api="native", keep_alive="30m", timeout=300
+            api="native", keep_alive=-1, timeout=300
         )
         engine = SpecializationEngine(
             registry, hook=hook, condense_transport=live_transport,

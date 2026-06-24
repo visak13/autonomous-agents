@@ -92,10 +92,60 @@ def test_assembled_context_is_bounded(tmp_path):
             assert "u19" in ctx                       # newest turn is kept
             assert "u0" not in ctx                     # oldest is dropped first
 
-        # a single turn larger than the WHOLE budget is hard-truncated, never over
+        # a single turn larger than the WHOLE budget is hard-truncated, never over,
+        # and (s9/c9) is KEPT rather than dropped to an empty context
         with ConversationMemory(store, recent_turns=20, max_chars=100) as mem:
             ctx = mem.assemble_context(cid)
             assert len(ctx) <= 100
+            assert ctx != ""        # the oversized newest turn is kept, not dropped
+            assert "u19" in ctx      # its head (the User: line) survives truncation
+
+
+# --------------------------------------------------------------------------- #
+# 2b) s9/c9 REGRESSION: an over-budget NEWEST turn is hard-truncated + KEPT
+#     (never dropped to an empty context -> memoryless follow-ups)
+# --------------------------------------------------------------------------- #
+def test_oversized_newest_turn_kept_head_and_tail(tmp_path):
+    """The c6 root cause: when the newest turn's formatted block ALONE exceeds the
+    budget, the fit-loop used to BREAK before keeping it -> empty context -> the
+    follow-up turn ran memoryless. The fix hard-truncates that block keeping its
+    HEAD (the user's stated fact) and TAIL (the answer's conclusion)."""
+    with ChatStore(tmp_path) as store:
+        # turn 1: the user states a fact; the assistant answers with a full,
+        # report-sized response that alone blows a small budget (mirrors live:
+        # turn final_responses measured at 4344 / 9373 chars in c6).
+        fact = "I'm using Rust and a tool called ferrocrab"
+        big_report = "REPORT-OPENING " + ("z" * 6000) + " REPORT-CONCLUSION"
+        cid = _seed(store, None, [(fact, big_report)])
+
+        with ConversationMemory(store, recent_turns=6, max_chars=400) as mem:
+            ctx = mem.assemble_context(cid)
+
+        assert ctx != ""                       # NOT dropped to empty (the bug)
+        assert len(ctx) <= 400                  # the hard bound still holds
+        # the user-stated fact lives at the HEAD and must survive truncation,
+        # so a turn-2 recall ("what tool did I say?") can ground on it
+        assert "ferrocrab" in ctx
+        assert f"{USER_PREFIX} {fact}" in ctx
+        # head+tail (not just head): the answer's conclusion is preserved too
+        assert ctx.rstrip().endswith("REPORT-CONCLUSION")
+
+
+def test_oversized_newest_turn_fits_intact_at_default_budget(tmp_path):
+    """A normal report-sized turn (~4.3k chars, the smaller c6 measurement) fits
+    INTACT at the raised default budget — no truncation, full recall."""
+    from chat_app.conversation_memory import DEFAULT_MAX_CHARS
+
+    assert DEFAULT_MAX_CHARS >= 8000  # sized to observed report lengths (c6)
+    with ChatStore(tmp_path) as store, ConversationMemory(store) as mem:
+        fact = "my codename is ferrocrab"
+        report = "Intro. " + ("w" * 4000) + " Done."  # ~4k chars, under 8000
+        cid = _seed(store, None, [(fact, report)])
+
+        ctx = mem.assemble_context(cid)
+        assert "ferrocrab" in ctx
+        assert "…[turn truncated" not in ctx          # kept intact, no elision
+        assert ctx.rstrip().endswith("Done.")
 
 
 # --------------------------------------------------------------------------- #

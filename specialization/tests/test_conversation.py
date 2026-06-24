@@ -25,6 +25,7 @@ from specialization.conversation import (
     STATE_APPROVED,
     STATE_CANCELLED,
     STATE_DENIED,
+    split_description_and_body,
 )
 from specialization.model import RawDefinition
 from specialization.registry import SpecRegistry
@@ -154,6 +155,81 @@ def test_reopen_seeds_existing_body_and_edits_in_place(tmp_path):
     assert re_spec.source == "autonomous"          # NOT silently re-stamped 'ui'
     assert re_spec.research_trace_ref == "run-XYZ"
     assert "QQQ" in reg.load("brief").body         # edit persisted + loadable
+
+
+# --------------------------------------------------------------------------- #
+# d14: the author also AUTHORS + ITERATES a STRONG, selection-effective
+# DESCRIPTION (the planner-facing lookup), not just the body.
+# --------------------------------------------------------------------------- #
+def test_start_authors_a_strong_description_not_just_the_body(tmp_path):
+    """The author STRENGTHENS the planner-facing description (d14) — it does not
+    leave it as the user's seed text. The authored description flows into the
+    DraftPreview + the compiled markdown frontmatter the planner selects on."""
+    reg = SpecRegistry(tmp_path / "specs")
+    weak = RawDefinition(name="news-brief", description="briefs", intent="")
+    conv = SpecConversation(weak, registry=reg)
+
+    preview = conv.start("shape research findings into a tight, sourced executive brief")
+
+    # The description was AUTHORED — strengthened past the weak seed, and is
+    # selection-effective (names the work, not a bare echo of the name).
+    desc = conv.raw.description
+    assert desc and desc != "briefs"
+    assert "brief" in desc.lower()
+    assert desc.lower() != conv.raw.name.lower()
+    # It is a single frontmatter-safe line and rides the preview + compiled doc.
+    assert "\n" not in desc
+    assert preview.description == desc
+    assert f"description: {desc}" in preview.to_markdown()
+
+
+def test_refine_iterates_the_description_on_top_of_the_prior(tmp_path):
+    """The description ITERATES across turns — a refine re-authors it BUILDING ON
+    the prior description (not from scratch), incorporating the critique."""
+    conv, _ = _conv(tmp_path)
+    conv.start("make a tight executive brief")
+    desc1 = conv.raw.description
+    assert desc1
+
+    conv.refine("ALWAYS-CAP-AT-FIVE-BULLETS")
+    desc2 = conv.raw.description
+
+    assert desc2 != desc1, "the description must change when refined"
+    assert "ALWAYS-CAP-AT-FIVE-BULLETS" in desc2  # critique folded into the description
+    # Still a clean one-liner (frontmatter-safe) and exposed on the preview.
+    assert "\n" not in desc2
+    assert conv._preview().description == desc2
+
+
+def test_authored_description_persists_and_is_selectable_next_run(tmp_path):
+    """The authored description is REGISTERED + visible in the body-free planner
+    index (the d14 selection lever) — present on the NEXT run, not just in-memory."""
+    conv, reg = _conv(tmp_path)
+    conv.start("shape a sourced executive brief")
+    conv.refine("lead with the single most important finding")
+    authored = conv.raw.description
+    conv.approve()
+
+    # A FRESH registry over the same dir (re-reads disk) shows the authored
+    # description in the planner-facing index — selectable on the next run.
+    fresh = SpecRegistry(reg.specs_dir)
+    rows = {e.name: e.description for e in fresh.index()}
+    assert rows["concise-brief"] == authored
+    assert authored and authored.lower() != "concise-brief"
+
+
+def test_split_description_and_body_is_backward_compatible():
+    """A bare-body reply (no DESCRIPTION/delimiter) yields (None, body) so the
+    caller keeps the prior description — the seam a scripted/legacy transport hits."""
+    none_desc, body = split_description_and_body("# Just a body\n\n- a rule")
+    assert none_desc is None
+    assert body == "# Just a body\n\n- a rule"
+
+    desc, body2 = split_description_and_body(
+        "DESCRIPTION: a strong selection line\n===SPEC BODY===\n# Body\n- rule"
+    )
+    assert desc == "a strong selection line"
+    assert body2 == "# Body\n- rule"
 
 
 def test_history_records_user_and_agent_turns(tmp_path):

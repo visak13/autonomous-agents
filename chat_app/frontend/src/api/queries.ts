@@ -16,6 +16,8 @@ import {
   approveSpecChat,
   authorShape,
   createChat,
+  deleteRegisteredSpec,
+  deleteShape,
   denySpecChat,
   getChat,
   getLambdaSubscriptions,
@@ -27,6 +29,7 @@ import {
   listRegisteredSpecs,
   listShapes,
   openSpecChat,
+  refineShape,
   reopenSpecChat,
   resumeRun,
   sendSpecChatMessage,
@@ -232,6 +235,23 @@ export function useUpdateRegisteredSpec() {
   });
 }
 
+/**
+ * DELETE a registered specialization (s4/a4, d13 UI). On success, drop the
+ * per-spec cache entry and invalidate the body-free index so the row clears from
+ * the visible list immediately (no fetch-in-effect). Any registered spec is
+ * deletable (specs have no built-ins).
+ */
+export function useDeleteRegisteredSpec() {
+  const qc = useQueryClient();
+  return useMutation<void, Error, { name: string }>({
+    mutationFn: ({ name }) => deleteRegisteredSpec(name),
+    onSuccess: (_void, { name }) => {
+      qc.removeQueries({ queryKey: queryKeys.registeredSpec(name) });
+      void qc.invalidateQueries({ queryKey: queryKeys.registeredSpecs });
+    },
+  });
+}
+
 export function useReopenSpecChat() {
   const qc = useQueryClient();
   return useMutation<SpecChatView, Error, { name: string }>({
@@ -283,6 +303,23 @@ export function useSetShapeMaxIter() {
   });
 }
 
+/**
+ * DELETE a USER-AUTHORED shape (s4/a4, d13 UI). On success, drop the per-shape
+ * cache entry and invalidate the catalog so the row clears from the visible list
+ * immediately. The backend 409s a shipped built-in (the UI hides the control on
+ * built-ins, but a 409 still surfaces via the mutation error as the real guard).
+ */
+export function useDeleteShape() {
+  const qc = useQueryClient();
+  return useMutation<void, Error, { name: string }>({
+    mutationFn: ({ name }) => deleteShape(name),
+    onSuccess: (_void, { name }) => {
+      qc.removeQueries({ queryKey: queryKeys.shape(name) });
+      void qc.invalidateQueries({ queryKey: queryKeys.shapes });
+    },
+  });
+}
+
 // --------------------------------------------------------------------------- //
 // (s9/b1, d14(2)/d9) DESCRIBE-A-SHAPE — author a new shape from an NL description
 // (POST /shapes/author). The response IS the authored shape's full view; seed it
@@ -295,6 +332,25 @@ export function useAuthorShape() {
     mutationFn: ({ description, nameHint }) => authorShape(description, nameHint),
     onSuccess: (shape) => {
       qc.setQueryData(queryKeys.shape(shape.name), shape);
+      void qc.invalidateQueries({ queryKey: queryKeys.shapes });
+    },
+  });
+}
+
+// (s8/b6, d18a) REFINE-A-SHAPE — edit an existing shape in plain language; the live
+// Gemma model authors the next version building on the current one
+// (POST /shapes/{name}/refine). The response IS the refined shape's full view; seed
+// it into the per-shape cache and patch the same row in the catalog so the edited
+// structure (e.g. a sequential→concurrent posture flip) shows immediately.
+export function useRefineShape() {
+  const qc = useQueryClient();
+  return useMutation<ShapeView, Error, { name: string; instruction: string }>({
+    mutationFn: ({ name, instruction }) => refineShape(name, instruction),
+    onSuccess: (shape) => {
+      qc.setQueryData(queryKeys.shape(shape.name), shape);
+      qc.setQueryData<ShapeView[]>(queryKeys.shapes, (prev) =>
+        prev?.map((s) => (s.name === shape.name ? shape : s)),
+      );
       void qc.invalidateQueries({ queryKey: queryKeys.shapes });
     },
   });

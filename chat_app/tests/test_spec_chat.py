@@ -119,6 +119,45 @@ def _author_and_register(client, name: str, intent: str) -> str:
     return body
 
 
+def test_author_strengthens_description_and_it_persists_to_the_planner_index(
+    tmp_path,
+) -> None:
+    """d14 over HTTP: the author STRENGTHENS the planner-facing description (the
+    draft carries an authored description, not the weak seed), it ITERATES on a
+    refine, and the approved description is what the body-free planner index
+    serves on the next run (the selection lever)."""
+    app = create_app(data_dir=tmp_path)
+    with TestClient(app) as client:
+        sid = client.post(
+            "/spec-chats",
+            json={"name": "sourced-brief", "description": "briefs"},  # weak seed
+        ).json()["session_id"]
+
+        # turn 1 — the author strengthens the description past the weak seed.
+        d1 = client.post(
+            f"/spec-chats/{sid}/message",
+            json={"message": "shape research findings into a tight, sourced brief"},
+        ).json()["draft"]
+        assert d1["description"] and d1["description"] != "briefs"
+        assert d1["description"].lower() != "sourced-brief"
+        assert f"description: {d1['description']}" in d1["markdown"]
+
+        # turn 2 — the description ITERATES (changes) on a refine.
+        d2 = client.post(
+            f"/spec-chats/{sid}/message",
+            json={"message": "DESC-ITERATION-TOKEN must drive selection"},
+        ).json()["draft"]
+        assert d2["description"] != d1["description"]
+
+        # approve → the authored description is what the PLANNER index serves on
+        # the next run (body-free lookup the selector matches a step against).
+        assert client.post(f"/spec-chats/{sid}/approve").status_code == 200
+        reg: SpecRegistry = app.state.wiring.registry
+        index = {e.name: e.description for e in reg.index()}
+        assert index["sourced-brief"] == d2["description"]
+        assert index["sourced-brief"] != "briefs"
+
+
 def test_reeditable_roundtrip_create_fetch_update_refetch_effective(tmp_path) -> None:
     """The action's acceptance gate over HTTP: a spec is CREATED+persisted, then
     FETCHED by id, UPDATED, and a RE-FETCH shows the edit — and the edit is
@@ -344,3 +383,55 @@ def test_redraft_is_offloaded_off_the_event_loop(tmp_path) -> None:
             assert resp.json()["draft"]["turn"] == 1
 
     asyncio.run(_run())
+
+
+# --------------------------------------------------------------------------- #
+# b9 (d13 UI delete) — DELETE a registered specialization: the selection catalog
+# (the planner's body-free index) SHRINKS by exactly that spec, the survivor is
+# UNTOUCHED + still loadable through the runtime's loader (no orphaned reference
+# breaks selection), and an absent/already-deleted name is a clean 404.
+# --------------------------------------------------------------------------- #
+def test_delete_registered_spec_shrinks_catalog_no_orphan_break(tmp_path) -> None:
+    """The b9 acceptance over HTTP: ``DELETE /spec-chats/registered/{name}`` removes
+    the spec so the planner-facing SELECTION CATALOG (``registry.index`` — what the
+    selector matches a step against) shrinks by exactly that one spec; the OTHER
+    spec stays listed AND still loads byte-identical through the SAME
+    :class:`~specialization.loader.SpecLoader` path the runtime composes a node's
+    body with (no orphaned reference breaks selection). A re-delete / unknown name
+    is a clean 404, never a 500."""
+    from specialization.loader import SpecLoader
+
+    app = create_app(data_dir=tmp_path)
+    with TestClient(app) as client:
+        _author_and_register(client, "doomed-ruleset", "shape a throwaway brief")
+        keep_body = _author_and_register(client, "keeper-ruleset", "shape a kept brief")
+
+        # the selection catalog (body-free index the planner reads) holds BOTH.
+        before = {r["name"] for r in client.get("/spec-chats/registered").json()}
+        assert {"doomed-ruleset", "keeper-ruleset"} <= before
+
+        # DELETE one → 200 with the {ok, deleted} receipt the UI drops the row on.
+        deleted = client.delete("/spec-chats/registered/doomed-ruleset")
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"ok": True, "deleted": "doomed-ruleset"}
+
+        # the catalog SHRANK by EXACTLY the deleted spec (nothing else moved).
+        after = {r["name"] for r in client.get("/spec-chats/registered").json()}
+        assert "doomed-ruleset" not in after
+        assert before - after == {"doomed-ruleset"}
+
+        # NO ORPHAN BREAK: the survivor is still listed, fetchable, AND loadable
+        # byte-identical through the EXACT loader path a launched node composes its
+        # spec body with — deleting a sibling did not disturb it.
+        assert "keeper-ruleset" in after
+        assert client.get("/spec-chats/registered/keeper-ruleset").status_code == 200
+        reg: SpecRegistry = app.state.wiring.registry
+        loaded = reg.load("keeper-ruleset")
+        assert loaded.body == keep_body
+        assert SpecLoader(reg).load_body("keeper-ruleset") == loaded.body
+        # the deleted spec is GONE from the authoritative store the planner reads.
+        assert "doomed-ruleset" not in reg.names()
+
+        # idempotent guard: a re-delete and an unknown name are clean 404s.
+        assert client.delete("/spec-chats/registered/doomed-ruleset").status_code == 404
+        assert client.delete("/spec-chats/registered/never-existed").status_code == 404

@@ -81,6 +81,17 @@ class ShapeNameConflict(ValueError):
         )
 
 
+class ShapeNotFound(LookupError):
+    """A REFINE was requested for a shape that does not exist (mapped to 404).
+
+    Refine EDITS an existing shape in place, so the target must already be in the
+    catalog; refining a missing name is a client error, not an authoring failure."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"no shape named {name!r} to refine")
+
+
 # --------------------------------------------------------------------------- #
 # request model (Pydantic v2 — house style; 422 automatic on bad input)
 # --------------------------------------------------------------------------- #
@@ -94,6 +105,17 @@ class AuthorShapeRequest(BaseModel):
 
     description: str = Field(min_length=1, max_length=4000)
     name_hint: str = Field(default="", max_length=120)
+
+
+class RefineShapeRequest(BaseModel):
+    """Refine an EXISTING shape in plain language; Gemma authors the next version.
+
+    ``instruction`` is the plain-language change the user wants applied to the
+    current shape (e.g. 'also run an independent parallel phase after the linear
+    one'). The shape NAME comes from the path, not the body — a refine edits a named
+    shape in place and never renames it."""
+
+    instruction: str = Field(min_length=1, max_length=4000)
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +221,52 @@ class ShapeAuthorService:
         )
         return view
 
+    async def refine(self, name: str, instruction: str) -> dict[str, Any]:
+        """REFINE an existing shape in place from ``instruction``; return its view.
+
+        The free-flow ITERATIVE edit (b6/d18a): unlike :meth:`author` (one-shot
+        create), this BUILDS ON the current shape and OVERWRITES its file — so the
+        same name is EXPECTED, never a 409 conflict. Raises
+        :class:`ShapeAuthoringUnavailable` (503) with no live transport,
+        :class:`ShapeNotFound` (404) if the named shape does not exist,
+        :class:`~agent_runtime.selfheal.MalformedOutputError` /
+        :class:`~agent_runtime.shapes.ShapeError` (422) when the model fails to
+        produce a usable refined shape."""
+        if self._transport is None:
+            raise ShapeAuthoringUnavailable(
+                "shape refinement needs the live model (start the app with "
+                "REACTIVE_AGENTS_LIVE=1); it is unavailable on the offline seam"
+            )
+        # The target must already exist (refine edits in place, never creates).
+        if self._config.get_shape(name) is None:
+            raise ShapeNotFound(name)
+
+        author = ShapeAuthor(self._transport, shapes_dir=self._shapes_dir)
+        try:
+            # Loads the prior shape, authors the next version building on it, and
+            # overwrites the SAME file (the round-trip guard runs inside).
+            reloaded, path = await author.refine_and_write(
+                name, instruction, shapes_dir=self._shapes_dir
+            )
+        except (MalformedOutputError, ShapeError):
+            logger.warning(
+                "shape refinement failed for %r (instruction %r)",
+                name, instruction[:200], exc_info=True,
+            )
+            raise
+
+        view = self._config.get_shape(reloaded.name)
+        if view is None:  # pragma: no cover - written-then-missing is an internal fault
+            raise ShapeError(
+                f"refined shape {reloaded.name!r} was written but is not in the "
+                f"catalog the list reads — shapes-dir mismatch"
+            )
+        logger.info(
+            "refined shape %r (execution=%s) at %s",
+            reloaded.name, reloaded.execution, path,
+        )
+        return view
+
 
 def register_shape_author_routes(
     app: FastAPI, service: ShapeAuthorService
@@ -228,13 +296,35 @@ def register_shape_author_routes(
                 detail=f"could not author a shape from that description: {exc}",
             )
 
+    @app.post("/shapes/{name}/refine")
+    async def refine_shape(name: str, req: RefineShapeRequest) -> dict:
+        """REFINE an existing shape in place from a plain-language instruction.
+
+        503 if no live model is wired; 404 if the named shape does not exist; 422 if
+        the model cannot produce a usable refined shape. On success returns the
+        refined shape's full catalog view (the same view the list renders) with a 200
+        — the file is OVERWRITTEN, so this is an edit, not a 201 create."""
+        try:
+            return await service.refine(name, req.instruction)
+        except ShapeAuthoringUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except ShapeNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except (MalformedOutputError, ShapeError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"could not refine the shape from that instruction: {exc}",
+            )
+
     return service
 
 
 __all__ = [
     "AuthorShapeRequest",
+    "RefineShapeRequest",
     "ShapeAuthorService",
     "ShapeAuthoringUnavailable",
     "ShapeNameConflict",
+    "ShapeNotFound",
     "register_shape_author_routes",
 ]

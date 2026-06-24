@@ -10,9 +10,10 @@ gap STRUCTURALLY: every null-spec node that fires a research/gather tool
 (``web_search``/``web_fetch``) is stamped with the generic research spec, so the
 parallel siblings are sibling-consistent and all carry the grounded ruleset.
 
-These tests script a :class:`FakeTransport` with per-node JSON (the authorer makes
-one structured call per node), so the WHOLE authoring loop + the default-spec pass
-run in-process with zero inference. They assert the resulting DAG directly.
+These tests script a :class:`FakeTransport` with the planner's TOOL CALLS (the
+authorer issues seed_plan → add_step per node → finalize_plan), so the WHOLE
+tool-driven authoring loop + the default-spec pass run in-process with zero
+inference. They assert the resulting DAG directly.
 
 The rule is generic + role-structural (no per-scenario topic/spec/filename):
 
@@ -49,6 +50,16 @@ _TOOL_CATALOG = [
 ]
 
 
+def _seed() -> str:
+    """The opening ``seed_plan`` tool call."""
+    return json.dumps({"tool": "seed_plan", "args": {"shape": "modular-parallel"}})
+
+
+def _final() -> str:
+    """The closing ``finalize_plan`` tool call."""
+    return json.dumps({"tool": "finalize_plan", "args": {}})
+
+
 def _node(
     task: str,
     *,
@@ -56,18 +67,20 @@ def _node(
     spec: str = "",
     needs_spec: str = "",
     depends_on: Sequence[str] = (),
-    more: bool = True,
+    more: bool = True,  # accepted for call-site compat; the loop ends via finalize_plan
 ) -> str:
-    """One per-node structured reply, as the authorer's schema expects it."""
+    """One ``add_step`` tool call (the authorer builds the DAG by calling tools)."""
     return json.dumps(
         {
-            "task": task,
-            "spec": spec,
-            "specs": [],
-            "needs_spec": needs_spec,
-            "tool": tool,
-            "depends_on": list(depends_on),
-            "more": more,
+            "tool": "add_step",
+            "args": {
+                "task": task,
+                "spec": spec,
+                "specs": [],
+                "needs_spec": needs_spec,
+                "tool": tool,
+                "depends_on": list(depends_on),
+            },
         }
     )
 
@@ -95,6 +108,7 @@ def _planner(
 # A mixed parallel-gather plan that exercises EVERY branch of the F2 pass in one DAG.
 def _mixed_plan_replies() -> list[str]:
     return [
+        _seed(),
         # n1: null-spec gather (web_search) -> SHOULD be defaulted.
         _node("Search the latest news on climate change", tool="web_search"),
         # n2: gather already bound to research-analyst -> unchanged (no override).
@@ -114,6 +128,7 @@ def _mixed_plan_replies() -> list[str]:
             depends_on=["n1", "n2", "n3", "n4"],
             more=False,
         ),
+        _final(),
     ]
 
 

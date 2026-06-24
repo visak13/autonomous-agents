@@ -1,22 +1,22 @@
-"""Schema-constrained tool-argument emission (s8/b1 phi-capability hardening).
+"""Schema-constrained tool-argument emission (s8/b1 small-model hardening).
 
-The a2 live POC surfaced the build's #1 phi-quality limitation: phi4-mini, asked
+A live POC surfaced a small-model limitation: the small agent model, asked
 to author a DAG, would name a tool on a node (e.g. ``web_search``) but emit an
 EMPTY ``tool_args`` — so the node's tool call failed (``web_search`` needs a
 ``query``) and only recovered via the slow self-heal/re-plan path. The fix this
-module ships (within the a1 tolerance: nudge phi, don't hard-gate it) is to make
-tool-arg emission a SEPARATE, SCHEMA-CONSTRAINED phi call:
+module ships (within the a1 tolerance: nudge the model, don't hard-gate it) is to
+make tool-arg emission a SEPARATE, SCHEMA-CONSTRAINED call:
 
 - a JSON SCHEMA per tool (required keys + types) is handed to Ollama's native
-  ``format=<schema>`` structured-output mode, which forces phi to emit
+  ``format=<schema>`` structured-output mode, which forces the model to emit
   syntactically-valid JSON that satisfies the schema (the s8 probe measured this
-  as reliable on phi4-mini — valid ``{"query": ...}`` first try);
+  as reliable — valid ``{"query": ...}`` first try);
 - ``max_tokens`` is raised so a small reasoning model does not truncate the JSON;
-- the emission is BOUNDED (a few attempts) and, if phi still cannot produce
+- the emission is BOUNDED (a few attempts) and, if the model still cannot produce
   usable args, a deterministic FALLBACK derives them from the node's task text —
-  so a research node never hard-fails on a phi hiccup (a1), while phi stays the
-  PRIMARY author of the args (recorded per-call so the demo can prove which path
-  ran).
+  so a research node never hard-fails on a small-model hiccup (a1), while the model
+  stays the PRIMARY author of the args (recorded per-call so the demo can prove
+  which path ran).
 
 This is additive + back-compat: an :class:`~agent_runtime.runtime.AgentRuntime`
 built without a ``tool_arg_emitter`` behaves exactly as before (it uses the
@@ -35,6 +35,7 @@ from llm_framework import Transport
 
 from .factory import PlanNode
 from .selfheal import ToolFailureError
+from .synth_tools import deliverable_extension, explicit_filename, unwrap_output_envelope
 
 # JSON schemas (Ollama-native ``format``) for the core tools' arguments. Required
 # keys + types so the structured-output mode forces phi to fill them. Kept here
@@ -220,6 +221,31 @@ def _first_url_from_inputs(inputs: Optional[Mapping[str, Any]]) -> Optional[str]
     return None
 
 
+def _normalize_report_value(v: Any) -> str:
+    """One upstream value → readable deliverable text (R5 / c1r grounding side).
+
+    Beyond the ``{"output": "<str>"}`` unwrap, flatten a bare ``{"findings": [...]}``
+    wrapper (the exact shape that leaked onto disk as raw JSON) into readable bullet
+    prose, so the writer node persists real text rather than a JSON envelope — the
+    graceful counterpart to the file_write tool boundary's refuse (it never has to
+    fire on this common shape)."""
+    s = unwrap_output_envelope(str(v))
+    st = s.strip()
+    if st.startswith("{") and st.endswith("}") and ('"findings"' in st or '"output"' in st):
+        try:
+            obj = json.loads(st)
+        except (ValueError, TypeError):
+            return s
+        if isinstance(obj, dict):
+            out = obj.get("output")
+            if isinstance(out, str) and out.strip():
+                return out
+            findings = obj.get("findings")
+            if isinstance(findings, (list, tuple)) and findings:
+                return "\n".join(f"- {x}" for x in findings)
+    return s
+
+
 def _report_text_from_inputs(inputs: Optional[Mapping[str, Any]]) -> str:
     """The upstream REPORT text to persist as ``file_write.content``.
 
@@ -227,7 +253,11 @@ def _report_text_from_inputs(inputs: Optional[Mapping[str, Any]]) -> str:
     produce step, so the real deliverable is the upstream node output (e.g. the
     summarize step). Prefer a markdown-looking body; among candidates pick the
     longest (the fullest report). Returns "" when there is nothing upstream."""
-    texts = [_strip_code_fence(str(v)) for v in (inputs or {}).values() if str(v).strip()]
+    texts = [
+        _strip_code_fence(_normalize_report_value(v))
+        for v in (inputs or {}).values()
+        if str(v).strip()
+    ]
     if not texts:
         return ""
 
@@ -245,12 +275,20 @@ def _report_text_from_inputs(inputs: Optional[Mapping[str, Any]]) -> str:
     return max(pool, key=len)
 
 
-def _relatable_md_filename(node: PlanNode, content: str) -> str:
-    """A relatable ``.md`` filename derived from the report's title (else the task).
+def _relatable_filename(node: PlanNode, content: str) -> str:
+    """A relatable filename for the deliverable, with the CHOSEN extension (c3r/d49).
 
-    Uses the first markdown heading / first non-empty line of the content as the
-    title, slugified — so a "Python Release Summary" report lands as
-    ``python-release-summary.md`` rather than a generic ``report.md``."""
+    Precedence mirrors the synthesizer's :func:`~agent_runtime.synth_tools.derive_output_path`
+    so both write paths agree: (1) an explicit filename the task names survives
+    verbatim (``cats.html`` stays ``cats.html``); (2) otherwise the stem is a slug
+    from the report's title (first markdown heading / non-tag line, else the task)
+    and the EXTENSION comes from the bound output-format writer spec (html-writer ->
+    ``.html``) or a format keyword in the task, defaulting to ``.md``. This replaces
+    the old hard-coded ``.md`` that turned an html-writer ``cats.html`` request into
+    ``findings.md`` when no usable path reached the write node."""
+    named = explicit_filename(node.task)
+    if named:
+        return named
     title = ""
     for line in (content or "").splitlines():
         s = line.strip().lstrip("#").strip()
@@ -261,19 +299,20 @@ def _relatable_md_filename(node: PlanNode, content: str) -> str:
     if not title:
         title = (node.task or "report")
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60]
-    return f"{slug or 'report'}.md"
+    ext = deliverable_extension(node.effective_specs, node.task or "")
+    return f"{slug or 'report'}{ext}"
 
 
-def _ensure_md(path: str) -> str:
-    """Force a ``.md`` extension on the deliverable filename (markdown request)."""
-    p = (path or "").strip().strip("/\\")
-    if not p:
-        return "report.md"
-    if p.lower().endswith(".md"):
-        return p
-    # strip any other extension (.html/.txt/...) and use .md
-    stem = p.rsplit(".", 1)[0] if "." in p.rsplit("/", 1)[-1] else p
-    return f"{stem}.md"
+def _has_extension(path: str) -> bool:
+    """True when the filename carries its own (short) extension the model chose.
+
+    Used so a model-chosen ``.html``/``.csv``/... is preserved verbatim and never
+    replaced by the relatable-name fallback (which only kicks in for a name with no
+    extension of its own)."""
+    name = (path or "").strip().strip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if "." not in name or name.endswith("."):
+        return False
+    return 1 <= len(name.rsplit(".", 1)[-1]) <= 5
 
 
 def _is_generic_name(path: str) -> bool:
@@ -384,9 +423,13 @@ def ground_args_from_upstream(
         if not report:
             return None
         path = str(have.get("path") or "").strip()
-        if not path or _is_generic_name(path):
-            path = _relatable_md_filename(node, report)
-        path = _ensure_md(path)
+        # RESPECT the LLM's chosen filename + extension (c3/d49: the model picks ANY
+        # extension — .md/.txt/.csv/.html/...). The old _ensure_md forced every
+        # deliverable to .md; that hard-code is GONE. Only SYNTHESIZE a relatable
+        # name when the model gave nothing usable (empty, or a generic stem WITH NO
+        # extension of its own) — never strip/override an extension it did choose.
+        if not path or (_is_generic_name(path) and not _has_extension(path)):
+            path = _relatable_filename(node, report)
         return {"path": path, "content": report}
     if tool == "send_mail":
         # s7/a3: ground the email BODY in the upstream deliverable (the news/report
@@ -453,22 +496,24 @@ class SchemaToolArgEmitter:
         transport: Transport,
         *,
         schemas: Optional[Mapping[str, Mapping[str, Any]]] = None,
-        max_tokens: int = 256,
+        max_tokens: int = 4096,
         temperature: float = 0.1,
         max_attempts: int = 2,
         fallback: Optional[ArgFallback] = default_fallback,
-        think: bool = False,
+        think: bool = True,
     ) -> None:
         self.transport = transport
         self.schemas = dict(schemas if schemas is not None else TOOL_ARG_SCHEMAS)
         self.max_tokens = max_tokens
         self.temperature = temperature
-        # s8/b1 swap: tool-arg emission is a SCHEMA-CONSTRAINED structured call, so
-        # on a thinking model (gemma4) the CoT trace must be suppressed — otherwise
-        # it eats the small max_tokens budget and the JSON args come back empty (the
-        # a2 failure mode on this path). Defaults False = think suppressed; the
-        # native transport drops ``think`` harmlessly on the OpenAI path / older
-        # non-thinking models, so this stays back-compat.
+        # s1/b1 REASONING ROLLOUT: tool-arg emission is a SCHEMA-CONSTRAINED structured
+        # call; gemma4 now reasons about the args in the SEPARATE message.thinking field
+        # (``think`` defaults True). Because the CoT competes with the content budget,
+        # the default ``max_tokens`` is raised to 4096 (a2-proven load-bearing: at a
+        # small budget the CoT eats it and the JSON args come back EMPTY). The transport
+        # JSON-extraction interceptor strips any fence before the direct json.loads at
+        # :_resolve. The native transport drops ``think`` harmlessly on the OpenAI path /
+        # older non-thinking models, so this stays back-compat.
         self.think = think
         self.max_attempts = max_attempts
         self.fallback = fallback
@@ -485,7 +530,9 @@ class SchemaToolArgEmitter:
         req = ", ".join(schema.get("required", [])) or "(none)"
         system = (
             f"You emit ONLY the JSON arguments for a '{node.tool}' tool call, "
-            f"matching the given schema. Required keys: {req}. No prose."
+            f"matching the given schema. Required keys: {req}. Reason it through "
+            "privately first; your VISIBLE reply must be ONLY the JSON arguments "
+            "object — no prose, no code fences."
         )
         user = (
             f"TASK (the step this tool call serves): {node.task}\n"

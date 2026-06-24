@@ -144,13 +144,15 @@ def test_select_parses_tool_and_args_and_uses_native_structured_opts():
     rt, transport = _runtime_with_script(json.dumps({"tool": "echo", "args": {"text": "hello"}}))
     sel = asyncio.run(rt.caller.select("say hello"))
     assert sel.tool == "echo" and sel.args == {"text": "hello"}
-    # the ship-path opts: native api, think=False top-level, temp 0, schema format.
+    # s1/b1 reasoning rollout ship-path opts: native api, think=True top-level (gemma4
+    # reasons in the SEPARATE message.thinking field), temp 0, schema format, and a
+    # max_tokens raised to give the CoT headroom (a2-proven: a small budget truncates).
     opts = transport.calls[-1]["opts"]
     assert opts["api"] == "native"
-    assert opts["think"] is False
+    assert opts["think"] is True
     assert opts["temperature"] == 0
     assert opts["format"]["properties"]["tool"]["enum"] == ["echo"]
-    assert opts["max_tokens"] >= 256
+    assert opts["max_tokens"] >= 4096
 
 
 def test_call_dispatches_handler_and_returns_structured_result():

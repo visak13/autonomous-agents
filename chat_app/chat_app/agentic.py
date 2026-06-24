@@ -975,9 +975,11 @@ def _build_incremental_planner(
         # terminal-node finalization guarantee inside IncrementalPlanner).
         requested_specs=requested_specs or [],
         # P2.2/P2.5 CF#2 — FRAMEWORK-INJECTED REVIEW. Default False (authored plan
-        # byte-identical); the served report write phase turns it on behind the
-        # reversible P2.5 flag so each authored write node gains a work->review pair
-        # + a final review (the framework injects it, not the planner).
+        # byte-identical); the served report write phase turns it on UNCONDITIONALLY
+        # (P2-5c/d65 flag-free end-state — formerly behind the reversible P2.5 flag) so
+        # each authored write node gains a work->review pair + a final review (the
+        # framework injects it, not the planner). The review emits RAW worker content,
+        # never a verdict/findings envelope (d50: the enum-verdict judgment path is retired).
         inject_review=inject_review,
     )
 
@@ -1564,7 +1566,7 @@ async def _run_generic_research_phase(
     research_depth: Optional[int],
     completeness_stop: Optional[str] = None,
 ) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
-    """P2.5 — the GENERIC-engine PHASE-1 research (the consolidation candidate behind the flag).
+    """P2.5/P2-5c — the GENERIC-engine PHASE-1 research, now the SERVED DEFAULT (d65 flag-free).
 
     Replaces the bespoke ``run_research_tree`` layer loop with the SAME generic engine the
     inline path uses (d115/d128): UNROLL the deep-research SHAPE into a bounded acyclic
@@ -1575,12 +1577,15 @@ async def _run_generic_research_phase(
     :func:`run_section_write_phase`, so ONLY the research ENGINE changes — the write side, the
     ``(findings, sources)`` contract and the d50/d60 grounding invariants are byte-identical.
 
-    ARCHITECTURAL NOTE (the parity risk, recorded honestly): the unroll is a FLAT
-    growing-visibility chain with a FIXED round structure — it has NO state-driven re-expansion
-    or persisted-findings decision node (the very mechanism that RESTORED Phase-1 breadth in
-    d111/d121/d122). So this candidate is expected to gather FEWER scoped facets than the tree
-    on the same budget; the HARD PARITY GATE measures exactly that, and per d132.E/d133 the
-    flag stays OFF (tree stays served) unless the candidate meets the bar."""
+    ITERATIVE BREADTH (P2-5b, d134/d135 — parity HELD): when the resolved shape declares
+    ``expand_on_gaps`` the unroll emits only the SEED layer + tags the DAG ``growable``, and
+    this phase builds a :class:`DagGrower` (below) that REUSES the SAME ``ResearchState`` +
+    ``Tree`` + ``run_decision_node`` + ``completeness_stop`` the retired tree used. The runtime
+    drive loop (:meth:`AgentRuntime._drive_growable`) then DECOMPOSE-FIRST-seeds the goal into
+    scoped children and grows wave-by-wave on note gaps — reproducing ``run_research_tree``'s
+    state-driven re-expansion WITHOUT a second engine. P2-5b proved within-run, same-budget,
+    that generic breadth meets-or-exceeds the tree, grounded; per d65 the reversible flag was
+    RETIRED in P2-5c and this is the served default on BOTH report routes."""
     spec_name = _deep_research_spec(registry, requested_specs)
     # Unroll the declarative shape; honor the shape/UI depth as max_iter (unroll_shape clamps
     # to the shape hard_cap). Per-leaf fetch breadth stays PINNED to the report contract (D97).

@@ -31,6 +31,7 @@ from llm_framework import Chain, Context, Transport
 from llm_framework.stages import call_stage, prompt_assembly, structured_output
 
 from .factory import AbstractPlanFactory, PlanDAG, PlanError
+from .identity import with_identity
 from .selfheal import MalformedOutputError
 from .tracing import get_tracer, run_blocking_in_span
 
@@ -59,14 +60,19 @@ _HEAL_DECISION_SCHEMA: dict[str, Any] = {
     "required": ["action", "rationale"],
 }
 
-# Native structured-call options for the heal decision (d1): the proven
-# think=false / temp 0 path. ``think`` OFF so gemma emits the JSON decision
-# directly instead of spending the budget on a CoT trace.
+# Native structured-call options for the heal decision. s1/b1 REASONING ROLLOUT
+# (planner steer): ``think=True`` so gemma4 reasons about how to heal a failed step
+# (retry/pivot/extend/abort) in the SEPARATE message.thinking field before emitting
+# the JSON decision — d1 wants think=True across the WHOLE structured pipeline, and
+# the heal decision is a genuine structured step (a1 §3 site #1). The CoT competes
+# with the content budget, so ``num_predict`` is raised 256->4096 (a2-proven
+# load-bearing: at <=512 the content truncates to EMPTY). temp 0 deterministic; the
+# response routes through the transport JSON-extraction interceptor like the others.
 _HEAL_OPTS: dict[str, Any] = {
     "api": "native",
-    "think": False,
+    "think": True,
     "temperature": 0,
-    "num_predict": 256,
+    "num_predict": 4096,
     "format": _HEAL_DECISION_SCHEMA,
 }
 
@@ -85,15 +91,17 @@ _AMBIGUITY_DECISION_SCHEMA: dict[str, Any] = {
         "needs_clarification": {
             "type": "boolean",
             "description": (
-                "true ONLY when the request omits a detail you would otherwise have "
-                "to GUESS to act correctly; false when it is clear enough to plan"
+                "true ONLY when the request is to SCHEDULE a recurring/future task "
+                "and a scheduling detail (what to do, or when/how often) is missing; "
+                "false for any normal one-shot request — proceed with sensible "
+                "defaults, never interrogate"
             ),
         },
         "question": {
             "type": "string",
             "description": (
-                "if needs_clarification, ONE short question asking the user for the "
-                "missing detail(s); empty string otherwise"
+                "if needs_clarification, ONE short question for the missing "
+                "scheduling detail; empty string otherwise"
             ),
         },
         "rationale": {"type": "string", "description": "one line: why"},
@@ -101,12 +109,18 @@ _AMBIGUITY_DECISION_SCHEMA: dict[str, Any] = {
     "required": ["needs_clarification", "question", "rationale"],
 }
 
-# Same proven think=false / temp 0 native path as the heal decision.
+# s1/b1 REASONING ROLLOUT: gemma4 is a thinking model — enable native ``think=True``
+# on the ambiguity gate so the model reasons (in the SEPARATE message.thinking field)
+# about whether a request is load-bearingly underspecified before deciding. The CoT
+# competes with the content token budget, so ``num_predict`` is raised 256->4096 (the
+# a2-proven load-bearing bump: at <=512 the CoT alone fills the budget and the JSON
+# ``content`` truncates to EMPTY). temp 0 deterministic; the transport JSON-extraction
+# interceptor returns clean JSON.
 _AMBIGUITY_OPTS: dict[str, Any] = {
     "api": "native",
-    "think": False,
+    "think": True,
     "temperature": 0,
-    "num_predict": 256,
+    "num_predict": 4096,
     "format": _AMBIGUITY_DECISION_SCHEMA,
 }
 
@@ -252,12 +266,20 @@ class Planner:
                     f"planner JSON unparsable after {self.max_repair_attempts} "
                     f"repair attempts: {repair.get('final_error')}"
                 )
+            # SAFE FALLBACK (b2 hardening of the a2 4/5 graph-integrity finding):
+            # with think=True the planner non-deterministically emits a node whose
+            # depends_on names a PHANTOM id. ``parse_dag_safe`` REPAIRS that (drops
+            # the dangling/self edge → graceful degrade) so it never surfaces as a
+            # user-visible failure. Every OTHER invalidity (dup id / real cycle /
+            # empty plan) still raises PlanError → MalformedOutputError, preserving
+            # the outer self-heal's retry-on-reject backstop.
             try:
-                dag = self.factory.parse_dag(ctx.structured)
+                dag, repairs = self.factory.parse_dag_safe(ctx.structured)
             except PlanError as exc:
-                # A structurally-invalid plan is also a malformed-output failure the
-                # outer self-heal should re-plan.
                 raise MalformedOutputError(f"planner emitted an invalid DAG: {exc}") from exc
+            if repairs:
+                span.set_attribute("planner.dag.repaired_edges", len(repairs))
+                span.set_attribute("planner.dag.repairs", "; ".join(repairs)[:1000])
 
             span.set_attribute("planner.node_count", len(dag.nodes))
             result = PlanResult(
@@ -273,9 +295,10 @@ class Planner:
     async def assess_ambiguity(self, goal: str) -> AmbiguityDecision:
         """Decide whether ``goal`` is too underspecified to plan without guessing.
 
-        A native structured Gemma call (``think=False``, ``temperature=0``, a JSON
-        schema with a ``needs_clarification`` boolean + a single ``question``
-        string, per d1) — the SAME proven path as :meth:`heal_decision`. When the
+        A native structured Gemma call (s1/b1: ``think=True`` + raised
+        ``num_predict``, ``temperature=0``, a JSON schema with a
+        ``needs_clarification`` boolean + a single ``question`` string, per d1) —
+        the SAME path as :meth:`heal_decision`. When the
         model judges the request omits a LOAD-BEARING detail (one it would have to
         guess to act correctly), it returns ``needs_clarification=True`` and ONE
         concise question to ask the user back; the live chat path then PAUSES and
@@ -288,18 +311,19 @@ class Planner:
         boolean is treated as "not ambiguous" (proceed), so a transport that does
         not understand the schema never blocks a run — exactly the safe default the
         offline seam and existing callers rely on."""
-        system = (
+        system = with_identity(
             self.factory.description
-            + "\n\nBefore planning, JUDGE whether the user's request is clear enough "
-            "to act on. A request is AMBIGUOUS only when it omits a LOAD-BEARING "
-            "detail you would otherwise have to GUESS — e.g. 'email me every morning' "
-            "does not say WHAT about or at WHAT time. A request that names its "
-            "subject and intent is NOT ambiguous just because minor styling is "
-            "unstated; do not over-ask. If ambiguous, set needs_clarification=true "
-            "and write ONE short question gathering the missing detail(s). If clear, "
-            "set needs_clarification=false and question to an empty string. Emit "
-            "STRICT JSON {\"needs_clarification\": <bool>, \"question\": <string>, "
-            "\"rationale\": <one line>}."
+            + "\n\nBefore planning, decide if you must ask ONE clarifying question. "
+            "Ask ONLY when the request is to SCHEDULE a recurring or future task "
+            "(e.g. 'email me every morning', 'remind me daily at 9') AND a "
+            "load-bearing scheduling detail is missing — WHAT to do, or WHEN/how "
+            "often. Any normal one-shot request — even a broad one like 'write a "
+            "report on X' — is NOT ambiguous: proceed with sensible defaults "
+            "(general scope, full timeframe), never interrogate. If a scheduling "
+            "detail is missing, set needs_clarification=true and ask ONE short "
+            "question for it; otherwise needs_clarification=false and question=\"\". "
+            "Emit STRICT JSON {\"needs_clarification\": <bool>, \"question\": "
+            "<string>, \"rationale\": <one line>}."
         )
         user = f"USER REQUEST:\n{goal}\n\nReturn ONLY the JSON ambiguity decision."
         chain = Chain()
@@ -350,8 +374,9 @@ class Planner:
 
         A node returning ``{status:"failed", reason}`` halts terminalization; rather
         than leave a dead plan, the planner makes a HEAL DECISION here — a native
-        structured Gemma call (``think=False``, ``temperature=0``, a JSON schema with
-        an ``enum`` action + ``required`` keys, per d1). The returned
+        structured Gemma call (s1/b1: ``think=True`` + raised ``num_predict``,
+        ``temperature=0``, a JSON schema with an ``enum`` action + ``required``
+        keys, per d1). The returned
         :class:`HealDecision` is one of :data:`HEAL_ACTIONS`
         (``retry|pivot|abort|extend``) + a one-line rationale; the runtime ROUTES that
         action through its deterministic heal logic (retry → re-dispatch the same node;
@@ -359,21 +384,21 @@ class Planner:
         control flow — this call only MAKES the choice. Raises
         :class:`MalformedOutputError` if the repair loop cannot extract a legal enum
         action so the outer bound can give up."""
-        system = (
+        system = with_identity(
             self.factory.description
-            + "\n\nA SINGLE step of an executing plan FAILED and the plan must NOT be "
-            "left dead. Decide how to HEAL it. Choose EXACTLY ONE action:\n"
-            "  - 'retry': a TRANSIENT failure (timeout, a one-off error); re-launch "
-            "the SAME step unchanged.\n"
-            "  - 'pivot': the APPROACH is wrong; re-derive a corrective sub-plan that "
-            "reaches the step's intent a DIFFERENT way.\n"
-            "  - 'extend': the step needs an EXTRA remediation step before it can "
-            "succeed; add it, then continue.\n"
-            "  - 'abort': UNRECOVERABLE; give up this branch and surface to the user.\n"
-            "Prefer 'retry' for a transient error while attempts remain; 'pivot' when "
-            "retries are exhausted or the approach is structurally wrong; 'abort' only "
-            "when nothing can recover. Emit STRICT JSON {\"action\": <one of "
-            "retry|pivot|abort|extend>, \"rationale\": <one line>}."
+            + "\n\nA step of an executing plan FAILED; the plan must not be left "
+            "dead. Choose EXACTLY ONE heal action:\n"
+            "- 'retry': TRANSIENT failure (timeout/one-off); re-launch the same step "
+            "unchanged. Prefer this while attempts remain.\n"
+            "- 'pivot': the APPROACH is wrong; re-derive a corrective sub-plan a "
+            "different way. Use when retries are exhausted or the approach is "
+            "structurally wrong.\n"
+            "- 'extend': the step needs an EXTRA remediation step first; add it, "
+            "then continue.\n"
+            "- 'abort': UNRECOVERABLE; give up this branch and surface. Use only "
+            "when nothing can recover.\n"
+            "Emit STRICT JSON {\"action\": <retry|pivot|abort|extend>, \"rationale\": "
+            "<one line>}."
         )
         user = (
             f"FAILED STEP: {failed_task}\n"
@@ -464,10 +489,17 @@ class Planner:
                     f"re-plan JSON unparsable after {self.max_repair_attempts} "
                     f"repair attempts: {repair.get('final_error')}"
                 )
+            # SAFE FALLBACK (b2): a corrective sub-plan is authored by the SAME
+            # think=True planner, so it can carry the same dangling-edge
+            # malformation — repair it rather than fail the heal. Non-repairable
+            # invalidity still raises for the runtime's bounded re-plan give-up.
             try:
-                dag = self.factory.parse_dag(ctx.structured)
+                dag, repairs = self.factory.parse_dag_safe(ctx.structured)
             except PlanError as exc:
                 raise MalformedOutputError(f"re-plan emitted an invalid DAG: {exc}") from exc
+            if repairs:
+                span.set_attribute("planner.replan.repaired_edges", len(repairs))
+                span.set_attribute("planner.replan.repairs", "; ".join(repairs)[:1000])
             span.set_attribute("planner.replan.node_count", len(dag.nodes))
             return dag
 

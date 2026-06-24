@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type {
   ChatRecord,
+  ClarificationPending,
   MissingSpecChoice,
   MissingSpecialistPending,
 } from "../../api/types";
 import { LambdaTab } from "../LambdaTab/LambdaTab";
+import { ClarificationResumePause } from "./ClarificationResumePause";
 import { MissingSpecialistPause } from "./MissingSpecialistPause";
 import "./ConversationPane.css";
 
@@ -21,8 +23,13 @@ interface ConversationPaneProps {
   pendingMessage: string | null;
   /** The missing-specialist CHOICE payload when the run paused (s10-a8), else null. */
   pendingResolution: MissingSpecialistPending | null;
+  /** The clarification payload when the run paused on a planner question
+   * (scenario-2 / d5), else null. */
+  pendingClarification: ClarificationPending | null;
   /** Resolve the active pause (sse_fallback / define_and_resume). */
   onResume: (choice: MissingSpecChoice, specName?: string) => void;
+  /** Resolve the active clarification pause by posting the user's answer to /resume. */
+  onResolveClarification: (answer: string) => void;
   /** True while a resume round-trip is in flight. */
   resuming: boolean;
   /** A resume error message, else null. */
@@ -39,7 +46,9 @@ export function ConversationPane({
   onNewChat,
   pendingMessage,
   pendingResolution,
+  pendingClarification,
   onResume,
+  onResolveClarification,
   resuming,
   resumeError,
 }: ConversationPaneProps) {
@@ -51,7 +60,7 @@ export function ConversationPane({
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [turnCount, busy, pendingResolution, resuming]);
+  }, [turnCount, busy, pendingResolution, pendingClarification, resuming]);
 
   if (!chat && !loading) {
     return (
@@ -114,6 +123,14 @@ export function ConversationPane({
             resuming={resuming}
             resumeError={resumeError}
             onResume={onResume}
+          />
+        )}
+        {pendingClarification && (
+          <ClarificationResumePause
+            pending={pendingClarification}
+            resuming={resuming}
+            resumeError={resumeError}
+            onResolve={onResolveClarification}
           />
         )}
         {runError && <p className="conversation-error" role="alert">Run error: {runError}</p>}

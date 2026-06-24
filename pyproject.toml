@@ -3,6 +3,7 @@ name = "reactive-agents"
 version = "0.1.0"
 description = "Standalone in-process reactive multi-agent system (phi4-mini runtime, zero Claude). uv workspace root (d11)."
 requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
 # d11: d2 mandates ONE in-process process, so every component must import every
 # other in the SAME interpreter resolved into ONE shared .venv. This root is a
 # uv WORKSPACE that folds each component in as a member and depends on them so

@@ -108,6 +108,22 @@ class SpecRegistry:
         # :meth:`load` byte-for-byte, no stale in-memory copy.
         return self.load(name)
 
+    # ---- delete: remove a spec's doc from the store (s4/a3) ---- #
+    def delete(self, name: str) -> Path:
+        """Remove a registered spec by unlinking its markdown doc. Returns the path.
+
+        The store is STATELESS (every read — ``index``/``load``/``names``/
+        ``__contains__`` — hits disk fresh), so a safe delete is just removing the
+        ``specs/<slug>.md`` file: there is NO in-memory cache to invalidate. Uses
+        ``_slug`` (via :meth:`_path`) so the name can never escape the specs dir.
+        Raises ``KeyError`` if no spec named ``name`` is registered (the route maps
+        that to 404), mirroring :meth:`load`."""
+        p = self._path(name)
+        if not p.exists():
+            raise KeyError(f"no registered specialization named {name!r}")
+        p.unlink()
+        return p
+
     # ---- planner-facing lookup: index ONLY, never a body (d10) ---- #
     def index(self) -> list[SpecIndexEntry]:
         """Return the body-free lookup rows the PLANNER reasons over.

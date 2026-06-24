@@ -357,14 +357,16 @@ def _router_transport(plan: dict):
 
     It routes each structured call by the JSON-schema ``format`` it is handed
     (the same seam the real model is driven through), so the full ``run_agentic``
-    path runs offline. a3: ``linear`` is now an OPEN shape AUTHORED node-by-node by
-    the incremental authorer (not the one-shot planner), so the routing is:
-    shape-selection -> ``linear``; the INCREMENTAL per-node call (its schema has
-    ``more``) -> the plan's nodes one at a time; the ``send_mail`` arg-emitter call
-    (its schema has ``subject``) -> the agent-written subject+body (the incremental
-    authorer carries no ``tool_args``, so the emitter grounds them per d11); the
-    node's own scoped generation (no ``format``) -> a body string. Defensive: an
-    unexpected heal call resolves to ``retry``."""
+    path runs offline. s8/b1: ``linear`` is now an OPEN shape AUTHORED by the
+    TOOL-DRIVEN incremental authorer (the planner issues plan-building tool calls,
+    no per-node ``format`` schema), so the routing is: shape-selection (schema has
+    ``shape``) -> ``linear``; the tool-driven AUTHORING turns (system prompt carries
+    the PLAN-BUILDING TOOLS, no ``format``) -> ``add_step`` for each plan node then
+    ``finalize_plan``; the ``send_mail`` arg-emitter call (schema has ``subject``) ->
+    the agent-written subject+body (the authorer carries no ``tool_args``, so the
+    emitter grounds them per d11); the node's own scoped generation (no ``format``,
+    no plan-tools marker) -> a body string. Defensive: an unexpected heal call
+    resolves to ``retry``."""
     from llm_framework import FakeTransport
 
     nodes = plan.get("nodes", [])
@@ -374,21 +376,31 @@ def _router_transport(plan: dict):
     def route(messages, **opts):
         fmt = opts.get("format")
         props = fmt.get("properties", {}) if isinstance(fmt, dict) else {}
+        system = next(
+            (str(m.get("content", "")) for m in messages if m.get("role") == "system"),
+            "",
+        )
         if "shape" in props:
             return json.dumps({"shape": "linear", "rationale": "single sequential mail step"})
-        if "more" in props:  # the INCREMENTAL per-node authoring call (a3)
+        if not fmt and "PLAN-BUILDING TOOLS" in system:
+            # the TOOL-DRIVEN authoring loop (s8/b1): emit add_step per plan node,
+            # then finalize_plan once all are authored.
             i = authored["i"]
             authored["i"] = i + 1
-            node = nodes[i] if i < len(nodes) else nodes[-1]
-            return json.dumps(
-                {
-                    "task": node.get("task", ""),
-                    "spec": node.get("spec", "") or "",
-                    "tool": node.get("tool", "") or "",
-                    "depends_on": [],  # single-step linear plan
-                    "more": i < len(nodes) - 1,
-                }
-            )
+            if i < len(nodes):
+                node = nodes[i]
+                return json.dumps(
+                    {
+                        "tool": "add_step",
+                        "args": {
+                            "task": node.get("task", ""),
+                            "spec": node.get("spec", "") or "",
+                            "tool": node.get("tool", "") or "",
+                            "depends_on": [],  # single-step linear plan
+                        },
+                    }
+                )
+            return json.dumps({"tool": "finalize_plan", "args": {}})
         if "subject" in props:  # the send_mail tool-arg emitter call (d11)
             return json.dumps(
                 {"subject": args0.get("subject", ""), "body": args0.get("body", "")}

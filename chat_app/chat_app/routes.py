@@ -239,6 +239,14 @@ class MessageResponse(BaseModel):
     outputs: dict[str, str]
     artifacts: list[ArtifactOut]
     missing_specialist: bool = False
+    # AMBIGUITY-CLARIFICATION PAUSE (scenario-2): True when the run paused on a
+    # planner clarifying question instead of running. ``pending`` then carries the
+    # clarification payload ({kind, resume_token, question, original_query}); the
+    # client surfaces the question and echoes the user's ``answer`` back to
+    # ``POST /chats/{id}/resume``. Distinct from ``missing_specialist`` so the UI
+    # can tell a clarify pause apart from a normal run (both have
+    # ``missing_specialist=False``). Back-compat: pre-existing clients ignore it.
+    needs_clarification: bool = False
     pending: dict[str, Any] | None = None
 
 
@@ -514,6 +522,7 @@ def register_routes(app: FastAPI) -> None:
                 outputs={},
                 artifacts=[],
                 missing_specialist=False,
+                needs_clarification=True,
                 pending=pending,
             )
 

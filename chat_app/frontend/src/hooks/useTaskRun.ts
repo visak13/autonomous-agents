@@ -17,6 +17,7 @@ import { useResumeRun, useRunPolling, useStartRun } from "../api/queries";
 import { statusForEvent } from "../api/lifecycle";
 import type {
   ArtifactOut,
+  ClarificationPending,
   MissingSpecChoice,
   MissingSpecialistPending,
   NodeStateOut,
@@ -163,9 +164,17 @@ export interface UseTaskRunResult {
   /** The CHOICE payload when the run PAUSED needing an unavailable specialist
    * (s10-a8), else null. Surfaced so the UI can render the resolution buttons. */
   pendingResolution: MissingSpecialistPending | null;
+  /** The CLARIFICATION payload when the run PAUSED on a planner clarifying
+   * question (scenario-2), else null. Surfaced so the UI can render the
+   * answer-and-resume prompt. */
+  pendingClarification: ClarificationPending | null;
   /** Resolve the active missing-specialist pause: `sse_fallback` runs the unmet
    * node(s) spec-less; `define_and_resume` stamps `specName` onto them. */
   resume: (choice: MissingSpecChoice, specName?: string) => void;
+  /** Resolve the active clarification pause: POST the user's `answer` to /resume
+   * (the backend re-drives the plan on the clarified intent) — NOT a fresh
+   * /message, so the gate does not re-ask. */
+  resolveClarification: (answer: string) => void;
   /** True while a resume round-trip is in flight. */
   resuming: boolean;
   /** A resume error message, else null. */
@@ -258,7 +267,22 @@ export function useTaskRun(chatId: string | null): UseTaskRunResult {
   // resolved that token. (Scoped to this chat — `result` is keyed on this chat's
   // run id; a chat switch resets resolvedToken and the run id above.)
   const pendingResolution: MissingSpecialistPending | null =
-    result?.missing_specialist && result.pending && result.pending.resume_token !== resolvedToken
+    result?.missing_specialist &&
+    result.pending &&
+    !("kind" in result.pending) &&
+    result.pending.resume_token !== resolvedToken
+      ? result.pending
+      : null;
+
+  // The active CLARIFICATION pause for THIS chat: the just-finished run reported
+  // needs_clarification with a clarification payload, AND the user has not yet
+  // answered that token. Same chat-scoping + resolved-token hiding as the
+  // missing-specialist pause above.
+  const pendingClarification: ClarificationPending | null =
+    result?.needs_clarification &&
+    result.pending &&
+    "kind" in result.pending &&
+    result.pending.resume_token !== resolvedToken
       ? result.pending
       : null;
 
@@ -285,6 +309,30 @@ export function useTaskRun(chatId: string | null): UseTaskRunResult {
       );
     },
     [chatId, pendingResolution, resumeRunMut],
+  );
+
+  const resolveClarification = useCallback(
+    (answer: string) => {
+      const trimmed = answer.trim();
+      if (!chatId || !pendingClarification || resumeRunMut.isPending || !trimmed) return;
+      const token = pendingClarification.resume_token;
+      // The user's already-given answer goes to /resume (which re-drives the plan
+      // on the clarified intent) — NOT a fresh /message, which the ambiguity gate
+      // would just re-ask. The resumed plan streams its node lifecycle over THIS
+      // chat's already-open SSE, so start from a clean DAG, then take the resumed
+      // summary's node_states as the authoritative reconciliation.
+      dispatch({ type: "reset" });
+      resumeRunMut.mutate(
+        { chatId, req: { resume_token: token, answer: trimmed } },
+        {
+          onSuccess: (resp) => {
+            dispatch({ type: "reconcile", states: resp.node_states });
+            setResolvedToken(token);
+          },
+        },
+      );
+    },
+    [chatId, pendingClarification, resumeRunMut],
   );
 
   const nodes = useMemo(
@@ -315,7 +363,9 @@ export function useTaskRun(chatId: string | null): UseTaskRunResult {
     lastCompletedRunId,
     pendingMessage,
     pendingResolution,
+    pendingClarification,
     resume,
+    resolveClarification,
     resuming: resumeRunMut.isPending,
     resumeError: resumeRunMut.error?.message ?? null,
   };

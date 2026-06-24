@@ -25,10 +25,12 @@
 # adding one text file; a3 re-architecture).
 
 name = "deep-research"
-description = """Iterative depth-first research: ~9 rounds of {research + critic} \
-then 1 final round of {research + synthesis + verify}. ONE specialization reused \
-across all rounds, behaviour set only by node role; each round sees all prior \
-researched layers; bounded by max_iter (not the critic)."""
+description = """Choose for an EXHAUSTIVE, multi-round investigation of ONE topic \
+that must go deep and be fact-checked — not a quick answer, and not a parallel \
+gather of separate topics. Runs ~9 iterative rounds of {research + critic}, each \
+building on and critiquing the last, then a final {research + synthesis + verify} \
+round; ONE specialization reused across all rounds (node role sets behaviour), \
+each round sees all prior researched layers, bounded by max_iter (not the critic)."""
 
 # UI-OVERRIDABLE CEILING (d5). Default ≈10 rounds = 9×{research+critic} + 1 final
 # round of {research+synthesis+verify}. The s4 Shapes screen persists an override
@@ -46,7 +48,67 @@ hard_cap = 24
 # edges serialise the rounds, so the dispatch mode is immaterial.
 execution = "deep-research"
 
+# ---------------------------------------------------------------------------
+# P2.4 (d131/d132.D/d133) — the STOP SIGNAL is DEFINED IN THE SHAPE, not in code.
+# ---------------------------------------------------------------------------
+# COMPLETENESS-DRIVEN stop. This text is handed to the research-tree DECISION
+# node verbatim as its stop criterion (research_tree._decision_instruction reads
+# it), so the model REASONS over "fill all the blanks" rather than halting at an
+# arbitrary depth baked into _DECISION_INSTRUCTION. The loop keeps poking the
+# RIGHT gap-questions (identify what/when/why/how -> find answers -> verify ->
+# expand into the blanks) and stops only when every facet the query implies is
+# answered with no meaning-adding gap left. Editing THIS string changes the stop
+# behaviour — no code change. (Empty => the runtime keeps its baked default.)
+completeness_stop = """Keep poking the RIGHT gap-questions for THIS query: identify \
+what / when / why / how, find the answers, VERIFY them, then expand into whatever \
+BLANKS remain. Each gathered note is a reusable DATA POINT (a claim + its source + \
+any gap it opens); a note's gap is the next question — e.g. 'the timeline lists \
+these events, but are ALL the events accounted for?'. STOP only when every facet the \
+query implies is filled — the thesis is answered across its real dimensions (timeline, \
+key events, costs/figures, causes, impact) with no meaning-adding gap left. This is a \
+COMPLETENESS stop: do NOT halt at an arbitrary depth, and do NOT pad once the blanks \
+are filled."""
+
+# ---------------------------------------------------------------------------
+# P2.4 (d131/d133) — CROSS-CUTTING SOURCE POLICY, expressed at the SHAPE.
+# ---------------------------------------------------------------------------
+# The deep-research shape declares the domains the research must NEVER fetch or
+# cite. Wikipedia (+ wikimedia / wiktionary) is the emphatic, non-negotiable
+# baseline (the user: "wikipedia is a lie polluting the internet"). This is
+# TOOL-ENFORCED: the P2.1 web-tools carry an always-on baseline deny-list and a
+# per-call ``exclude_domains`` arg; this list is the shape-level statement of the
+# same policy (extensible to social-media / opinion sources later).
+deny_domains = ["wikipedia.org", "wikimedia.org", "wiktionary.org"]
+
+# ---------------------------------------------------------------------------
+# P2.5b (d134/d135) — ITERATIVE GAP-EXPANSION (the parity lever to RETIRE the tree).
+# ---------------------------------------------------------------------------
+# When true, the GENERIC engine reproduces run_research_tree's ITERATIVE breadth:
+# `unroll_shape` emits ONLY the first (seed) research layer and tags the PlanDAG
+# `growable`, and the runtime's drive loop GROWS the DAG round-by-round by invoking
+# the SAME research_tree.run_decision_node over the persisted ResearchState — each
+# note's gaps author the next layer's research nodes (growing-visibility edges). The
+# loop is bounded by `max_layers` + `fan_out` + no_expansion + the `completeness_stop`
+# above (the model's stop_research). This relaxes EXACTLY ONE invariant ("node set
+# fixed at unroll time") and reuses the tree's already-generic tool-driven loop — NO
+# bespoke python, no second engine. false => the legacy frozen unroll (all rounds at
+# unroll time), byte-identical to pre-P2.5b. (The DAG IS the research topology; the
+# `max_iter`/`round_roles`/`final_roles` above still describe the frozen-unroll mode.)
+expand_on_gaps = true
+
+# GROWTH BOUND: the max number of research layers the growable drive runs (seed = layer
+# 1; growth adds up to max_layers-1 more), further clamped by the TreeConfig depth
+# ceiling (≤10). A hard termination-safety bound alongside no_expansion / stop_research.
+# 5 mirrors the tree's baseline depth (TreeConfig.depth default 5).
+max_layers = 5
+
+# PER-DECISION-LAYER expansion cap handed to the grower's Tree (≤ this many expand_branch
+# keeps per layer) — the iterative breadth knob. Mirrors TreeConfig.fan_out (~4-5).
+fan_out = 5
+
 # Node roles emitted each NON-FINAL round, in order. Both run the SAME spec.
+# (Frozen-unroll mode only; in the growable mode above the SEED uses the research
+# position and the decision node plays the critic — mirroring the tree's gather-decide.)
 round_roles = ["research", "critic"]
 
 # Node roles emitted in the SINGLE FINAL round, in order (replaces the last

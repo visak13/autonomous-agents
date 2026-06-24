@@ -9,10 +9,11 @@ check on the shape selector's reliable spec-name extraction: the new free-string
 ``run_agentic`` fires the (unchanged) notify/pause when ``name not in registry``.
 
 These tests drive the REAL ``run_agentic`` on the deterministic ``FakeTransport``
-(no GPU / live model): one scripted reply for the shape-selection call, one for the
-single-node incremental authoring call. ``skip_ambiguity=True`` bypasses the
-pre-selection ambiguity call so the scripted replies line up. The trigger is generic
-— a set-membership check, no scenario/keyword/topic matching.
+(no GPU / live model): one scripted reply for the shape-selection call, then the
+planner's TOOL CALLS for the tool-driven incremental authoring (add_step →
+finalize_plan). ``skip_ambiguity=True`` bypasses the pre-selection ambiguity call so
+the scripted replies line up. The trigger is generic — a set-membership check, no
+scenario/keyword/topic matching.
 """
 from __future__ import annotations
 
@@ -24,6 +25,13 @@ from reactive_tools import EventPlane
 
 from chat_app.agentic import run_agentic
 from chat_app.app import build_wiring
+
+# A deliberately-synthetic specialization name that no real spec would ever carry.
+# The test needs a name the live registry GENUINELY does not have (build_wiring loads
+# the shared var/chat_app data dir, whose registered specs grow as the app is used —
+# an earlier hardcoded "forensic-accountant" later collided with a spec authored during
+# live testing). The guard assert in _run still protects the intent if this ever clashes.
+MISSING_SPEC = "zzz-unregistered-sentinel-specialist"
 
 
 def _selector_reply(shape: str, *, unmet_specs=None, requested_specs=None) -> str:
@@ -40,24 +48,32 @@ def _selector_reply(shape: str, *, unmet_specs=None, requested_specs=None) -> st
 
 
 def _node_reply(task: str, *, tool: str = "", spec: str = "", more: bool = False) -> str:
+    """One ``add_step`` tool call (the planner builds the DAG by calling tools)."""
     return json.dumps(
         {
-            "task": task,
-            "spec": spec,
-            "specs": [],
-            "needs_spec": "",
-            "tool": tool,
-            "depends_on": [],
-            "more": more,
+            "tool": "add_step",
+            "args": {
+                "task": task,
+                "spec": spec,
+                "specs": [],
+                "needs_spec": "",
+                "tool": tool,
+                "depends_on": [],
+            },
         }
     )
+
+
+def _final_reply() -> str:
+    """The closing ``finalize_plan`` tool call."""
+    return json.dumps({"tool": "finalize_plan", "args": {}})
 
 
 def _run(transport, query, **kw):
     w = build_wiring()
     try:
         # the requested specialist must genuinely be absent for the trigger to be real.
-        assert "forensic-accountant" not in set(w.registry.names())
+        assert MISSING_SPEC not in set(w.registry.names())
         return asyncio.run(
             run_agentic(
                 query,
@@ -79,8 +95,9 @@ def test_unregistered_requested_spec_fires_missing_specialist_pause():
     # spec-less — and attach the unmet need to the DAG's sink (answer) node.
     transport = FakeTransport(
         [
-            _selector_reply("linear", unmet_specs=["forensic-accountant"]),
+            _selector_reply("linear", unmet_specs=[MISSING_SPEC]),
             _node_reply("write the forensic accounting report", more=False),
+            _final_reply(),
         ]
     )
     res = _run(transport, "write me a forensic-accountant report on this filing")
@@ -90,7 +107,7 @@ def test_unregistered_requested_spec_fires_missing_specialist_pause():
     pending = res.pending or {}
     assert pending.get("choices") == ["sse_fallback", "define_and_resume"]
     needs = " ".join(m.get("needs", "") for m in pending.get("missing", []))
-    assert "forensic-accountant" in needs
+    assert MISSING_SPEC in needs
     # the need is attached to a real DAG node (so a define-and-resume can stamp the
     # newly-defined spec there) — the sink/terminal node of the authored plan.
     flagged = {m["node_id"] for m in pending["missing"]}
@@ -108,8 +125,9 @@ def test_deep_research_is_suppressed_when_a_spec_is_unavailable():
     # the pause — deep-research is never run spec-less for a missing-specialist need.
     transport = FakeTransport(
         [
-            _selector_reply("deep-research", unmet_specs=["forensic-accountant"]),
+            _selector_reply("deep-research", unmet_specs=[MISSING_SPEC]),
             _node_reply("research and report on the filing", more=False),
+            _final_reply(),
         ]
     )
     res = _run(transport, "do a deep forensic-accountant investigation of the filing")
@@ -130,6 +148,7 @@ def test_registered_requested_spec_does_not_false_fire():
             [
                 _selector_reply("linear", unmet_specs=["markdown-writer"]),
                 _node_reply("write the overview", more=False),
+                _final_reply(),
                 # the run proceeds to execute the single node; a generous tail of
                 # produce/verify replies keeps the deterministic transport fed.
                 *["the overview text" for _ in range(8)],

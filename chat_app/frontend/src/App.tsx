@@ -76,7 +76,9 @@ export function App() {
               onNewChat={handleNewChat}
               pendingMessage={run.pendingMessage}
               pendingResolution={run.pendingResolution}
+              pendingClarification={run.pendingClarification}
               onResume={run.resume}
+              onResolveClarification={run.resolveClarification}
               resuming={run.resuming}
               resumeError={run.resumeError}
             />

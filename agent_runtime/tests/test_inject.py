@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent_runtime.factory import PlanNode
+from agent_runtime.identity import AGENT_IDENTITY
 from agent_runtime.runtime import _SHAPING_FRAMING, SubAgent
 from agent_runtime.scope import ScopedSpec
 from llm_framework import FakeTransport
@@ -76,13 +77,16 @@ class _FindingsHook:
 
 
 def _markdown_node() -> PlanNode:
-    """A produce node: research the live topic, shaped by the markdown ruleset."""
+    """A produce node that runs ONE generic tool then shapes its output by the markdown
+    ruleset. Uses ``web_fetch`` (a non-research single-tool node) so it exercises the
+    GENERIC produce path's system/user shaping seam — a ``web_search`` node now runs the
+    agentic research LOOP (s9/c5), covered separately in test_research_read_fetch.py."""
     return PlanNode(
         id="n1",
-        task=f"Research {_TOPIC} and report the findings.",
+        task=f"Read about {_TOPIC} and report the findings.",
         spec="markdown-writer",
-        tool="web_search",
-        tool_args={"query": _TOPIC},
+        tool="web_fetch",
+        tool_args={"url": "https://example.org/iran-talks"},
     )
 
 
@@ -125,7 +129,7 @@ def test_produce_step_injects_ruleset_as_shaping_layer_over_real_task(tmp_path):
     # --- USER carries the REAL task content + the tool findings --- #
     assert _TOPIC in user                            # the actual task
     assert "report the findings" in user
-    assert "TOOL OUTPUT (web_search)" in user
+    assert "TOOL OUTPUT (web_fetch)" in user
     assert "sanctions relief remains the main sticking point" in user  # findings
 
     # --- separation of concerns: ruleset NOT in the user turn; findings NOT in
@@ -135,8 +139,8 @@ def test_produce_step_injects_ruleset_as_shaping_layer_over_real_task(tmp_path):
     assert _TOPIC not in system
 
     # The tool actually fired (the agent DID the task before shaping).
-    assert agent.hook.calls and agent.hook.calls[0][0] == "web_search"
-    assert result.tool_used == "web_search"
+    assert agent.hook.calls and agent.hook.calls[0][0] == "web_fetch"
+    assert result.tool_used == "web_fetch"
 
 
 # --------------------------------------------------------------------------- #
@@ -188,14 +192,17 @@ def test_injected_system_is_not_a_skill_how_to(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# A node with NO spec is a bare step: the produce step has NO system prompt (no
-# ruleset to shape with) — the shaping framing only rides alongside a real body.
+# A node with NO spec is a bare step: d11 now rides the UNIVERSAL IDENTITY as its
+# system turn, but still NO shaping layer (the shaping framing only rides
+# alongside a real ruleset body) — the test's real intent (no shaping leakage).
 # --------------------------------------------------------------------------- #
-def test_bare_node_has_no_system_shaping_layer():
+def test_bare_node_has_only_identity_no_shaping_layer():
     transport = FakeTransport(["plain answer"])
     node = PlanNode(id="n1", task="Summarise the inputs.")  # no spec
     agent = SubAgent(node, transport=transport)
     _run(agent.run())
-    roles = [m["role"] for m in transport.calls[0]["messages"]]
-    assert "system" not in roles                     # bare step → no shaping layer
-    assert _SHAPING_FRAMING not in str(transport.calls[0]["messages"])
+    system = next(
+        m["content"] for m in transport.calls[0]["messages"] if m["role"] == "system"
+    )
+    assert system == AGENT_IDENTITY                  # identity only — no shaping layer
+    assert _SHAPING_FRAMING not in system

@@ -19,9 +19,9 @@ Three canned scenarios cover the Stage-A acceptance surface:
 - :func:`subagent_transport` — canned sub-agent replies (one per node) so a full
   DAG run produces realistic node outputs offline.
 
-A live run swaps in ``OllamaTransport(base_url="http://localhost:11435",
-model="phi4-mini")`` with no other code change — that is the whole point of the
-pluggable seam.
+A live run swaps in ``OllamaTransport(base_url="http://localhost:11434",
+model="gemma4-e4b-candidate-ctx32k")`` with no other code change — that is the
+whole point of the pluggable seam.
 """
 from __future__ import annotations
 

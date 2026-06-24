@@ -7,11 +7,16 @@
 FROM gemma4:e2b-it-qat
 
 # --- Context window --------------------------------------------------------
-# 8192 is ample for the chat + plan-DAG calls. This model uses sliding-window
-# attention (only 3 of 35 layers keep a global KV cache), so context is CHEAP
-# on VRAM: measured size_vram only 1.438 GiB @4K and 1.559 GiB @128K (f16 KV).
-# The full 131072 max would still fit with ~4.4 GiB headroom if ever needed.
-PARAMETER num_ctx 8192
+# 32768 (s5/d22, gate-approved). This model uses sliding-window attention
+# (only 3 of 35 layers keep a global KV cache), so context is CHEAP on VRAM:
+# 8192->32768 adds only ~+24 MiB KV; even 131072 fits ~1.56 GiB with ~4.1 GiB
+# free (no Shared-GPU spill, no OOM). The driver of the choice is window
+# OVERFLOW, not VRAM: a realistic ~18.4k-token deep-research synthesize prompt
+# overflows 8192/16384 (prompt truncated -> thinking block EMPTY -> thin/empty
+# report, the s5 root cause of o4); 32768 fits the full prompt WITH room for
+# CoT + substantive output. CAVEAT (s8 scope): at 32768, num_predict=4096
+# becomes the OUTPUT limiter (thinking+content fill 4096) for long reports.
+PARAMETER num_ctx 32768
 
 # --- Deterministic structured output --------------------------------------
 # temperature 0 measured 8/8 valid JSON AND 8/8 valid plan-DAG on the real

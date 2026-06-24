@@ -24,8 +24,9 @@ Three pieces, additive over the existing ``ToolHook`` seam:
 3. :class:`StructuredToolCaller` — the SINGLE place that OFFERS all registered
    tools to a node and DISPATCHES the model's chosen tool to its handler. One
    native ``/api/chat`` call with the proven Gemma structured-output settings
-   (decision d1, the 24/24 path): ``think=False`` (TOP-LEVEL, suppress the CoT
-   trace so it does not eat the token budget), ``temperature=0`` (deterministic
+   (decision d1, s1/b1 reasoning rollout): ``think=True`` (TOP-LEVEL — gemma4
+   reasons in the SEPARATE message.thinking field; ``num_predict`` is raised to
+   4096 so the CoT cannot starve the JSON to EMPTY), ``temperature=0`` (deterministic
    selection), and ``format=<JSON schema>`` whose ``tool`` field is an **enum of
    the registered tool names** + ``required`` keys, with ``num_predict`` raised to
    fit the whole ``{tool, args}`` object. The chosen tool's args are then
@@ -38,7 +39,8 @@ Decisions honored
   ``reactive_tools``; the planner (not this module) owns control flow. No
   LangChain/LangGraph/PydanticAI/smolagents.
 - spec — native structured outputs use a JSON SCHEMA in ``format`` (enum +
-  required), NEVER ``format="json"``; ``think=False`` top-level; ``temperature=0``;
+  required), NEVER ``format="json"``; ``think=True`` top-level (s1/b1, raised
+  ``num_predict``); ``temperature=0``;
   ``num_predict`` raised to hold the whole object; per-request options only (the
   transport never mutates a global Ollama config).
 - d2  — purely in-process: the registry/caller machinery crosses no process
@@ -284,10 +286,12 @@ class GrowableToolRegistry:
 # StructuredToolCaller — offer all tools, select one, dispatch it, return result
 # --------------------------------------------------------------------------- #
 
-# Default output budget for the selection call. The object is small ({tool, args})
-# but ``num_predict`` is raised well above the bare minimum so a verbose small
-# model never truncates the JSON mid-args (the spec's structured-output rule).
-DEFAULT_SELECT_MAX_TOKENS = 512
+# Default output budget for the selection call. The {tool, args} object is small,
+# BUT s1/b1 enables ``think=True`` on the selection call (gemma4 reasons in the
+# SEPARATE message.thinking field) and those thinking tokens compete with the content
+# budget, so this is raised 512->4096 (the a2-proven load-bearing bump: at a small
+# budget the CoT eats it and the JSON selection comes back EMPTY).
+DEFAULT_SELECT_MAX_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -324,9 +328,11 @@ class ToolCallResult:
 class StructuredToolCaller:
     """Offer the registered tools to a node, let Gemma pick ONE, dispatch it.
 
-    One native structured-output call selects ``{tool, args}`` (the proven d1
-    path: ``think=False`` top-level, ``temperature=0``, ``format=<enum schema>``,
-    raised ``num_predict``); the chosen tool's args are validated through its
+    One native structured-output call selects ``{tool, args}`` (s1/b1 reasoning
+    rollout: ``think=True`` top-level so gemma4 reasons in the SEPARATE
+    message.thinking field, ``temperature=0``, ``format=<enum schema>``, raised
+    ``num_predict`` so the CoT does not starve the JSON); the chosen tool's args
+    are validated through its
     Pydantic model; the handler is dispatched through the bound :class:`ToolHook`
     (so the call + result are observable on the event plane); a structured
     :class:`ToolCallResult` is returned.
@@ -339,7 +345,7 @@ class StructuredToolCaller:
         *,
         max_tokens: int = DEFAULT_SELECT_MAX_TOKENS,
         temperature: float = 0.0,
-        think: bool = False,
+        think: bool = True,
     ) -> None:
         if transport is None:
             raise ToolRegistryError("StructuredToolCaller needs a transport")
@@ -366,7 +372,9 @@ class StructuredToolCaller:
             "arguments. Respond ONLY as a JSON object {\"tool\": <one of the tool "
             "names>, \"args\": {<arguments for that tool>}}. The 'tool' MUST be one "
             "of the offered names. The 'args' MUST satisfy the chosen tool's arg "
-            "schema (fill every required key). No prose.\n\n"
+            "schema (fill every required key). Reason it through privately first; "
+            "your VISIBLE reply must be ONLY the JSON object — no prose, no code "
+            "fences.\n\n"
             "OFFERED TOOLS (name, description, arg schema):\n"
             + json.dumps(catalog, indent=2)
         )

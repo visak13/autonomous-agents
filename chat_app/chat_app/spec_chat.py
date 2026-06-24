@@ -295,6 +295,14 @@ class SpecChatService:
             created_at=spec.created_at,
         )
 
+    def delete_spec(self, name: str) -> str:
+        """Remove a registered spec by unlinking its doc through
+        ``SpecRegistry.delete`` (the store is stateless — no cache to clear).
+        Returns the deleted name. ``KeyError`` if absent (route → 404). This is a
+        file delete, so the route offloads it off the event loop (d4)."""
+        self._registry.delete(name)
+        return name
+
     def effective_body(self, name: str) -> str:
         """The body a node would load on its NEXT run — read through the SAME
         :class:`~specialization.loader.SpecLoader` path the runtime composes a
@@ -481,6 +489,19 @@ def register_spec_chat_routes(
             raise HTTPException(status_code=404, detail=f"no registered spec {name!r}")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.delete("/spec-chats/registered/{name}")
+    async def delete_registered_spec(name: str) -> dict:
+        """DELETE a registered specialization (unlink its doc; the store is
+        stateless so there is no cache to clear). Additive — leaves create/list/
+        select/update/author UNCHANGED. The file delete is offloaded off the event
+        loop (d4). 404 if no such spec. Returns ``{"ok": true, "deleted": name}``
+        so the UI can drop the row + refresh the list."""
+        try:
+            deleted = await asyncio.to_thread(service.delete_spec, name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"no registered spec {name!r}")
+        return {"ok": True, "deleted": deleted}
 
     @app.post("/spec-chats/reopen", response_model=SpecChatView, status_code=201)
     async def reopen_spec_chat(req: ReopenSpecRequest) -> SpecChatView:

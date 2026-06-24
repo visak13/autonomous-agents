@@ -1,7 +1,7 @@
 [project]
 name = "llm-framework"
 version = "0.1.0"
-description = "Standalone phi4-mini LLM framework (transport layer). Zero Claude in runtime."
+description = "Standalone gemma4-e2b-agent LLM framework (transport layer). Zero Claude in runtime."
 requires-python = ">=3.11"
 # Dependency-light by design: httpx for HTTP + the OpenTelemetry *API* only
 # (s6/b1 transport span instrumentation). Token counting uses an in-repo

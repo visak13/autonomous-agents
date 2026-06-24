@@ -25,6 +25,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   useApproveSpecChat,
+  useDeleteRegisteredSpec,
   useDenySpecChat,
   useOpenSpecChat,
   useRegisteredSpec,
@@ -201,7 +202,7 @@ function RegisteredSpecList({ onEdit }: { onEdit: (name: string) => void }) {
       {specs.data && specs.data.length > 0 && (
         <ul className="spec-reg-list">
           {specs.data.map((row: RegisteredSpecRow) => (
-            <li key={row.name}>
+            <li key={row.name} className="spec-reg-item">
               <button
                 type="button"
                 className="spec-reg-row"
@@ -214,11 +215,51 @@ function RegisteredSpecList({ onEdit }: { onEdit: (name: string) => void }) {
                 )}
                 <span className="spec-reg-source">{row.source}</span>
               </button>
+              <DeleteSpecButton name={row.name} />
             </li>
           ))}
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * Per-row DELETE control for a registered specialization (s4/a4, d13 UI). A REAL
+ * hit-testable button (its own row sibling — never nested inside the re-open
+ * button, which would be invalid + un-clickable). Click → confirm → delete; the
+ * mutation invalidates the index so the row clears. Double-delete is guarded by
+ * disabling while the mutation is pending. Any registered spec is deletable
+ * (specs have no built-ins). */
+function DeleteSpecButton({ name }: { name: string }) {
+  const del = useDeleteRegisteredSpec();
+  const onDelete = () => {
+    if (del.isPending) return;
+    if (!window.confirm(`Delete specialization "${name}"? This cannot be undone.`)) {
+      return;
+    }
+    del.mutate({ name });
+  };
+  return (
+    <span className="spec-reg-delete-wrap">
+      <button
+        type="button"
+        className="spec-reg-delete"
+        onClick={onDelete}
+        disabled={del.isPending}
+        aria-label={`Delete ${name}`}
+        title={`Delete ${name}`}
+      >
+        {del.isPending ? "Deleting…" : "Delete"}
+      </button>
+      {del.isError && (
+        // A failed delete is shown plainly, never a silent no-op (e.g. a 404 if the
+        // spec vanished concurrently).
+        <span className="spec-reg-delete-err" role="alert">
+          {del.error.message}
+        </span>
+      )}
+    </span>
   );
 }
 

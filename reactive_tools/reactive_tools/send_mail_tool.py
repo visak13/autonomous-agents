@@ -135,9 +135,11 @@ class SmtpAppPasswordAdapter(MailAdapter):
 
 SEND_MAIL_NAME = "send_mail"
 SEND_MAIL_DESCRIPTION = (
-    "Send an email to the user's own inbox. You write only the subject and body; "
-    "the recipient is fixed to the user's own address and cannot be set. "
-    "Returns a structured result proving the send."
+    "Email the user's own inbox. Use ONLY when the user EXPLICITLY asks to be "
+    "emailed; otherwise deliver the result in chat or via file_write, never by "
+    "email. You write only the subject and body; the recipient is fixed to the "
+    "user's own address and cannot be set. Returns a structured result proving "
+    "the send."
 )
 
 

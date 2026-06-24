@@ -66,32 +66,9 @@ def test_real_output_passes_gate_first_try_no_inline_fix():
     assert transport.call_count == 1  # produce only — no review needed
 
 
-def test_judgment_node_missing_verdict_rejected_then_fixed_inline():
-    # A judgment-role node whose produce OMITS the verdict is rejected by the gate
-    # (never silently passed) and re-emits a legal verdict inline → DONE.
-    #
-    # NOTE (a3): a role node now ALSO repairs a null verdict at PRODUCE time inside
-    # SubAgent._run_role (the generic move of the b3 hardening). That is a SECOND,
-    # earlier safety net; this test isolates the GATE's inline-fix path by disabling
-    # the produce-time repair (max_verdict_repairs=0), so the missing verdict reaches
-    # the gate exactly as before and the CODER=REVIEWER inline fix handles it.
-    produce = json.dumps({"findings": ["x"], "fixed_inline": []})            # no verdict
-    review = json.dumps({"verdict": "pass", "findings": ["x"], "fixed_inline": []})
-    transport = FakeTransport([produce, review], strict=True)
-    dag = PlanDAG(nodes=[PlanNode(id="j1", task="Judge the answer.", role="verify")])
-    rt = AgentRuntime(
-        transport=transport, verifier=default_node_verifier, max_inline_fixes=1,
-        max_verdict_repairs=0,
-    )
-    out = asyncio.run(rt.run(dag))
-
-    st = out.states["j1"]
-    assert st["status"] == NodeStatus.DONE.value
-    assert st["inline_fixed"] is True
-    assert transport.call_count == 2
-
-
 def test_default_verifier_unit_contract():
+    # d48: the enum-verdict JUDGMENT path is retired (no judgment roles remain), so
+    # the verifier only enforces the usable-output contract now.
     n = PlanNode(id="n", task="t")
     # real output passes; degenerate tokens are rejected with a reviewer-able reason.
     assert default_node_verifier(n, _Res("real content")) == (True, None)
@@ -99,13 +76,5 @@ def test_default_verifier_unit_contract():
         ok, reason = default_node_verifier(n, _Res(bad))
         assert ok is False and "usable output" in reason
 
-    # judgment node: missing / out-of-enum verdict rejected; a legal verdict passes.
-    j = PlanNode(id="j", task="t", role="critic")
-    assert default_node_verifier(j, _Res(json.dumps({"gaps": []})))[0] is False
-    assert default_node_verifier(j, _Res(json.dumps({"verdict": "maybe"})))[0] is False
-    assert default_node_verifier(j, _Res(json.dumps({"verdict": "converged"}))) == (
-        True,
-        None,
-    )
-    # a non-judgment node with verdict-less JSON still passes (only judgment gated).
+    # a worker node with arbitrary verdict-less JSON still passes (no judgment gate).
     assert default_node_verifier(n, _Res(json.dumps({"answer": 42})))[0] is True

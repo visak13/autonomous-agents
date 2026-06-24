@@ -208,7 +208,12 @@ def apply_resolution(
             )
         merged = tuple([*n.specs, spec_name]) if n.specs else (spec_name,)
         rewritten.append(_with(n, specs=merged, needs_spec=None))
-    return PlanDAG(nodes=rewritten, rationale=dag.rationale, shape=dag.shape)
+    # Carry the overall goal (d39) through the resume rewrite so the resumed nodes
+    # still receive the verbatim goal the initial run did — otherwise a missing-spec
+    # resume would run the rebuilt DAG goal-less.
+    return PlanDAG(
+        nodes=rewritten, rationale=dag.rationale, shape=dag.shape, goal=dag.goal
+    )
 
 
 def _with(node: PlanNode, *, specs: tuple[str, ...], needs_spec: Optional[str]) -> PlanNode:

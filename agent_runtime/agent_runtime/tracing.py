@@ -27,7 +27,12 @@ Usage::
     provider = get_tracer_provider()          # idempotent: built once
     tracer = get_tracer(__name__)
     with tracer.start_as_current_span("phi.call") as span:
-        span.set_attribute("model", "phi4-mini")
+        # Tag the span with the CONFIGURED model, never a hardcoded literal, so
+        # the trace tracks whatever tag the transport actually drives (s8/b1 swap
+        # to gemma4-e2b-agent; the live LLM span at transport.py sets
+        # ``llm.model_name`` from ``self.model`` the same way).
+        from llm_framework.transport import DEFAULT_MODEL
+        span.set_attribute("model", DEFAULT_MODEL)
         ...
     # on shutdown:
     provider.force_flush(); provider.shutdown()
@@ -95,6 +100,27 @@ def build_tracer_provider(
     provider = TracerProvider(resource=resource)
     exporter = OTLPSpanExporter(endpoint=endpoint)
     provider.add_span_processor(BatchSpanProcessor(exporter))
+    # SECOND export path (s7 Stage-A): a LOCAL file exporter alongside — never
+    # replacing — the Phoenix one above. It writes a readable, complete JSON per
+    # trace under var/traces, merging in the full prompts + reasoning the
+    # Phoenix span omits. Best-effort: a failure to wire it must never block the
+    # (load-bearing) Phoenix path or app startup.
+    try:
+        from agent_runtime.local_trace import build_local_file_processor
+
+        provider.add_span_processor(build_local_file_processor())
+    except Exception:  # pragma: no cover - local capture is a debugging aid, not core
+        pass
+    # THIRD path (s7 Stage-B): render the just-written JSON to readable MARKDOWN
+    # when a run's ROOT span ends. Registered AFTER the JSON processor above so the
+    # trace's JSON is already on disk by the time it renders. Reads only — it never
+    # touches the capture path; best-effort so it can never block Phoenix/startup.
+    try:
+        from agent_runtime.local_trace_md import MarkdownTraceProcessor
+
+        provider.add_span_processor(MarkdownTraceProcessor())
+    except Exception:  # pragma: no cover - markdown render is a debugging aid, not core
+        pass
     return provider
 
 

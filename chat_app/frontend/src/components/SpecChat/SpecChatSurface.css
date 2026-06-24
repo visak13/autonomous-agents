@@ -377,6 +377,56 @@
   color: var(--text-muted);
   white-space: nowrap;
 }
+/* a row now hosts the re-open button + a sibling DELETE control (s4/a4) */
+.spec-reg-item {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+}
+.spec-reg-item .spec-reg-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.spec-reg-delete-wrap {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+}
+.spec-reg-delete-err {
+  font-size: var(--text-xs);
+  color: var(--danger, #d4534f);
+  max-width: 12rem;
+  text-align: right;
+  word-break: break-word;
+}
+.spec-reg-delete {
+  flex: 1 1 auto;
+  align-self: stretch;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0 var(--space-3);
+  cursor: pointer;
+  /* real hit-testable control — never pointer-events:none */
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.spec-reg-delete:hover:not(:disabled) {
+  border-color: var(--danger, #d4534f);
+  color: var(--danger, #d4534f);
+  background: var(--bg-elevated);
+}
+.spec-reg-delete:focus-visible {
+  outline: 2px solid var(--danger, #d4534f);
+  outline-offset: 2px;
+}
+.spec-reg-delete:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
 
 /* --- the re-open editor (direct PUT edit) --- */
 .spec-editor {

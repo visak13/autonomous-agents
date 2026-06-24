@@ -37,6 +37,7 @@ store is free to hold a raw value and the clamp happens at read.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import threading
@@ -48,8 +49,26 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent_runtime import ShapeSpec, load_shapes
+from agent_runtime.shape_author import delete_shape as delete_shape_file
 
 from chat_app.persistence import resolve_data_dir
+
+
+# The 6 shipped built-in shapes (d13 no-regression): they live in the package
+# shapes dir alongside user-authored shapes, so a delete is physically possible —
+# but DELETE /shapes/{name} REFUSES them (409) so the user can only clear their OWN
+# authored noise, never a shipped shape. Specs have no built-ins (any registered
+# spec is deletable); this guard is shapes-only.
+BUILTIN_SHAPES = frozenset(
+    {
+        "linear",
+        "modular-parallel",
+        "concurrent-multi-topic-gathering",
+        "deep-research",
+        "iterative-deep-research",
+        "iterative-writing-improvement",
+    }
+)
 
 
 def _now_iso() -> str:
@@ -94,6 +113,15 @@ class ShapeConfigStore:
                     max_iter   INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                -- s13/B6: the per-shape research-tree DEPTH override (sibling of
+                -- max_iter), in a DISJOINT table so a shape may carry a depth override
+                -- with no max_iter row (and vice-versa) — no NOT-NULL coupling, no
+                -- migration of the existing shape_config rows.
+                CREATE TABLE IF NOT EXISTS shape_depth (
+                    shape_name TEXT PRIMARY KEY,
+                    depth      INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self.db.commit()
@@ -132,6 +160,60 @@ class ShapeConfigStore:
         ).fetchone()
         return int(row["max_iter"]) if row is not None else None
 
+    def set_depth(self, shape_name: str, depth: int) -> None:
+        """Persist the per-shape research-tree ``depth`` override (s13/B6; upsert,
+        durable on return). MIRRORS :meth:`set_max_iter` exactly — same shapes/specs
+        store, a sibling override — so the user controls report-path tree DEPTH the
+        same way they set ``max_iter``. The stored value is the RAW UI value; the
+        run_plan_chain consumer clamps it to ``[1, N4_TREE_DEPTH_CEILING]`` (the
+        hard ≤10 the user fixed) at read. A value ``< 1`` is rejected (the route
+        surfaces it as 422)."""
+        name = (shape_name or "").strip()
+        if not name:
+            raise ValueError("shape_name must be non-empty")
+        value = int(depth)
+        if value < 1:
+            raise ValueError(f"depth must be >= 1 (got {value})")
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO shape_depth(shape_name, depth, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(shape_name) DO UPDATE SET "
+                "depth = excluded.depth, updated_at = excluded.updated_at",
+                (name, value, _now_iso()),
+            )
+            self.db.commit()
+
+    def get_depth(self, shape_name: str) -> Optional[int]:
+        """The stored research-tree ``depth`` override for ``shape_name``, or ``None``
+        if none is set (s13/B6). ``None`` means "no UI override" — the runtime then
+        uses the env baseline (``RA_TREE_DEPTH`` via ``TreeConfig.from_env``).
+        Read by :func:`chat_app.agentic.run_agentic` for the SELECTED shape and
+        handed to ``run_plan_chain`` as ``research_depth``."""
+        row = self.db.execute(
+            "SELECT depth FROM shape_depth WHERE shape_name = ?",
+            ((shape_name or "").strip(),),
+        ).fetchone()
+        return int(row["depth"]) if row is not None else None
+
+    def all_depths(self) -> dict[str, int]:
+        """Every stored depth override as ``{shape_name: depth}`` (one read)."""
+        rows = self.db.execute(
+            "SELECT shape_name, depth FROM shape_depth"
+        ).fetchall()
+        return {r["shape_name"]: int(r["depth"]) for r in rows}
+
+    def delete(self, shape_name: str) -> None:
+        """Drop the per-shape ``max_iter`` AND ``depth`` override rows (idempotent;
+        durable on return). Called when a shape file is deleted so no override row
+        outlives the file as an orphan. Deleting a non-existent row is a no-op (a
+        shape the user never overrode has no row to remove)."""
+        name = (shape_name or "").strip()
+        with self._lock:
+            self.db.execute("DELETE FROM shape_config WHERE shape_name = ?", (name,))
+            self.db.execute("DELETE FROM shape_depth WHERE shape_name = ?", (name,))
+            self.db.commit()
+
     def all_overrides(self) -> dict[str, int]:
         """Every stored override as ``{shape_name: max_iter}`` (one read)."""
         rows = self.db.execute(
@@ -163,6 +245,17 @@ class SetMaxIterRequest(BaseModel):
     max_iter: int = Field(ge=1, le=1000)
 
 
+class SetDepthRequest(BaseModel):
+    """Set a shape's research-tree ``depth`` override (s13/B6 — the sibling of
+    ``max_iter`` on the Shapes screen).
+
+    ``ge=1`` rejects a nonsensical floor at the wire; ``le=10`` is the hard
+    ``N4_TREE_DEPTH_CEILING`` the user fixed (the run_plan_chain consumer also
+    clamps, so the bound is enforced even if a raw value were stored)."""
+
+    depth: int = Field(ge=1, le=10)
+
+
 # --------------------------------------------------------------------------- #
 # the service — merge the on-disk shape catalog with the stored overrides
 # --------------------------------------------------------------------------- #
@@ -190,22 +283,31 @@ class ShapeConfigService:
         return load_shapes(self._shapes_dir)
 
     @staticmethod
-    def _view(spec: ShapeSpec, override: Optional[int]) -> dict[str, Any]:
-        """One shape's full structure + its override + the effective round count."""
+    def _view(
+        spec: ShapeSpec,
+        override: Optional[int],
+        depth_override: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """One shape's full structure + its overrides + the effective round count."""
         view = spec.as_dict()
         view["max_iter_override"] = override
         # The cap the runtime will actually run: the override clamped to hard_cap
         # (or, with no override, the shape's own default) — the single number the
         # s3 deep-research unroll honors.
         view["effective_max_iter"] = spec.effective_max_iter(override)
+        # s13/B6: the per-shape research-tree DEPTH override (or None = env baseline).
+        # The run_plan_chain consumer clamps it to the hard ceiling at read; the view
+        # surfaces the raw stored value so the UI can render/edit it like max_iter.
+        view["depth_override"] = depth_override
         return view
 
     def list_shapes(self) -> list[dict[str, Any]]:
-        """Every text-file shape, each merged with its stored override (sorted)."""
+        """Every text-file shape, each merged with its stored overrides (sorted)."""
         overrides = self._store.all_overrides()
+        depths = self._store.all_depths()
         catalog = self._catalog()
         return [
-            self._view(catalog[name], overrides.get(name))
+            self._view(catalog[name], overrides.get(name), depths.get(name))
             for name in sorted(catalog)
         ]
 
@@ -214,7 +316,9 @@ class ShapeConfigService:
         spec = self._catalog().get(name)
         if spec is None:
             return None
-        return self._view(spec, self._store.get_max_iter(name))
+        return self._view(
+            spec, self._store.get_max_iter(name), self._store.get_depth(name)
+        )
 
     def set_max_iter(self, name: str, max_iter: int) -> Optional[dict[str, Any]]:
         """Persist the override for ``name`` and return the updated view.
@@ -227,7 +331,42 @@ class ShapeConfigService:
         if spec is None:
             return None
         self._store.set_max_iter(name, max_iter)
-        return self._view(spec, max_iter)
+        return self._view(spec, max_iter, self._store.get_depth(name))
+
+    def set_depth(self, name: str, depth: int) -> Optional[dict[str, Any]]:
+        """Persist the research-tree ``depth`` override for ``name`` and return the
+        updated view (s13/B6 — the SAME shapes/specs path as :meth:`set_max_iter`).
+
+        Returns ``None`` if ``name`` is not a known text-file shape (the route maps
+        that to 404) so the store never accumulates a depth override for a shape that
+        does not exist. A ``depth < 1`` raises ``ValueError`` from the store (the
+        route maps that to 422)."""
+        spec = self._catalog().get(name)
+        if spec is None:
+            return None
+        self._store.set_depth(name, depth)
+        return self._view(spec, self._store.get_max_iter(name), depth)
+
+    def delete_shape(self, name: str) -> Optional[bool]:
+        """Delete a USER-AUTHORED shape: remove its ``<name>.toml`` AND drop its
+        ``shape_config`` override row (so no row outlives the file). Order matters —
+        FILE THEN ROW. Returns ``None`` if no such text-file shape exists (route →
+        404), ``True`` on success. Raises ``PermissionError`` for a shipped built-in
+        (route → 409, d13 no-regression — only the user's own shapes are deletable).
+
+        The structural store is stateless (load_shapes globs on every call), so the
+        only durable extra state needing cleanup is the override row."""
+        spec = self._catalog().get(name)
+        if spec is None:
+            return None
+        if name in BUILTIN_SHAPES:
+            raise PermissionError(
+                f"shape {name!r} is a built-in and cannot be deleted"
+            )
+        # File then row: a leftover override row must never outlive its shape file.
+        delete_shape_file(name, shapes_dir=self._shapes_dir)
+        self._store.delete(name)
+        return True
 
 
 def register_shape_routes(
@@ -272,6 +411,39 @@ def register_shape_routes(
             raise HTTPException(status_code=404, detail=f"no shape {name!r}")
         return view
 
+    @app.put("/shapes/{name}/depth")
+    async def set_depth(name: str, req: SetDepthRequest) -> dict:
+        """SET a shape's research-tree ``depth`` override (s13/B6 — the SAME
+        shapes/specs path as ``PUT /shapes/{name}/max_iter``; persisted to SQLite,
+        honored by run_plan_chain on the report route).
+
+        404 if ``name`` is not a text-file shape; 422 (automatic + the store guard)
+        on a value out of ``[1, 10]``. Returns the updated shape view so the UI
+        re-renders the new depth in one round-trip."""
+        try:
+            view = service.set_depth(name, req.depth)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"no shape {name!r}")
+        return view
+
+    @app.delete("/shapes/{name}")
+    async def delete_shape_route(name: str) -> dict:
+        """DELETE a USER-AUTHORED shape (unlink its ``.toml`` + drop its override
+        row). Additive — leaves list/get/set_max_iter/author UNCHANGED. 404 if no
+        such shape; 409 for a shipped built-in (d13 — only the user's own shapes are
+        deletable). The file + SQLite delete is offloaded off the event loop (d4).
+        Returns ``{"ok": true, "deleted": name}`` so the UI can drop the row +
+        refresh the list."""
+        try:
+            ok = await asyncio.to_thread(service.delete_shape, name)
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if ok is None:
+            raise HTTPException(status_code=404, detail=f"no shape {name!r}")
+        return {"ok": True, "deleted": name}
+
     return service
 
 
@@ -291,6 +463,7 @@ __all__ = [
     "ShapeConfigStore",
     "ShapeConfigService",
     "SetMaxIterRequest",
+    "SetDepthRequest",
     "register_shape_routes",
     "build_shape_config_service",
 ]

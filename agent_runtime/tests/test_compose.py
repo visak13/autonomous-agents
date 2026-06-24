@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 
 from agent_runtime.factory import PlanDAG, PlanNode
+from agent_runtime.identity import AGENT_IDENTITY
 from agent_runtime.runtime import (
     _RULESET_LAYER_HEADER,
     _REVIEWER_FRAMING,
@@ -205,14 +206,19 @@ def test_single_spec_back_compat_no_layer_header(tmp_path):
     )
     sys_list = _produce_system(t_list)
 
-    expected = f"{_SHAPING_FRAMING}\n\n{MARKDOWN_WRITER_RULESET.strip()}"
-    assert sys_scalar == expected           # exactly framing + the one body
+    # Universal identity (d11) now LEADS every node system turn; the single-spec
+    # shaping body is exactly framing + the one body, BELOW the identity.
+    expected = f"{AGENT_IDENTITY}\n\n{_SHAPING_FRAMING}\n\n{MARKDOWN_WRITER_RULESET.strip()}"
+    assert sys_scalar == expected           # identity + framing + the one body
     assert sys_list == expected             # the list form is equivalent
     assert _RULESET_LAYER_HEADER.format(i=1, n=1, name="markdown-writer") not in sys_scalar
     assert "=====" not in sys_scalar         # no layer separators for a single spec
 
 
-def test_bare_node_has_no_system_shaping_layer(tmp_path):
+def test_bare_node_has_only_the_identity_no_shaping_layer(tmp_path):
+    # d11: a bare (spec-less) node now carries the UNIVERSAL IDENTITY as its system
+    # turn — but still NO shaping layer (no _SHAPING_FRAMING, no ruleset body). The
+    # test's real intent (no shaping leakage onto a bare node) is preserved.
     reg, loader = _two_spec_registry(tmp_path)
     transport = FakeTransport(["plain answer"])
     asyncio.run(
@@ -220,9 +226,10 @@ def test_bare_node_has_no_system_shaping_layer(tmp_path):
             PlanDAG(nodes=[PlanNode(id="n1", task="Summarise.")])  # no spec / specs
         )
     )
-    roles = [m["role"] for m in transport.calls[0]["messages"]]
-    assert "system" not in roles
-    assert _SHAPING_FRAMING not in str(transport.calls[0]["messages"])
+    system = _produce_system(transport)
+    assert system == AGENT_IDENTITY           # identity only — no shaping layer
+    assert _SHAPING_FRAMING not in system
+    assert "=====" not in system              # no ruleset layer separators
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +245,8 @@ def test_subagent_compose_system_unit(tmp_path):
     node = PlanNode(id="n1", task="t.", specs=("markdown-writer", "brevity-editor"))
     agent = SubAgent(node, transport=FakeTransport(["x"]), scopes=scopes)
     system = agent._compose_system()
-    assert system.startswith(_SHAPING_FRAMING)
+    assert system.startswith(AGENT_IDENTITY)   # d11: identity leads every node system
+    assert _SHAPING_FRAMING in system
     assert _RULESET_LAYER_HEADER.format(i=1, n=2, name="markdown-writer") in system
     assert _RULESET_LAYER_HEADER.format(i=2, n=2, name="brevity-editor") in system
     assert agent.spec_names == ("markdown-writer", "brevity-editor")

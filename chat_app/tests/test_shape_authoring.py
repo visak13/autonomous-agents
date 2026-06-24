@@ -32,6 +32,7 @@ from chat_app.shape_authoring import (
     ShapeAuthorService,
     ShapeAuthoringUnavailable,
     ShapeNameConflict,
+    ShapeNotFound,
     register_shape_author_routes,
 )
 from chat_app.shape_config import (
@@ -228,3 +229,109 @@ def test_post_author_422_on_empty_and_unauthorable(tmp_path):
         assert client.post(
             "/shapes/author", json={"description": "unauthorable"}
         ).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# 6) REFINE — free-flow ITERATIVE edit of an EXISTING shape (s8/b6, d18a)
+# --------------------------------------------------------------------------- #
+def _collapsed_compositional_reply(name: str = "linear-plus-modular-parallel") -> str:
+    # the model COLLAPSED a compositional refine to flat 'sequential'; the
+    # safety-net must upgrade it to 'concurrent' so the parallel phase survives.
+    return json.dumps(
+        {
+            "name": name,
+            "description": (
+                "a sequential foundation phase, then a modular parallel phase of "
+                "independent avenues, then a combine step"
+            ),
+            "execution": "sequential",
+            "max_iter": 1,
+            "round_roles": [],
+            "final_roles": [],
+        }
+    )
+
+
+def test_service_refine_builds_on_prior_overwrites_in_place(tmp_path):
+    import asyncio
+
+    # seed an existing shape via the author flow, then refine it in place.
+    author, config = _service(
+        tmp_path,
+        FakeTransport([_parallel_reply("news"), _collapsed_compositional_reply("news")]),
+    )
+    asyncio.run(author.author("gather news in parallel and email me"))
+    assert load_shape("news", shapes_dir=tmp_path).execution == "concurrent"
+
+    view = asyncio.run(
+        author.refine("news", "add a sequential foundation phase before the parallel one")
+    )
+    # same shape (edit in place — no rename, no new file), posture stays/becomes
+    # concurrent (compositional, never flattened to sequential).
+    assert view["name"] == "news"
+    assert view["execution"] == "concurrent"
+    # exactly ONE shape file on disk (overwritten, not duplicated).
+    assert len(list(tmp_path.glob("*.toml"))) == 1
+    assert sum(1 for s in config.list_shapes() if s["name"] == "news") == 1
+
+
+def test_service_refine_404_when_missing(tmp_path):
+    import asyncio
+
+    author, _ = _service(tmp_path, FakeTransport([_parallel_reply("whatever")]))
+    try:
+        asyncio.run(author.refine("does-not-exist", "tweak it"))
+    except ShapeNotFound as exc:
+        assert exc.name == "does-not-exist"
+        return
+    raise AssertionError("expected ShapeNotFound refining a missing shape")
+
+
+def test_service_refine_unavailable_without_transport(tmp_path):
+    import asyncio
+
+    author, _ = _service(tmp_path, None)
+    try:
+        asyncio.run(author.refine("any", "tweak"))
+    except ShapeAuthoringUnavailable:
+        return
+    raise AssertionError("expected ShapeAuthoringUnavailable refining with no transport")
+
+
+def test_post_refine_edits_existing_and_returns_view(tmp_path):
+    # author then refine over the real HTTP surface; 200 + updated view, file in place.
+    app = _app(
+        tmp_path,
+        FakeTransport([_parallel_reply("flow"), _collapsed_compositional_reply("flow")]),
+    )
+    with TestClient(app) as client:
+        assert client.post(
+            "/shapes/author", json={"description": "gather in parallel + email"}
+        ).status_code == 201
+        resp = client.post(
+            "/shapes/flow/refine",
+            json={"instruction": "add a linear foundation phase before the parallel one"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["name"] == "flow"
+        assert body["execution"] == "concurrent"  # compositional, not collapsed
+        # still exactly one shape listed under that name
+        listing = client.get("/shapes").json()["shapes"]
+        assert sum(1 for s in listing if s["name"] == "flow") == 1
+
+
+def test_post_refine_404_missing_and_503_no_model(tmp_path):
+    # 404 when the shape doesn't exist
+    app = _app(tmp_path / "a", FakeTransport([_parallel_reply("x")]))
+    with TestClient(app) as client:
+        assert client.post(
+            "/shapes/ghost/refine", json={"instruction": "tweak"}
+        ).status_code == 404
+
+    # 503 with no live model
+    app_off = _app(tmp_path / "b", None)
+    with TestClient(app_off) as client:
+        assert client.post(
+            "/shapes/any/refine", json={"instruction": "tweak"}
+        ).status_code == 503

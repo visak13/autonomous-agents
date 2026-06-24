@@ -19,9 +19,11 @@ apply together:
 * ``recent_turns`` — at most the last K turns are considered (most recent =
   most relevant to the next turn).
 * ``max_chars`` — a hard character budget on the final block. When the recent
-  turns overflow it, the OLDEST are dropped first (newest kept), and a final
-  hard truncation guarantees ``len(block) <= max_chars`` even for a single
-  oversized turn.
+  turns overflow it, the OLDEST are dropped first (newest kept). The most-recent
+  turn is NEVER dropped: an over-budget newest block is HARD-TRUNCATED keeping
+  its head (the user's request, where stated facts live) and tail (the answer's
+  conclusion), so ``len(block) <= max_chars`` holds even for a single oversized
+  turn AND the latest exchange always remains visible to the next turn.
 
 Optionally a compact per-chat RUNNING SUMMARY (the ``chat_summaries`` table) is
 prepended, so long threads keep continuity with older turns the recent-N window
@@ -67,13 +69,26 @@ def _now_iso() -> str:
 # Default bounds tuned for a small local Gemma context window. Both are
 # overridable per-instance (constructor) and per-call (assemble_context args).
 DEFAULT_RECENT_TURNS = 6
-DEFAULT_MAX_CHARS = 4000
+# max_chars sized to OBSERVED turn lengths, not a round guess: substantive
+# answers are full reports (s9/c6 measured turn final_responses at 4344 and 9373
+# chars), so the prior 4000-char budget dropped EVERY report-sized newest turn ->
+# memoryless follow-ups (the s9/c9 regression). 8000 chars (~2000 tokens) holds a
+# normal report-sized turn intact while staying small against the E4B num_ctx
+# (32768, s5/s11) — this block is injected into EVERY node's user turn
+# (runtime.py:_compose_task), so it must not bloat prompts toward window overflow.
+# An over-budget newest turn is still hard-truncated head+tail (never dropped).
+DEFAULT_MAX_CHARS = 8000
 
 # Block formatting — plain, model-friendly role-prefixed lines.
 USER_PREFIX = "User:"
 ASSISTANT_PREFIX = "Assistant:"
 SUMMARY_HEADER = "Summary of earlier conversation:"
 TURN_SEP = "\n\n"
+
+# Marker shown where the middle of an over-budget single turn was elided. The
+# HEAD (the User: line + start of the answer — where user-stated facts live) and
+# the TAIL (the answer's conclusion) are both kept; only the middle is cut.
+TURN_ELISION = "\n…[turn truncated to fit the context budget]…\n"
 
 
 class ConversationMemory:
@@ -188,6 +203,29 @@ class ConversationMemory:
             lines.append(f"{ASSISTANT_PREFIX} {turn.final_response}".rstrip())
         return "\n".join(lines)
 
+    @staticmethod
+    def _truncate_block(block: str, budget: int) -> str:
+        """Hard-truncate one formatted turn to ``<= budget`` keeping HEAD and TAIL.
+
+        Used only when a SINGLE turn's block alone exceeds the budget. The head
+        preserves the ``User:`` line (where a user-stated fact lives) plus the
+        start of the answer; the tail preserves the answer's conclusion; the
+        middle is elided with :data:`TURN_ELISION`. For a budget too small to even
+        hold the elision marker, a plain head cut is used. The return is
+        guaranteed ``len(result) <= budget`` — this is what lets an over-budget
+        NEWEST turn be kept (not dropped to an empty context, the s9/c6 bug)."""
+        if budget <= 0:
+            return ""
+        if len(block) <= budget:
+            return block
+        if budget <= len(TURN_ELISION):
+            return block[:budget]
+        keep = budget - len(TURN_ELISION)
+        head = keep - keep // 2  # head gets the odd char so the User: line is favored
+        tail = keep // 2
+        tail_part = block[-tail:] if tail > 0 else ""
+        return block[:head] + TURN_ELISION + tail_part
+
     def assemble_context(
         self,
         chat_id: str,
@@ -204,8 +242,15 @@ class ConversationMemory:
 
         1. at most ``recent_turns`` turns are considered, and
         2. if those still overflow ``max_chars``, the OLDEST turns are dropped
-           first (the most recent turn is always preferred), then a final hard
-           truncation enforces the budget even for a single oversized turn/summary.
+           first (the most recent turn is always preferred).
+
+        The MOST-RECENT turn is NEVER silently dropped: if its formatted block
+        alone exceeds the budget it is HARD-TRUNCATED head+tail (via
+        :meth:`_truncate_block`) and kept, rather than dropped to an empty context.
+        That drop was the s9/c6 multi-round memory regression — every substantive
+        answer is a report-sized block (> the old 4000 budget), so follow-ups ran
+        memoryless. A final hard truncation still enforces the budget for an
+        oversized summary.
 
         Strictly scoped to ``chat_id`` (isolation invariant). An unknown chat with
         no summary yields ``""``.
@@ -230,11 +275,22 @@ class ConversationMemory:
         kept_newest_first: list[str] = []
         for turn in reversed(turns):  # newest first
             block = self._format_turn(turn)
-            extra = len(block) + (sep_len if (used > 0) else 0)
-            if used + extra > budget:
+            sep = sep_len if (used > 0) else 0
+            if used + sep + len(block) > budget:
+                # Budget exceeded. The NEWEST turn must never be silently dropped
+                # (the s9/c6 memory regression): if nothing has been kept yet,
+                # HARD-TRUNCATE this newest block (head+tail) into the remaining
+                # budget so the latest exchange always survives. Older turns that
+                # overflow still stop here (oldest-dropped-first is intact).
+                if not kept_newest_first:
+                    remaining = budget - used - sep
+                    truncated = self._truncate_block(block, remaining)
+                    if truncated:
+                        kept_newest_first.append(truncated)
+                        used += sep + len(truncated)
                 break
             kept_newest_first.append(block)
-            used += extra
+            used += sep + len(block)
 
         ordered = ([summary_block] if summary_block else []) + list(
             reversed(kept_newest_first)  # back to chronological order

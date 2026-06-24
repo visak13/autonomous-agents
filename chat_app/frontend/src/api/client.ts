@@ -16,6 +16,7 @@ import type {
   LambdaSnapshot,
   MessageResponse,
   OpenSpecChatResponse,
+  RefineShapeRequest,
   RegisteredSpec,
   RegisteredSpecRow,
   ResumeRequest,
@@ -44,7 +45,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions {
-  method?: "GET" | "POST" | "PUT";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   timeoutMs?: number;
   signal?: AbortSignal | undefined;
@@ -254,6 +255,19 @@ export function updateRegisteredSpec(
   );
 }
 
+/**
+ * DELETE a registered specialization (s4/a4, d13 UI). Unlinks its doc through the
+ * stateless SpecRegistry — additive, leaving create/list/select/update/author
+ * untouched. The backend returns `{ok, deleted}` (200) or 404 if absent; the
+ * caller's mutation invalidates the list so the row clears. Specs have no
+ * built-ins, so any registered spec is deletable.
+ */
+export function deleteRegisteredSpec(name: string): Promise<void> {
+  return request<void>(`/spec-chats/registered/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
 /** Re-open an existing registered spec into an EDITABLE chat session (201). The
  * returned view begins already-started with the existing body as its draft; the
  * caller then refines via /message and re-registers via /approve. */
@@ -287,6 +301,20 @@ export function setShapeMaxIter(name: string, maxIter: number): Promise<ShapeVie
   });
 }
 
+/**
+ * DELETE a USER-AUTHORED shape (s4/a4, d13 UI): unlinks its `.toml` and drops its
+ * `max_iter` override row server-side. The backend REFUSES a shipped built-in with
+ * 409 (only the user's own shapes are deletable) and 404s an unknown name; on
+ * success it returns `{ok, deleted}` (200). The caller's mutation invalidates the
+ * catalog so the row clears. The UI hides this control on built-ins, but a 409
+ * surfaces gracefully as the real guard.
+ */
+export function deleteShape(name: string): Promise<void> {
+  return request<void>(`/shapes/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
 // --------------------------------------------------------------------------- //
 // (s9/b1, d14(2)/d9) DESCRIBE-A-SHAPE — the user describes a shape and the live
 // Gemma model authors the declarative file. This is a blocking native-structured
@@ -300,6 +328,19 @@ export function authorShape(description: string, nameHint?: string): Promise<Sha
   const body: AuthorShapeRequest =
     nameHint && nameHint.trim() ? { description, name_hint: nameHint.trim() } : { description };
   return request<ShapeView>("/shapes/author", {
+    method: "POST",
+    body,
+    timeoutMs: SHAPE_AUTHOR_TIMEOUT_MS,
+  });
+}
+
+// (s8/b6, d18a) REFINE-A-SHAPE — the user edits an EXISTING shape in plain language
+// and the live Gemma model authors the next version building on the current one.
+// Same blocking model round-trip + generous ceiling as authoring; the file is
+// overwritten in place. Returns the refined shape's full view.
+export function refineShape(name: string, instruction: string): Promise<ShapeView> {
+  const body: RefineShapeRequest = { instruction };
+  return request<ShapeView>(`/shapes/${encodeURIComponent(name)}/refine`, {
     method: "POST",
     body,
     timeoutMs: SHAPE_AUTHOR_TIMEOUT_MS,

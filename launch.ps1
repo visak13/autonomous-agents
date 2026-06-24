@@ -29,8 +29,8 @@ param(
     [string]$OllamaExe = "$env:USERPROFILE\ollama-native\ollama.exe",
     [string]$OllamaUrl = "http://127.0.0.1:11434",
     [string]$AppUrl    = "http://127.0.0.1:8000",
-    [string]$BaseModel = "gemma4:e2b-it-qat",
-    [string]$ModelTag  = "gemma4-e2b-agent",
+    [string]$BaseModel = "batiai/gemma4-e4b:q4",
+    [string]$ModelTag  = "gemma4-e4b-candidate-ctx32k",
     [string]$Modelfile = "",
     [switch]$NoBrowser
 )
@@ -41,7 +41,7 @@ $ErrorActionPreference = "Stop"
 # binding, which made the (Join-Path $PSScriptRoot ...) default throw. Body scope
 # populates it reliably; fall back to the invocation path if ever empty.
 $RepoRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-if (-not $Modelfile) { $Modelfile = Join-Path $RepoRoot "Modelfile.gemma4-e2b-agent" }
+if (-not $Modelfile) { $Modelfile = Join-Path $RepoRoot "Modelfile.gemma4-e4b-candidate-ctx32k" }
 $PidStore = Join-Path $RepoRoot "var\launcher.pids.json"
 $AppLog   = Join-Path $RepoRoot "var\app-8000.log"
 
@@ -194,8 +194,18 @@ if (Test-Url "$AppUrl/health") {
     Say "  uv sync (ensuring the workspace .venv is current) ..."
     Push-Location $RepoRoot
     try {
-        & uv sync
-        if ($LASTEXITCODE -ne 0) { Die "uv sync failed (exit $LASTEXITCODE). See output above." }
+        # uv writes its normal progress ("Resolved N packages") to STDERR. Under
+        # Windows PowerShell 5.1 with $ErrorActionPreference='Stop', a native
+        # command's stderr is promoted to a TERMINATING NativeCommandError even on
+        # exit 0 — which would abort the launcher on a perfectly healthy sync. So
+        # localize ErrorActionPreference to 'Continue' for just this native call and
+        # gate purely on $LASTEXITCODE (the real success signal).
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & uv sync 2>&1 | ForEach-Object { Write-Host "    $_" }
+        $rc = $LASTEXITCODE
+        $ErrorActionPreference = $eap
+        if ($rc -ne 0) { Die "uv sync failed (exit $rc). See output above." }
     } finally { Pop-Location }
     Ok "  uv sync complete"
 
@@ -230,7 +240,7 @@ if (Test-Url "$AppUrl/health") {
         }
         Ok "  bridged $bridged .env key(s) into the app environment (values not shown)"
     } else {
-        Warn "  no .env at $envFile — send_mail will error at call time until SMTP_* creds are set"
+        Warn "  no .env at $envFile - send_mail will error at call time until SMTP_* creds are set"
     }
 
     # Start uvicorn via the venv python DIRECTLY (single tracked PID, clean stop -

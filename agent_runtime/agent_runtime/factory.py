@@ -32,22 +32,26 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from .identity import with_identity
+
 
 class PlanError(ValueError):
     """A plan/DAG is structurally invalid (bad refs, cycle, duplicate id)."""
 
 
-# Node ROLES (s3 / blueprint §2c). In eda-base3 the role is the spawn PROTOCOL
-# (the pool sets EDP_ROLE → worker.md vs reviewer.md skill prompt over the SAME
-# compiled spec doc). With no Claude-Code pool here, ``role`` is an EXPLICIT node
-# field: the SAME specialization is reused, and the role selects a role-prompt
-# template + a per-role OUTPUT SCHEMA (see ``agent_runtime.roles``). This is what
-# lets the deep-research shape run ONE spec differentiated only by node role.
-# Defined HERE (pure data, no model) so ``factory`` stays lean and ``roles`` can
-# import it without a cycle.
-VALID_ROLES: frozenset[str] = frozenset(
-    {"research", "critic", "worker", "reviewer", "synthesis", "verify"}
-)
+# Node ROLES (d48 3-role collapse). THREE roles, period — PLANNER, WORKER,
+# SYNTHESIZER — but PLANNER is the planning STAGE (shape selector + incremental
+# planner), not a per-node field, so at the NODE level there are only TWO:
+# ``worker`` and ``synthesizer``. Node BEHAVIOR comes from the node's SPEC(s) +
+# task framing + reasoning, NOT a per-role code switch (the 6-role enum
+# {research,critic,worker,reviewer,synthesis,verify} and its per-role output
+# schemas / verdict path are RETIRED). The deep-research per-round behaviors
+# (research/critic/verify) are now POSITIONS the shape declares
+# (``shapes.VALID_POSITIONS``), mapped onto worker nodes with the matching framing
+# injected into the task (prompting). Roles are NOT LLM-extensible (Q-A: bounded) —
+# this set is fixed. Defined HERE (pure data, no model) so ``factory`` stays lean
+# and ``roles`` can import it without a cycle.
+VALID_ROLES: frozenset[str] = frozenset({"worker", "synthesizer"})
 
 
 # --------------------------------------------------------------------------- #
@@ -88,13 +92,13 @@ class PlanNode:
         Optional kwargs for the primary tool call (what phi would emit alongside
         a tool hint). Kept JSON-shaped.
     role:
-        Optional NODE ROLE (blueprint §2c) — one of :data:`VALID_ROLES`
-        (``research|critic|worker|reviewer|synthesis|verify``) or ``None``. The
-        role does NOT change which specialization loads (that is ``specs``); it
-        selects a role-prompt TEMPLATE + a per-role OUTPUT SCHEMA so the SAME spec
-        behaves differently per node (the deep-research engine). ``None`` = a
-        plain producer step (legacy behaviour, byte-compatible with every
-        existing acyclic plan). Only a known role string is accepted.
+        Optional NODE ROLE (d48) — one of :data:`VALID_ROLES` (``worker`` |
+        ``synthesizer``) or ``None``. The role does NOT change which specialization
+        loads (that is ``specs``); ``synthesizer`` routes to the terminal
+        raw-content file/answer loop, anything else (``worker``/``None``) is a plain
+        producer step whose behavior comes from its SPEC(s) + task + reasoning.
+        ``None`` = a plain producer step (byte-compatible with every existing
+        acyclic plan). Only a known role string is accepted.
     needs_spec:
         Optional FREE-TEXT descriptor of a specialist this step REQUIRES when NO
         registered specialization in the planner's lookup fits (s4 RC8 / blueprint
@@ -117,6 +121,7 @@ class PlanNode:
     tool_args: Mapping[str, Any] = field(default_factory=dict)
     role: Optional[str] = None
     needs_spec: Optional[str] = None
+    source_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -150,6 +155,25 @@ class PlanNode:
         if self.needs_spec is not None:
             needs = str(self.needs_spec).strip()
             object.__setattr__(self, "needs_spec", needs or None)
+        # SOURCE-SCOPING (s9/c13, d56): the 1-based indices into the run's global
+        # fetched-SOURCE index that THIS (synthesis/write) node is responsible for —
+        # the planner's REASONED source→section assignment, so each section's prompt
+        # carries ONLY its own sources (kept inside the model's ~512-tok sliding
+        # window). Normalised to a deduped, order-preserving tuple of positive ints; a
+        # stray non-int / non-positive value is dropped. Empty = no scoping (the node
+        # sees the full upstream source index, byte-identical to the pre-c13 path).
+        raw_sids = self.source_ids or ()
+        if isinstance(raw_sids, (int, str)):
+            raw_sids = (raw_sids,)
+        clean_sids: list[int] = []
+        for s in raw_sids:
+            try:
+                v = int(s)
+            except (TypeError, ValueError):
+                continue
+            if v > 0 and v not in clean_sids:
+                clean_sids.append(v)
+        object.__setattr__(self, "source_ids", tuple(clean_sids))
 
     @property
     def effective_specs(self) -> tuple[str, ...]:
@@ -187,6 +211,7 @@ class PlanNode:
             "tool_args": dict(self.tool_args),
             "role": self.role,
             "needs_spec": self.needs_spec,
+            "source_ids": list(self.source_ids),
         }
 
 
@@ -202,6 +227,23 @@ class PlanDAG:
     nodes: list[PlanNode]
     rationale: str = ""
     shape: str = ""
+    # The VERBATIM overall goal this plan serves (d38/d39) — the user's actual
+    # request, carried ON the plan so it travels with the DAG to the runtime and
+    # survives the missing-specialist resume (which re-derives the DAG, not the
+    # goal). The runtime reads it and feeds it to EVERY worker node's user turn,
+    # because a Gemma node cannot DISCOVER the goal the way an eda-base3/Claude-Code
+    # worker can (no file/grep access) — without it a node sees only the planner's
+    # PARAPHRASED task. Empty => omitted everywhere (byte-identical to pre-d39).
+    goal: str = ""
+    # GROWABLE PLAN (P2.5b, d134/d135) — the ONE relaxed invariant: when a shape declares
+    # ``expand_on_gaps`` the unroll emits only the SEED research layer and tags the DAG
+    # ``growable``; the runtime's drive loop then APPENDS new research nodes round-by-round
+    # via ``research_tree.run_decision_node`` (gaps → next layer), bounded by ``fan_out`` /
+    # ``max_layers`` + no_expansion + completeness_stop. False/0 => a frozen DAG, byte-
+    # identical to every pre-P2.5b plan (the node set is fixed at unroll/author time).
+    growable: bool = False
+    fan_out: int = 0      # per-layer expansion cap for the grower's Tree (0 => runtime default)
+    max_layers: int = 0   # growth bound: max research layers incl. the seed (0 => runtime default)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -282,6 +324,10 @@ class PlanDAG:
             "nodes": [n.as_dict() for n in self.nodes],
             "rationale": self.rationale,
             "shape": self.shape,
+            "goal": self.goal,
+            "growable": self.growable,
+            "fan_out": self.fan_out,
+            "max_layers": self.max_layers,
         }
 
 
@@ -295,20 +341,28 @@ class PlanDAG:
 # the goal + the lookup to author the nodes itself.
 FACTORY_DESCRIPTION = (
     "You are an autonomous planner. Decompose the GOAL into a DAG of logical "
-    "steps. Each node is one step with a unique id and a free-text 'task'. Use "
-    "'depends_on' to order steps (a node runs only after every id it lists has "
-    "finished); independent steps share no edge and may run concurrently. If a "
-    "step's work matches a registered specialization, set 'spec' to that "
-    "specialization's name (from the lookup); if SEVERAL registered "
-    "specializations apply to one step, list them ALL in 'specs' (they are "
-    "composed/layered onto that step in the order you list them) instead of "
-    "'spec'. If a step REQUIRES a specialist whose work is NOT covered by any "
-    "registered specialization in the lookup, leave 'spec'/'specs' empty and "
-    "DESCRIBE the needed specialist in 'needs_spec' (free text) — do NOT invent a "
-    "name and do NOT silently leave it unspecialized. If a step "
-    "needs a tool, set 'tool' to the tool name (from the tool list) and put its "
-    "arguments in 'tool_args'. Emit ONLY the plan that fits THIS goal — invent "
-    "the steps yourself; there is no template to follow."
+    "steps — invent the steps yourself; there is no template.\n"
+    "- Each node has a unique id, a free-text 'task', and 'depends_on' (ids that "
+    "must finish first). Independent steps share no edge and run concurrently.\n"
+    "- Specialization (SELECTION GUIDELINES, see docs/SELECTION_GUIDELINES.md): "
+    "MATCH on the WORK a step PRODUCES vs each spec's description, not a shared "
+    "keyword. Bind an output-style spec to the node that produces the deliverable, "
+    "a role/analysis spec to the reasoning node. OUTPUT FORMAT: when the goal names "
+    "a format for the deliverable (HTML, Markdown, a .html/.md file), bind the "
+    "output-style spec for THAT format — an HTML request gets the HTML writer, a "
+    "Markdown request the Markdown writer; never substitute a different format's "
+    "writer. If a registered specialization fits, set 'spec' to its name. Use "
+    "'specs' (applied in order) ONLY when 2+ "
+    "genuinely COMPOSE (e.g. an analysis spec + an output-format spec on the same "
+    "node) — keep it to 2-3 and never stack two conflicting output styles; never "
+    "put a single name in 'specs' or set both. A user-requested spec wins over a "
+    "default. If NO spec clearly fits, leave the node unspecialized (spec/specs "
+    "empty) — do NOT force-fit a loosely related one. If a step REQUIRES a "
+    "specialist no registered spec covers, leave spec/specs empty and describe it "
+    "in 'needs_spec' — never invent a name or silently run it unspecialized.\n"
+    "- Tool: if a step uses a tool, set 'tool' to its name and its arguments in "
+    "'tool_args'.\n"
+    "Emit ONLY the plan that fits THIS goal."
 )
 
 # The node schema advertised to phi (kept as data so the planner prompt and the
@@ -323,8 +377,8 @@ NODE_SCHEMA: dict[str, str] = {
     "depends_on": "list of node ids that must finish first (may be empty)",
     "tool": "tool name from the tool list, or null",
     "tool_args": "object of arguments for the tool, or omitted",
-    "role": "node role, one of research|critic|worker|reviewer|synthesis|verify, "
-            "or null (null = a plain producer step)",
+    "role": "node role, one of worker|synthesizer, or null (null = a plain "
+            "producer step; 'synthesizer' = the terminal output/writer node)",
     "needs_spec": "free-text description of a REQUIRED specialist when NO listed "
                   "specialization fits, or null/omitted; set this (and leave "
                   "spec/specs empty) instead of guessing a name or running "
@@ -441,7 +495,7 @@ class AbstractPlanFactory:
         payload is asserted body-free before it is serialised (d10)."""
         ctx = self.planner_context(goal)
         self.assert_body_free(ctx)
-        system = (
+        system = with_identity(
             ctx["factory"]["description"]
             + "\n\nEmit STRICT JSON of the form: "
             + '{"rationale": "<one line>", "nodes": [ '
@@ -500,7 +554,7 @@ class AbstractPlanFactory:
             failed_task, error, spec=spec, completed=completed
         )
         self.assert_body_free(ctx)
-        system = (
+        system = with_identity(
             self.description
             + "\n\nA SINGLE step of an existing plan FAILED and must be re-derived. "
             "Emit a MINIMAL corrective DAG (one or a few nodes) that accomplishes "
@@ -523,12 +577,18 @@ class AbstractPlanFactory:
 
     # -- parse phi's emitted JSON back into a validated DAG --------------- #
 
-    def parse_dag(self, structured: Any) -> PlanDAG:
-        """Turn phi's parsed JSON (a dict/list) into a validated :class:`PlanDAG`.
+    def _raw_node_dicts(
+        self, structured: Any
+    ) -> tuple[list[dict[str, Any]], str, str]:
+        """Coerce phi's parsed JSON into clean per-node kwargs dicts (shared front
+        half of :meth:`parse_dag` / :meth:`parse_dag_safe`).
 
-        Accepts either ``{"nodes": [...], "rationale": ...}`` or a bare list of
-        node objects. Raises :class:`PlanError` on a malformed/empty plan so the
-        self-heal layer can catch it and repair/re-plan."""
+        Validates only the ENVELOPE (plan is an object/list with a non-empty
+        ``nodes`` list; each raw node is an object) and normalises each node's
+        fields — ``depends_on`` is kept as a plain ``list[str]`` so the repair pass
+        can edit it before the :class:`PlanNode`/:class:`PlanDAG` invariants
+        (id/task/role field checks + ref/cycle/dup GRAPH checks) are enforced at
+        build time. Raises :class:`PlanError` on a malformed envelope/node."""
         if structured is None:
             raise PlanError("planner produced no structured plan (None)")
         rationale = ""
@@ -544,7 +604,7 @@ class AbstractPlanFactory:
         if not isinstance(raw_nodes, list) or not raw_nodes:
             raise PlanError(f"plan has no 'nodes' list: {structured!r}")
 
-        nodes: list[PlanNode] = []
+        out: list[dict[str, Any]] = []
         for i, raw in enumerate(raw_nodes):
             if not isinstance(raw, Mapping):
                 raise PlanError(f"node[{i}] is not an object: {raw!r}")
@@ -558,25 +618,118 @@ class AbstractPlanFactory:
             if isinstance(specs_raw, str):
                 specs_raw = [specs_raw]
             specs = tuple(str(s) for s in specs_raw if s)
-            nodes.append(
-                PlanNode(
-                    id=str(raw.get("id") or f"n{i+1}"),
-                    task=str(raw.get("task") or raw.get("description") or ""),
-                    spec=(str(raw["spec"]) if raw.get("spec") else None),
-                    specs=specs,
-                    depends_on=tuple(str(d) for d in dep),
-                    tool=(str(raw["tool"]) if raw.get("tool") else None),
-                    tool_args=dict(raw.get("tool_args") or {}),
+            out.append(
+                {
+                    "id": str(raw.get("id") or f"n{i+1}"),
+                    "task": str(raw.get("task") or raw.get("description") or ""),
+                    "spec": (str(raw["spec"]) if raw.get("spec") else None),
+                    "specs": specs,
+                    "depends_on": [str(d) for d in dep],
+                    "tool": (str(raw["tool"]) if raw.get("tool") else None),
+                    "tool_args": dict(raw.get("tool_args") or {}),
                     # ROLE (optional): a known role or null; PlanNode validates it.
-                    role=(str(raw["role"]) if raw.get("role") else None),
+                    "role": (str(raw["role"]) if raw.get("role") else None),
                     # NEEDS_SPEC (optional, s4 RC8): the planner's free-text
                     # missing-specialist signal; PlanNode normalises blanks to None.
-                    needs_spec=(
+                    "needs_spec": (
                         str(raw["needs_spec"]) if raw.get("needs_spec") else None
                     ),
-                )
+                    # SOURCE-SCOPING (s9/c13, d56): the global SOURCE id(s) this
+                    # section node owns; PlanNode normalises to positive-int tuple.
+                    "source_ids": raw.get("source_ids") or (),
+                }
             )
+        return out, rationale, shape
+
+    @staticmethod
+    def _build_dag(
+        node_dicts: Sequence[Mapping[str, Any]], rationale: str, shape: str
+    ) -> PlanDAG:
+        """Construct + EAGERLY VALIDATE a :class:`PlanDAG` from kwargs dicts.
+
+        ``PlanNode`` enforces the per-node field invariants and ``PlanDAG``
+        (via ``__post_init__`` → ``validate``) the graph invariants (unique ids,
+        resolvable ``depends_on`` refs, acyclic) — so a structurally-invalid plan
+        still raises :class:`PlanError` here exactly as before."""
+        nodes = [
+            PlanNode(
+                id=d["id"],
+                task=d["task"],
+                spec=d["spec"],
+                specs=tuple(d["specs"]),
+                depends_on=tuple(d["depends_on"]),
+                tool=d["tool"],
+                tool_args=dict(d["tool_args"]),
+                role=d["role"],
+                needs_spec=d["needs_spec"],
+                source_ids=tuple(d.get("source_ids") or ()),
+            )
+            for d in node_dicts
+        ]
         return PlanDAG(nodes=nodes, rationale=rationale, shape=shape)
+
+    @staticmethod
+    def _repair_dangling_edges(node_dicts: Sequence[dict[str, Any]]) -> list[str]:
+        """Drop, IN PLACE, every ``depends_on`` ref to an unknown node or to self.
+
+        This is the NARROW b2 safe-fallback for the a2 live-observed think=True
+        malformation: the planner non-deterministically emits a node whose
+        ``depends_on`` names a PHANTOM id (no such node). A dangling edge only
+        *adds* an unsatisfiable ordering constraint, so dropping it degrades the
+        plan gracefully — the node simply loses that ordering hint (it may start
+        earlier) instead of the whole run failing. Dropping edges only REMOVES
+        constraints, so it can never introduce a cycle.
+
+        Returns human-readable repair notes (empty list = nothing was dangling, so
+        the result is byte-identical to the strict path). DELIBERATELY does NOT
+        touch duplicate ids or a real cycle among RESOLVABLE edges — those are
+        genuine ambiguities the strict validator must still reject so the planner's
+        outer self-heal keeps its retry-on-reject backstop."""
+        known = {d["id"] for d in node_dicts}
+        repairs: list[str] = []
+        for d in node_dicts:
+            kept: list[str] = []
+            for dep in d["depends_on"]:
+                if dep == d["id"]:
+                    repairs.append(
+                        f"node {d['id']!r}: dropped self-referential depends_on"
+                    )
+                elif dep not in known:
+                    repairs.append(
+                        f"node {d['id']!r}: dropped dangling depends_on {dep!r}"
+                    )
+                else:
+                    kept.append(dep)
+            d["depends_on"] = kept
+        return repairs
+
+    def parse_dag(self, structured: Any) -> PlanDAG:
+        """Turn phi's parsed JSON (a dict/list) into a validated :class:`PlanDAG`.
+
+        Accepts either ``{"nodes": [...], "rationale": ...}`` or a bare list of
+        node objects. STRICT: raises :class:`PlanError` on a malformed/empty plan —
+        INCLUDING a dangling ``depends_on`` edge — so a caller that wants the "no
+        silent bad DAG" guarantee gets it unchanged. The live planner emission path
+        instead uses :meth:`parse_dag_safe`, which repairs dangling edges."""
+        node_dicts, rationale, shape = self._raw_node_dicts(structured)
+        return self._build_dag(node_dicts, rationale, shape)
+
+    def parse_dag_safe(self, structured: Any) -> tuple[PlanDAG, list[str]]:
+        """Parse into a validated DAG, REPAIRING dangling/self ``depends_on`` edges
+        instead of rejecting them — the b2 safe fallback for the a2 finding.
+
+        Returns ``(dag, repairs)`` where ``repairs`` lists every edge dropped
+        (empty when the plan was already clean → byte-identical to
+        :meth:`parse_dag`). Repair is intentionally NARROW (see
+        :meth:`_repair_dangling_edges`): only unresolvable / self refs are dropped,
+        so the node degrades gracefully rather than the run failing. Every OTHER
+        invalidity (duplicate ids, a real cycle among resolvable edges, an empty
+        plan, a bad field) still raises :class:`PlanError` — the planner's outer
+        self-heal keeps its retry-on-reject backstop for malformations repair
+        cannot safely fix."""
+        node_dicts, rationale, shape = self._raw_node_dicts(structured)
+        repairs = self._repair_dangling_edges(node_dicts)
+        return self._build_dag(node_dicts, rationale, shape), repairs
 
 
 __all__ = [

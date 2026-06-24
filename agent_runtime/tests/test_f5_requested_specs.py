@@ -9,11 +9,12 @@ GUARANTEES they are bound: if the 4.6B model forgot to bind any of them, they ar
 stamped onto the plan's TERMINAL node(s) — exactly the F5(i) failure (a request
 naming ``markdown-writer`` previously ran with the named spec NEVER bound).
 
-These tests script a :class:`FakeTransport` with per-node JSON (one structured call
-per node), so the whole authoring loop + the requested-spec pass run in-process with
-zero inference, and assert the resulting DAG directly. The mechanism is generic +
-structural (it keys only off 'is the requested spec bound anywhere?' and the DAG's
-sink set) — no per-scenario topic/spec is referenced.
+These tests script a :class:`FakeTransport` with the planner's TOOL CALLS (add_step
+per node → finalize_plan), so the whole tool-driven authoring loop + the
+requested-spec pass run in-process with zero inference, and assert the resulting DAG
+directly. The mechanism is generic + structural (it keys only off 'is the requested
+spec bound anywhere?' and the DAG's sink set) — no per-scenario topic/spec is
+referenced.
 """
 from __future__ import annotations
 
@@ -41,23 +42,31 @@ _TOOL_CATALOG = [
 ]
 
 
+def _final() -> str:
+    """The closing ``finalize_plan`` tool call."""
+    return json.dumps({"tool": "finalize_plan", "args": {}})
+
+
 def _node(
     task: str,
     *,
     tool: str = "",
     spec: str = "",
     depends_on: Sequence[str] = (),
-    more: bool = True,
+    more: bool = True,  # accepted for call-site compat; the loop ends via finalize_plan
 ) -> str:
+    """One ``add_step`` tool call (the authorer builds the DAG by calling tools)."""
     return json.dumps(
         {
-            "task": task,
-            "spec": spec,
-            "specs": [],
-            "needs_spec": "",
-            "tool": tool,
-            "depends_on": list(depends_on),
-            "more": more,
+            "tool": "add_step",
+            "args": {
+                "task": task,
+                "spec": spec,
+                "specs": [],
+                "needs_spec": "",
+                "tool": tool,
+                "depends_on": list(depends_on),
+            },
         }
     )
 
@@ -91,6 +100,7 @@ def test_named_spec_forgotten_by_model_is_stamped_on_terminal_node(tmp_path):
     replies = [
         _node("research the history of the Eiffel Tower", tool="web_search"),
         _node("write the overview", depends_on=["n1"], more=False),
+        _final(),
     ]
     planner = _planner(tmp_path, replies, requested_specs=[_MD_SPEC])
     dag = _run(planner.plan("overview of the Eiffel Tower using the markdown-writer specialization")).dag
@@ -107,6 +117,7 @@ def test_named_spec_bound_by_model_is_honored_not_clobbered(tmp_path):
     replies = [
         _node("research the topic", tool="web_search"),
         _node("write it up", spec=_MD_SPEC, depends_on=["n1"], more=False),
+        _final(),
     ]
     planner = _planner(tmp_path, replies, requested_specs=[_MD_SPEC])
     dag = _run(planner.plan("write it up using markdown-writer")).dag
@@ -121,6 +132,7 @@ def test_no_requested_spec_is_a_no_op_baseline(tmp_path):
     replies = [
         _node("research the history of the Eiffel Tower", tool="web_search"),
         _node("write the overview", depends_on=["n1"], more=False),
+        _final(),
     ]
     planner = _planner(tmp_path, replies, requested_specs=[])
     dag = _run(planner.plan("overview of the Eiffel Tower")).dag
@@ -133,7 +145,7 @@ def test_unregistered_requested_spec_is_dropped(tmp_path):
     # registered specs survive) — it can never be stamped onto a node.
     planner = _planner(
         tmp_path,
-        [_node("do the thing", more=False)],
+        [_node("do the thing", more=False), _final()],
         requested_specs=["no-such-spec"],
     )
     assert planner.requested_specs == []
@@ -146,7 +158,7 @@ def test_named_spec_composes_over_existing_default_on_a_gather_sink(tmp_path):
     # research-analyst, a user-named spec still reaches it: the requested-spec pass
     # runs FIRST and composes onto the sink, and F2 then leaves the now-specced node
     # alone (no clobber in either direction).
-    replies = [_node("research and report on AI", tool="web_search", more=False)]
+    replies = [_node("research and report on AI", tool="web_search", more=False), _final()]
     planner = _planner(tmp_path, replies, requested_specs=[_MD_SPEC])
     dag = _run(planner.plan("research AI and write it using markdown-writer")).dag
     specs = dag.by_id["n1"].effective_specs

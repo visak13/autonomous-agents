@@ -21,12 +21,20 @@ requires-python = ">=3.11"
 #   lookup; a sub-agent loads its ONE compiled spec via SpecLoader (d10 split).
 dependencies = [
     "llm-framework",
+    # memory: the research READ path (d109) RANKS a fetched source's chunks by MiniLM
+    # 384-d similarity to the node's sub-question, REUSING the memory store's CpuEmbedder
+    # (relevance-select read). Lazy-imported so the heavy fastembed ONNX model loads only
+    # on the served deep-research route, never at module import.
+    "memory",
     "openinference-semantic-conventions>=0.1.30",
     "opentelemetry-exporter-otlp-proto-http>=1.42.1",
     "opentelemetry-sdk>=1.42.1",
     "reactive-tools",
     "specialization",
 ]
+
+[tool.uv.sources]
+memory = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

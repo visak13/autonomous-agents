@@ -1,0 +1,59 @@
+# ===========================================================================
+# Custom Ollama Modelfile — ReactiveAgents runtime model (s8/b8 swap to E4B)
+# Base: batiai/gemma4-e4b:q4 (Google Gemma 4 edge E4B, TEXT-ONLY Q4, ~4.8 GB)
+# Build:  ollama create gemma4-e4b-candidate-ctx32k -f Modelfile.gemma4-e4b-candidate-ctx32k
+#
+# This is the SHIP-PATH model (DEFAULT_MODEL in llm_framework/transport.py). It
+# replaces gemma4-e2b-agent (d42, retired): s10/s11 measured E4B the only
+# fit-passing upgrade beating e2b — better instruction-following + strict-format,
+# no deep-research over-routing — while still fitting the 6 GB RTX 4050 at 0%
+# offload. Same gemma4 family/renderer as e2b, so CoT lands in message.thinking
+# (think=True) with clean fenced JSON in content (d25 revalidated on E4B).
+#
+# Pull the COMMUNITY TEXT-ONLY base (batiai/gemma4-e4b:q4, ~4.8 GB), NOT the
+# official ~9.6 GB text+image+audio tag (its mmproj projector wastes ~0.86 GB of
+# dead VRAM for text work). gemma4-e2b's Modelfile / tag are left UNTOUCHED.
+# ===========================================================================
+FROM batiai/gemma4-e4b:q4
+
+# gemma4 renderer/parser so think=True CoT lands in message.thinking, exactly
+# like e2b (the transport's JSON-extraction interceptor + thinking-capture rely
+# on this shape — d25).
+TEMPLATE {{ .Prompt }}
+RENDERER gemma4
+PARSER gemma4
+PARAMETER stop <turn|>
+
+# --- d36 baseline (pinned) -------------------------------------------------
+# num_ctx 32768: window OVERFLOW (not VRAM) is the failure mode — a realistic
+# ~18.4k-token deep-research synthesize prompt overflows 8192/16384 (truncated ->
+# empty thinking -> thin report, the o4 root cause); 32768 fits the full prompt
+# WITH room for CoT + substantive output. SWA keeps KV cheap so 32768 is safe on
+# 6 GB. temperature 0 is the measured-best for E4B's deterministic/structured/
+# write work (s11 sweep: 0.928 vs 0.685 @0.3, reproduced 3x); per-call sites may
+# override num_predict/temperature over HTTP /api options.
+PARAMETER num_ctx 32768
+PARAMETER temperature 0
+PARAMETER top_p 0.95
+PARAMETER top_k 64
+PARAMETER repeat_penalty 1.0
+
+# --- Output budget ---------------------------------------------------------
+# Modelfile floor only; reasoned call sites RAISE num_predict to >=4096 over HTTP
+# (with think=True the CoT competes with content; <=512 -> empty content, d6).
+PARAMETER num_predict 1024
+
+# --- System prompt (neutral fallback) --------------------------------------
+# The ReactiveAgents runtime sends its OWN system message per task (the universal
+# agent identity + planner factory / composed spec rulesets), which Ollama uses
+# in preference to this default — so this is just a sane baseline for a bare
+# /api/generate warm call and does NOT fight the agent.
+SYSTEM """You are the local reasoning model for the ReactiveAgents app. Be precise and follow the caller's output-format instructions exactly."""
+
+# --- Runtime knobs that are NOT Modelfile params (set by server/transport) --
+# * think        -> request field on /api/chat (think=false on structured calls,
+#                   think=true on reasoned calls). Not bakeable.
+# * keep_alive   -> request field; the app passes -1 (RESIDENT, d36) since the GPU
+#                   is gemma's SOLE consumer (kills per-call reload thrash). Not bakeable.
+# * Server env (on `ollama serve`): OLLAMA_FLASH_ATTENTION=1, OLLAMA_NUM_PARALLEL=1,
+#   OLLAMA_MAX_LOADED_MODELS=1. Leave KV cache at default f16.

@@ -158,11 +158,44 @@ export interface MissingSpecialistPending {
   missing: MissingSpecialistNode[];
 }
 
+// --------------------------------------------------------------------------- //
+// AMBIGUITY-CLARIFICATION PAUSE (scenario-2) — a run can PAUSE instead of acting
+// when the planner judges the request too underspecified and asks ONE clarifying
+// question. The terminal MessageResponse then carries `needs_clarification=true`
+// and a `pending` CLARIFICATION payload the UI surfaces; the user types an
+// `answer` and the client echoes it (with the `resume_token`) to POST
+// /chats/{id}/resume, which re-drives the plan on the clarified intent — instead
+// of the UI re-sending the answer as a FRESH /message (which the gate re-asks).
+// (clarification.py clarification_payload; routes.py MessageResponse / resume.)
+// --------------------------------------------------------------------------- //
+
+/** The `pending` payload on an ambiguity-clarification pause
+ * (clarification.py clarification_payload). The `kind` discriminator tells it
+ * apart from a MissingSpecialistPending; the opaque `resume_token` is echoed back
+ * (with the user's `answer`) to POST /chats/{id}/resume; `question` is the
+ * planner's single clarifying question; `original_query` is the request the
+ * answer refines. */
+export interface ClarificationPending {
+  kind: "clarification";
+  resume_token: string;
+  question: string;
+  original_query: string;
+}
+
+/** The two pause payload shapes a run can carry. Discriminated by the
+ * `kind:"clarification"` field present ONLY on ClarificationPending — narrow on
+ * `"kind" in pending` (or on the response's `needs_clarification` /
+ * `missing_specialist` flags) before consuming. */
+export type PendingPause = MissingSpecialistPending | ClarificationPending;
+
 /** The terminal summary of one driven message run (routes.py MessageResponse).
  * On a missing-specialist PAUSE, `ok` is false, the run produced nothing
  * (`node_states`/`outputs`/`artifacts` empty), `missing_specialist` is true and
- * `pending` carries the CHOICE; for a normal run `missing_specialist` is false and
- * `pending` is null (back-compat: pre-existing clients ignore the new fields). */
+ * `pending` carries the CHOICE. On an ambiguity-clarification PAUSE, `ok` is
+ * false, `needs_clarification` is true and `pending` carries the clarification
+ * payload (the question + resume_token). For a normal run both flags are false
+ * and `pending` is null (back-compat: pre-existing clients ignore the new
+ * fields). */
 export interface MessageResponse {
   chat_id: string;
   turn_index: number;
@@ -173,17 +206,24 @@ export interface MessageResponse {
   artifacts: ArtifactOut[];
   /** True when the run paused because a needed specialist is unavailable. */
   missing_specialist?: boolean;
-  /** The CHOICE payload when paused (else null/absent). */
-  pending?: MissingSpecialistPending | null;
+  /** True when the run paused on a planner clarifying question (scenario-2). */
+  needs_clarification?: boolean;
+  /** The pause payload when paused (CHOICE or clarification), else null/absent. */
+  pending?: PendingPause | null;
 }
 
 /** POST /chats/{id}/resume body (routes.py ResumeRequest) — resolve a paused run.
- * For the missing-specialist pause `choice` is required; `define_and_resume` also
- * needs `spec_name` (the registered spec to apply to every unmet node). */
+ * ONE request type serves both pauses (validated per pause kind server-side):
+ *  - MISSING-SPECIALIST: `choice` is required; `define_and_resume` also needs
+ *    `spec_name` (the registered spec to apply to every unmet node).
+ *  - CLARIFICATION (scenario-2): `answer` carries the user's reply to the
+ *    planner's question; `choice` is omitted. */
 export interface ResumeRequest {
   resume_token: string;
-  choice: MissingSpecChoice;
+  choice?: MissingSpecChoice;
   spec_name?: string;
+  /** The user's answer to the planner's clarifying question (clarification pause). */
+  answer?: string;
 }
 
 /** The 202 body of the decoupled run-start (routes.py start_run). */
@@ -488,4 +528,13 @@ export interface SetShapeMaxIterRequest {
 export interface AuthorShapeRequest {
   description: string;
   name_hint?: string;
+}
+
+/** POST /shapes/{name}/refine body (s8/b6, d18a) — the user REFINES an existing
+ * shape in plain language and the live Gemma model authors the next version
+ * BUILDING ON the current one (shape_authoring.py RefineShapeRequest). The shape
+ * name is in the path; `instruction` is the change to apply. The response is the
+ * refined shape's full ShapeView (the file is overwritten in place). */
+export interface RefineShapeRequest {
+  instruction: string;
 }

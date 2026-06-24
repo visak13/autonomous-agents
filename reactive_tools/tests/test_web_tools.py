@@ -170,7 +170,7 @@ def test_ddgs_backend_normalises_rows(monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def text(self, query, region, max_results):
+        def text(self, query, region, max_results, timelimit=None):
             return [
                 {"title": "T1", "href": "https://t1.example", "body": "b1"},
                 {"title": "T2", "href": "", "body": "b2"},        # dropped (no url)

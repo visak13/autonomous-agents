@@ -29,33 +29,42 @@ plug-n-play families, one schema:
   final round) + ``max_iter`` (the round ceiling), which
   :func:`~agent_runtime.shapes.unroll_shape` expands into the role-tagged DAG.
 
-The call uses the PROVEN d1 native-structured path (the same one
-:class:`~agent_runtime.shape_selector.ShapeSelector` /
-:class:`~agent_runtime.incremental.IncrementalPlanner` use): ``api=native``,
-``think=False`` TOP-LEVEL (gemma4 is a thinking model — off so the whole budget
-goes to the JSON, not a CoT trace that returns EMPTY content), ``temperature=0``
-(deterministic), ``num_predict`` sized to hold the WHOLE object, and the schema
-passed as Ollama-native ``format=<schema>`` with ``enum``+``required`` keys. Per
-the local-gemma specialist [required] rule, a JSON SCHEMA (not ``format:"json"``)
-is what pins the ``execution`` enum, the role enums and the required keys — and
-EVERY field is ``required`` (no optionals) because this model reliably fills a
-fully-specified object but tends to OMIT optional signals.
+The call uses the PROMPT-JSON reasoning path (the SAME one
+:class:`~agent_runtime.incremental.IncrementalPlanner` uses for tool-call
+authoring): ``api=native``, ``think=True`` TOP-LEVEL (s1/b1 reasoning rollout —
+gemma4 reasons in the SEPARATE message.thinking field; ``num_predict`` raised to
+4096 so the CoT cannot starve the JSON content to EMPTY), ``temperature=0``
+(deterministic), and the JSON elicited by the PROMPT (keys + enums spelled out in
+:func:`_system_prompt`) — **NOT** a constrained ``format=<schema>``. This is the
+b6 (d34/d18a) change: the local-gemma specialist [required] rule is that a
+load-bearing REASONED field must never sit behind ``format``-schema constrained
+decoding, because constrained decoding trades content fidelity for syntactic
+validity and silently DROPS a correctly-reasoned value — exactly the failure that
+collapsed a COMPOSITIONAL "linear plus modular parallel" description down to the
+single most-restrictive ``execution`` enum value (``sequential``), losing the
+parallel phase. The model now reasons the posture freely (think=True), emits the
+JSON in ``message.content``, and the transport's fence-stripping JSON interceptor +
+the ``structured_output`` repair stage + :func:`_coerce_spec`'s validate-and-repair
+enforce the contract instead. :func:`build_shape_schema` is kept as the documented
+contract (and the behavioural-proof artifact), not as a wire constraint.
 """
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from llm_framework import Chain, Context, Transport
 from llm_framework.stages import call_stage, prompt_assembly, structured_output
 
-from .factory import VALID_ROLES
+from .identity import with_identity
 from .selfheal import MalformedOutputError
 from .shapes import (
     SHAPES_DIR,
     VALID_EXECUTION,
+    VALID_POSITIONS,
     ShapeError,
     ShapeSpec,
     load_shape,
@@ -68,11 +77,13 @@ from .tracing import get_tracer, run_blocking_in_span
 # shape's 24). Authoring never lets the model set this; it is policy, not content.
 DEFAULT_DEEP_RESEARCH_HARD_CAP = 24
 
-# num_predict for the WHOLE shape object. A shape is small (a name, a one-line
-# description, an execution enum, an int, and two short role arrays), so this holds
-# it at temperature 0 without the verbose small model running its output past the
-# cap and truncating the JSON (the specialist structured-output [required] rule).
-DEFAULT_NUM_PREDICT = 512
+# num_predict for the WHOLE shape object. The shape JSON itself is small, BUT s1/b1
+# enables ``think=True`` on this authoring call (gemma4 reasons in the SEPARATE
+# message.thinking field) and those thinking tokens compete with the content budget,
+# so the cap is raised 512->4096 (the a2-proven load-bearing bump: at <=512 the CoT
+# alone fills the budget and the JSON ``content`` truncates to EMPTY). temp 0 still
+# holds the actual shape object tight; this is headroom for the CoT, not a larger shape.
+DEFAULT_NUM_PREDICT = 4096
 
 # The reserved shape-selection escalation token — a shape file may never be named
 # this (it is the selector's "no shape fits" signal), so authoring rejects it.
@@ -85,12 +96,12 @@ def build_shape_schema() -> dict[str, Any]:
     """The native ``format`` schema for ONE authored shape (enum + required keys).
 
     ``execution`` is enum-constrained to :data:`~agent_runtime.shapes.VALID_EXECUTION`
-    and the two role arrays to :data:`~agent_runtime.factory.VALID_ROLES`, so Gemma
-    can only emit a legal discipline / role vocabulary (Ollama enforces it at the
-    wire). EVERY field is ``required`` — the small model reliably fills a
-    fully-specified object but omits OPTIONAL ones, so a discipline shape emits
-    EMPTY role arrays + ``max_iter`` 1 rather than leaving them unset."""
-    roles = sorted(VALID_ROLES)
+    and the two position arrays to :data:`~agent_runtime.shapes.VALID_POSITIONS` (d48:
+    deep-research round POSITIONS, decoupled from node roles), so Gemma can only emit a
+    legal discipline / position vocabulary. EVERY field is ``required`` — the small
+    model reliably fills a fully-specified object but omits OPTIONAL ones, so a
+    discipline shape emits EMPTY position arrays + ``max_iter`` 1 rather than unset."""
+    roles = sorted(VALID_POSITIONS)
     return {
         "type": "object",
         "properties": {
@@ -100,7 +111,13 @@ def build_shape_schema() -> dict[str, Any]:
             },
             "description": {
                 "type": "string",
-                "description": "one line: what this shape's execution posture is",
+                "description": (
+                    "a STRONG, DISCRIMINATIVE one-liner the shape SELECTOR reads "
+                    "to pick this shape: name the KIND of work it fits and WHEN to "
+                    "choose it OVER the other shapes (e.g. 'choose for independent "
+                    "sub-tasks gathered in parallel then combined') — never a bare "
+                    "restatement of the name or posture"
+                ),
             },
             "execution": {
                 "type": "string",
@@ -149,35 +166,163 @@ def build_shape_schema() -> dict[str, Any]:
     }
 
 
-def _system_prompt() -> str:
-    """Frame the authoring task: describe the shape format + the two families."""
+def _authoring_guidance() -> str:
+    """The shared family + rules block used by BOTH the create and refine prompts.
+
+    Frames the shape vocabulary (keys, the three execution families, the role
+    vocabulary), the COMPOSITIONAL/multi-pattern rule (the b6/d18a fix that stops a
+    'linear plus modular parallel' description collapsing to a flat ``sequential``
+    shape), and the d14 STRONG, selection-effective ``description`` mandate."""
     return (
-        "You AUTHOR a declarative plan-SHAPE from a natural-language description. A "
-        "plan SHAPE is the EXECUTION POSTURE of a plan — NOT its individual steps. "
+        "A plan SHAPE is the EXECUTION POSTURE of a plan — NOT its individual steps. "
+        "It is PLANNER INPUT: the planner reads this shape (its 'execution' posture "
+        "and its 'description') to decide HOW to construct the per-task DAG — whether "
+        "to chain steps sequentially, fan independent steps out in parallel, or run "
+        "bounded deepening research rounds. Author it FOR THAT CONSUMER: condensed, "
+        "actionable guidance the planner can apply directly, NOT a verbose essay. "
+        "Every field MUST be SHORT and PRECISE — the planner loads this on every plan. "
         "Emit STRICT JSON for ONE shape with keys: "
         '{"name", "description", "execution", "max_iter", "round_roles", '
         '"final_roles"}.\n\n'
         "Choose 'execution' to fit the description:\n"
-        "- 'deep-research': the task wants ITERATIVE, DEEPENING research — repeated "
-        "rounds that each build on the last, a critic checking each round, finishing "
-        "with a synthesis and a verification. Set round_roles=[\"research\",\"critic\"], "
-        "final_roles=[\"research\",\"synthesis\",\"verify\"], and max_iter to the number "
-        "of rounds (about 10 if unspecified).\n"
-        "- 'concurrent': the task splits into INDEPENDENT sub-tasks that can run AT "
-        "THE SAME TIME and are then combined/delivered (e.g. gather several things in "
-        "parallel, then email or save them). Set round_roles=[], final_roles=[], "
-        "max_iter=1.\n"
-        "- 'sequential': the steps must run STRICTLY one after another, each needing "
-        "the previous. Set round_roles=[], final_roles=[], max_iter=1.\n\n"
+        "- 'deep-research': ITERATIVE, DEEPENING research — repeated rounds each "
+        "building on the last, a critic checking each, ending in synthesis + verify. "
+        "Set round_roles=[\"research\",\"critic\"], "
+        "final_roles=[\"research\",\"synthesis\",\"verify\"], max_iter = rounds "
+        "(~10 if unspecified).\n"
+        "- 'concurrent': INDEPENDENT sub-tasks run AT THE SAME TIME then "
+        "combine/deliver. Set round_roles=[], final_roles=[], max_iter=1.\n"
+        "- 'sequential': steps run STRICTLY one after another, never overlapping. "
+        "Set round_roles=[], final_roles=[], max_iter=1.\n\n"
+        "COMPOSITIONAL / MULTI-PATTERN intent (IMPORTANT): when a description "
+        "combines a SEQUENTIAL/linear phase WITH a parallel/modular phase — e.g. "
+        "'linear plus modular parallel', or 'a foundation phase, THEN independent "
+        "avenues explored in parallel, then combined' — choose execution='concurrent'. "
+        "'concurrent' is the ONLY posture that supports BOTH patterns at once: the "
+        "planner chains the sequential phase with depends_on edges AND fans out the "
+        "independent parallel steps. NEVER choose 'sequential' for such a description "
+        "— 'sequential' forbids ALL fan-out and would FLATTEN the parallel phase into "
+        "a single file (the exact collapse this shape must avoid). For a compositional "
+        "shape, write the 'description' to SPELL OUT the phased structure (the "
+        "sequential foundation phase, THEN the parallel fan-out, THEN how the results "
+        "combine) so the planner authors the real mix, not a flat line.\n\n"
         "RULES:\n"
-        "- round_roles and final_roles are ONLY for 'deep-research'. For "
-        "'concurrent' and 'sequential' they MUST be the empty list [] (those shapes' "
-        "actual steps are authored later, per-task — the shape only sets the dispatch "
-        "posture).\n"
+        "- round_roles/final_roles are ONLY for 'deep-research'; for "
+        "'concurrent'/'sequential' they MUST be [] (those steps are authored later, "
+        "per-task — the shape only sets the dispatch posture).\n"
         "- roles may ONLY be: research, critic, synthesis, verify, worker, reviewer.\n"
-        "- 'name' is a short kebab-case id (lowercase words joined by hyphens).\n"
-        "Return ONLY the JSON for this one shape."
+        "- 'name' is a short kebab-case id.\n"
+        "- 'description' is SELECTION-CRITICAL — it is the ONLY text the shape "
+        "SELECTOR reads to choose this shape over the others. Write a STRONG, "
+        "DISCRIMINATIVE one-liner that names the KIND of work this shape fits and "
+        "WHEN to pick it OVER the other shapes (for a compositional shape, name BOTH "
+        "phases). A bare restatement of the name or the bare posture word is NOT "
+        "acceptable — it makes the shape unselectable.\n"
     )
+
+
+def _system_prompt() -> str:
+    """Frame the CREATE task: author one shape from a fresh NL description."""
+    return with_identity(
+        "You AUTHOR a declarative plan-SHAPE from a natural-language description. "
+        + _authoring_guidance()
+        + "Return ONLY the JSON for this one shape."
+    )
+
+
+def _refine_system_prompt() -> str:
+    """Frame the EDIT/REFINE task: emit the UPDATED shape, building on the prior one.
+
+    The free-flow ITERATIVE authoring half of b6 (d18a): the user refines an
+    EXISTING shape in plain language and the model emits the NEXT version BUILDING
+    ON the current definition (not a one-shot create). Shares the exact same family
+    + compositional + strong-description rules as :func:`_system_prompt` so a refined
+    shape is held to the same contract a created one is."""
+    return with_identity(
+        "You REFINE an EXISTING declarative plan-SHAPE. You are given the shape's "
+        "CURRENT definition and a refinement instruction; emit the UPDATED shape — "
+        "BUILDING ON the current one, preserving every part the instruction does not "
+        "change, applying the requested change, and KEEPING the same 'name'. This is "
+        "an EDIT of an existing shape, not a fresh authoring.\n\n"
+        + _authoring_guidance()
+        + "Return ONLY the JSON for the one UPDATED shape."
+    )
+
+
+def _refine_user(prior: ShapeSpec, instruction: str) -> str:
+    """The refine USER turn: the prior shape (as JSON) + the requested change."""
+    prior_json = json.dumps(
+        {
+            "name": prior.name,
+            "description": prior.description,
+            "execution": prior.execution,
+            "max_iter": int(prior.max_iter),
+            "round_roles": list(prior.round_roles),
+            "final_roles": list(prior.final_roles),
+        },
+        indent=2,
+    )
+    return (
+        "CURRENT SHAPE (edit THIS, do not start over):\n"
+        f"{prior_json}\n\n"
+        f"REFINEMENT REQUESTED:\n{str(instruction).strip()}\n\n"
+        "Return ONLY the updated shape JSON (same keys, same 'name')."
+    )
+
+
+# Lower-cased cue sets for the compositional safety-net (a deterministic backstop
+# BEHIND the prompt, mirroring the d28/d7 finalize guarantees). The net only ever
+# upgrades 'sequential' -> 'concurrent', which is behaviourally SAFE: under
+# 'concurrent' dispatch a fully-chained DAG runs exactly as it would under
+# 'sequential' (each node still waits on its single dependency), so re-enabling
+# fan-out can never make a genuinely linear plan wrong — it only stops a
+# compositional intent being flattened.
+_PARALLEL_CUES = (
+    "parallel",
+    "concurrent",
+    "simultaneous",
+    "at the same time",
+    "at once",
+    "in parallel",
+)
+_SEQUENTIAL_CUES = (
+    "sequential",
+    "linear",
+    "one after another",
+    "one at a time",
+    "in sequence",
+    "step by step",
+    "step-by-step",
+)
+_COMPOSITION_CUES = (
+    "plus",
+    " then ",
+    "followed by",
+    "phase",
+    "stage",
+    "combine",
+    "both",
+    "after that",
+    "afterwards",
+)
+
+
+def _looks_compositional(text: str) -> bool:
+    """True iff ``text`` signals BOTH a parallel phase AND a sequential/multi-phase one.
+
+    Used as the deterministic backstop in :func:`_coerce_spec`: a description that
+    explicitly couples a parallel/modular phase with a sequential or otherwise
+    phased structure (e.g. 'linear plus modular parallel') is COMPOSITIONAL and must
+    not be dispatched as flat ``sequential``. Requires a parallel cue (so a purely
+    linear description never trips it) joined with either a sequential cue or a
+    composition/phase cue."""
+    t = f" {str(text or '').lower()} "
+    has_parallel = any(cue in t for cue in _PARALLEL_CUES)
+    if not has_parallel:
+        return False
+    has_sequence = any(cue in t for cue in _SEQUENTIAL_CUES)
+    has_compose = any(cue in t for cue in _COMPOSITION_CUES)
+    return has_sequence or has_compose
 
 
 def _slugify(text: str, *, fallback: str) -> str:
@@ -189,14 +334,24 @@ def _slugify(text: str, *, fallback: str) -> str:
     return slug or "authored-shape"
 
 
-def _coerce_spec(parsed: Mapping[str, Any], *, name_hint: str) -> ShapeSpec:
+def _coerce_spec(
+    parsed: Mapping[str, Any], *, name_hint: str, request_text: str = ""
+) -> ShapeSpec:
     """Validate one parsed authoring reply into a consistent :class:`ShapeSpec`.
 
     Reconciles the two families so the on-disk file is always coherent: a
     discipline shape (sequential/concurrent) carries NO roles and a single round;
     a deep-research shape MUST carry round/final roles (an empty one is an
     authoring failure, surfaced for the self-heal/caller, never silently shipped as
-    an inert shape)."""
+    an inert shape).
+
+    ``request_text`` is the originating NL request (the create description or the
+    refine instruction + prior description). It feeds the COMPOSITIONAL safety-net
+    (b6/d18a): if the model picked the most-restrictive ``sequential`` posture for a
+    description that clearly couples a parallel phase with a sequential one, the
+    posture is upgraded to ``concurrent`` so the parallel phase is not flattened (a
+    deterministic backstop behind the prompt, same spirit as the d28/d7 finalize
+    guarantees; never touches ``deep-research`` or an already-``concurrent`` shape)."""
     execution = str(parsed.get("execution", "")).strip().lower()
     if execution not in VALID_EXECUTION:
         raise MalformedOutputError(
@@ -206,13 +361,23 @@ def _coerce_spec(parsed: Mapping[str, Any], *, name_hint: str) -> ShapeSpec:
     description = " ".join(str(parsed.get("description", "")).split())
     name = _slugify(parsed.get("name", ""), fallback=name_hint or execution)
 
-    # Keep only legal roles (the enum should already guarantee this, but a repair
-    # reply could slip a stray token through the parser).
+    # COMPOSITIONAL safety-net: a 'sequential' posture for a description that names
+    # BOTH a parallel and a sequential/phased structure is the flat-collapse this
+    # action must prevent — upgrade it to 'concurrent' (which subsumes sequential
+    # via depends_on edges, so the linear phase is preserved while the parallel
+    # phase is re-enabled). Considers the model's own description AND the request.
+    if execution == "sequential" and _looks_compositional(
+        f"{request_text} {description}"
+    ):
+        execution = "concurrent"
+
+    # Keep only legal POSITIONS (d48; the enum should already guarantee this, but a
+    # repair reply could slip a stray token through the parser).
     round_roles = tuple(
-        r for r in (parsed.get("round_roles") or []) if str(r) in VALID_ROLES
+        r for r in (parsed.get("round_roles") or []) if str(r) in VALID_POSITIONS
     )
     final_roles = tuple(
-        r for r in (parsed.get("final_roles") or []) if str(r) in VALID_ROLES
+        r for r in (parsed.get("final_roles") or []) if str(r) in VALID_POSITIONS
     )
     try:
         max_iter = int(parsed.get("max_iter") or 1)
@@ -289,6 +454,25 @@ def write_shape(spec: ShapeSpec, *, shapes_dir: Optional[Path] = None) -> Path:
     return path
 
 
+def delete_shape(name: str, *, shapes_dir: Optional[Path] = None) -> Path:
+    """Delete a shape's ``<name>.toml`` from the shapes dir the runtime loads.
+
+    The structural store is a plain directory globbed on every
+    :func:`~agent_runtime.shapes.load_shapes` call (stateless), so removing a shape
+    is just unlinking its file — a deleted shape is simply never offered to a fresh
+    plan, and a resume referencing it falls back to CONCURRENT (handled in routes).
+    Name→file is the direct ``<name>.toml`` map :func:`write_shape` writes. Defaults
+    to the package :data:`~agent_runtime.shapes.SHAPES_DIR`. Raises
+    :class:`~agent_runtime.shapes.ShapeError` if the file is absent (the route maps
+    that to 404). Returns the unlinked path."""
+    directory = Path(shapes_dir) if shapes_dir is not None else SHAPES_DIR
+    path = directory / f"{name}.toml"
+    if not path.exists():
+        raise ShapeError(f"no shape file named {name!r} to delete")
+    path.unlink()
+    return path
+
+
 class ShapeAuthor:
     """Author a declarative shape from an NL description via one native Gemma call.
 
@@ -305,7 +489,7 @@ class ShapeAuthor:
         Output-token budget for the one authoring call (:data:`DEFAULT_NUM_PREDICT`).
     call_opts:
         Extra transport options merged OVER the proven native structured defaults
-        (``api=native``, ``think=False``, ``temperature=0``, ``num_predict``).
+        (``api=native``, ``think=True`` (s1/b1), ``temperature=0``, ``num_predict``).
     """
 
     def __init__(
@@ -320,9 +504,13 @@ class ShapeAuthor:
         self.transport = transport
         self.shapes_dir = Path(shapes_dir) if shapes_dir is not None else None
         self.max_repair_attempts = max_repair_attempts
+        # s1/b1 REASONING ROLLOUT: ``think=True`` (gemma4 reasons about the shape in
+        # the SEPARATE message.thinking field before emitting the JSON); ``num_predict``
+        # (DEFAULT_NUM_PREDICT raised to 4096) gives the CoT headroom so content is not
+        # starved. An explicit caller ``call_opts`` still overrides.
         self.call_opts = {
             "api": "native",
-            "think": False,
+            "think": True,
             "temperature": 0,
             "num_predict": int(num_predict),
             **(dict(call_opts) if call_opts else {}),
@@ -348,9 +536,12 @@ class ShapeAuthor:
         for a malformed plan."""
         if not description or not str(description).strip():
             raise MalformedOutputError("shape authoring needs a non-empty description")
-        schema = self.schema()
-        self.last_schema = schema
-        opts = {**self.call_opts, "format": schema}
+        # b6/d34: schema is the documented contract + proof artifact, but it is NOT
+        # passed as a wire `format` constraint (constrained decoding drops the
+        # reasoned posture). The prompt elicits the JSON; the interceptor + repair
+        # stage + `_coerce_spec` enforce it.
+        self.last_schema = self.schema()
+        opts = dict(self.call_opts)
 
         chain = Chain()
         chain.use(prompt_assembly())
@@ -376,11 +567,69 @@ class ShapeAuthor:
                     f"{self.max_repair_attempts} repair attempts: "
                     f"{repair.get('final_error')}"
                 )
-            spec = _coerce_spec(parsed, name_hint=name_hint)
+            spec = _coerce_spec(parsed, name_hint=name_hint, request_text=description)
             self.last_spec = spec
             span.set_attribute("author.shape_name", spec.name)
             span.set_attribute("author.execution", spec.execution)
             span.set_attribute("author.unrollable", spec.is_unrollable)
+            return spec
+
+    async def refine(self, prior: ShapeSpec, instruction: str) -> ShapeSpec:
+        """Author the NEXT version of ``prior`` from a plain-language ``instruction``.
+
+        The free-flow ITERATIVE half of b6 (d18a): an EDIT that BUILDS ON the
+        existing shape rather than a one-shot create. The prior shape is fed into the
+        prompt (:func:`_refine_user`) and the model emits the updated shape, held to
+        the same family/compositional/strong-description contract as a created one.
+        Runs the SAME prompt-JSON reasoning path as :meth:`author` (no ``format``
+        constraint). The refined shape KEEPS the prior name (an edit edits in place;
+        the model is never allowed to rename and orphan the file), so the caller can
+        overwrite the same ``<name>.toml``. The compositional safety-net sees both the
+        prior description and the instruction, so refining 'make it run the phases in
+        parallel' off a linear shape upgrades the posture deterministically. Raises
+        :class:`MalformedOutputError` when no usable shape survives the repair loop."""
+        if not instruction or not str(instruction).strip():
+            raise MalformedOutputError("shape refinement needs a non-empty instruction")
+        self.last_schema = self.schema()
+        opts = dict(self.call_opts)
+
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(self.transport, **opts))
+        chain.use(
+            structured_output(self.transport, max_repair_attempts=self.max_repair_attempts)
+        )
+        ctx = Context(
+            system=_refine_system_prompt(),
+            user=_refine_user(prior, instruction),
+            transport=self.transport,
+        )
+        tracer = get_tracer("agent_runtime.shape_author")
+        with tracer.start_as_current_span("planner.refine_shape") as span:
+            span.set_attribute("refine.shape_name", prior.name)
+            span.set_attribute("refine.instruction", str(instruction)[:1000])
+            ctx = await run_blocking_in_span(chain.run, ctx)
+            self.last_raw = ctx.raw_output
+            parsed = ctx.structured
+            if not isinstance(parsed, Mapping):
+                repair = ctx.meta.get("structured_output", {})
+                raise MalformedOutputError(
+                    "shape refinement produced no parseable JSON after "
+                    f"{self.max_repair_attempts} repair attempts: "
+                    f"{repair.get('final_error')}"
+                )
+            spec = _coerce_spec(
+                parsed,
+                name_hint=prior.name,
+                request_text=f"{prior.description} {instruction}",
+            )
+            # An edit edits IN PLACE: force the prior name regardless of what the
+            # model emitted (dataclasses.replace re-runs __post_init__ to re-validate).
+            if spec.name != prior.name:
+                spec = replace(spec, name=prior.name)
+            self.last_spec = spec
+            span.set_attribute("refine.execution", spec.execution)
+            span.set_attribute("refine.unrollable", spec.is_unrollable)
             return spec
 
     async def author_and_write(
@@ -412,12 +661,45 @@ class ShapeAuthor:
             )
         return reloaded, path
 
+    async def refine_and_write(
+        self,
+        prior_name: str,
+        instruction: str,
+        *,
+        shapes_dir: Optional[Path] = None,
+    ) -> tuple[ShapeSpec, Path]:
+        """Load ``prior_name``, REFINE it, and OVERWRITE its file; return ``(spec, path)``.
+
+        The on-disk edit half of the free-flow iterative authoring: loads the current
+        shape from the same dir the runtime reads (raising :class:`ShapeError` if it
+        is absent), authors the next version BUILDING ON it (:meth:`refine`), and
+        writes it back to the SAME ``<name>.toml`` (overwrite is correct here — this
+        is an edit of an existing shape, not a name collision). The written file is
+        re-loaded through the REAL loader so a non-round-tripping edit is never
+        shipped."""
+        target_dir = (
+            Path(shapes_dir)
+            if shapes_dir is not None
+            else (self.shapes_dir if self.shapes_dir is not None else None)
+        )
+        prior = load_shape(prior_name, shapes_dir=target_dir)
+        spec = await self.refine(prior, instruction)
+        path = write_shape(spec, shapes_dir=target_dir)
+        reloaded = load_shape(spec.name, shapes_dir=target_dir)
+        if reloaded.execution != spec.execution or reloaded.is_unrollable != spec.is_unrollable:
+            raise ShapeError(
+                f"refined shape {spec.name!r} did not round-trip the loader "
+                f"(wrote execution={spec.execution!r}, read {reloaded.execution!r})"
+            )
+        return reloaded, path
+
 
 __all__ = [
     "ShapeAuthor",
     "build_shape_schema",
     "shape_to_toml",
     "write_shape",
+    "delete_shape",
     "DEFAULT_NUM_PREDICT",
     "DEFAULT_DEEP_RESEARCH_HARD_CAP",
 ]

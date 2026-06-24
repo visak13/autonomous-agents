@@ -21,11 +21,12 @@ through a bespoke side path. The ONLY swappable seam is the transport:
   writes ``raw_output``), so the whole compile path is fully evidenced WITHOUT
   touching the shared GPU. This is a real offline fallback, not a mock of phi.
 - **LIVE (DEFERRED)** — a caller may inject a real
-  :class:`~llm_framework.transport.OllamaTransport` (phi4-mini) to have the model
-  author the body. That live-inference condense is **DEFERRED** here (the GPU is
-  shared — d7): it is reachable by construction (same code path, different
-  transport) but is NOT exercised/faked in this step's proof. It is left for a
-  later live-inference run; we never fabricate a phi "reply" and call it live.
+  :class:`~llm_framework.transport.OllamaTransport` (the local agent model, gemma4
+  E4B) to have the model author the body. That live-inference condense is
+  **DEFERRED** here (the GPU is shared — d7): it is reachable by construction (same
+  code path, different transport) but is NOT exercised/faked in this step's proof.
+  It is left for a later live-inference run; we never fabricate a model "reply" and
+  call it live.
 
 Nothing here is async — the chain is synchronous. Research (which IS async)
 already produced the trace; the compiler just distills it.
@@ -51,10 +52,10 @@ DEFAULT_MAX_SOURCES = 5
 
 # Marker line stamped into an OFFLINE-condensed body so a reader (and the s8
 # demo) can tell at a glance the body was distilled deterministically and that
-# the live phi4-mini condense is the deferred upgrade — not a faked live reply.
+# the live gemma4 E4B condense is the deferred upgrade — not a faked live reply.
 OFFLINE_MARKER = (
     "<!-- condensed offline (deterministic distillation); "
-    "live phi4-mini condense DEFERRED (d7 shared-GPU) -->"
+    "live gemma4 E4B condense DEFERRED (d7 shared-GPU) -->"
 )
 
 
@@ -186,7 +187,7 @@ def condense_body(
     - ``transport=None`` (default) → OFFLINE: a deterministic
       :func:`default_condense_transport` is wired in, so the full chain runs with
       zero GPU and a reproducible body (d7).
-    - ``transport=<OllamaTransport>`` → LIVE phi4-mini authoring. Reachable by
+    - ``transport=<OllamaTransport>`` → LIVE gemma4 E4B authoring. Reachable by
       construction (same chain), DEFERRED for a later live-inference run.
     """
     tp = transport or default_condense_transport(raw, trace)

@@ -23,16 +23,22 @@ default).* These tests prove exactly that chain, end to end, with NO live model:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from llm_framework import FakeTransport
 
 from agent_runtime import load_shape, unroll_shape
-from agent_runtime.roles import ROLE_RESEARCH
+from agent_runtime.shape_author import write_shape
 
 from chat_app.app import create_app
 from chat_app.agentic import run_agentic
-from chat_app.shape_config import ShapeConfigService, ShapeConfigStore
+from chat_app.shape_config import (
+    ShapeConfigService,
+    ShapeConfigStore,
+    register_shape_routes,
+)
 
 DEEP_RESEARCH = "deep-research"
 FILE_DEFAULT_MAX_ITER = 10  # the deep-research.toml default
@@ -43,8 +49,9 @@ def _rounds_in(dag) -> int:
     """The number of research ROUNDS in an unrolled deep-research DAG.
 
     One research node is emitted per round (final round included), so the count of
-    research-role nodes IS the effective round count the unroll ran."""
-    return sum(1 for n in dag.nodes if n.role == ROLE_RESEARCH)
+    research-POSITION nodes (id suffix ``_research``; d48 — they are worker nodes now)
+    IS the effective round count the unroll ran."""
+    return sum(1 for n in dag.nodes if n.id.endswith("_research"))
 
 
 # --------------------------------------------------------------------------- #
@@ -211,3 +218,82 @@ def test_run_agentic_honors_api_set_override_for_deep_research(tmp_path):
     assert dr["rounds_executed"] == 3
     # the unrolled DAG the generic runtime actually drove carries exactly 3 rounds
     assert _rounds_in(result.dag) == 3
+
+
+# --------------------------------------------------------------------------- #
+# 6) b9 (d13 UI delete) — DELETE a USER-AUTHORED shape: the selection catalog
+#    (load_shapes, what the planner selects a shape from) SHRINKS, its persisted
+#    max_iter override row is cleaned up (no orphaned row outlives the file), a
+#    shipped BUILT-IN is REFUSED (409, only the user's own noise is clearable),
+#    and the surviving shape is untouched (no orphaned reference breaks selection).
+# --------------------------------------------------------------------------- #
+def _seed_shapes_dir(tmp_path):
+    """A temp shapes dir holding one shipped BUILT-IN (``linear``) plus one
+    USER-AUTHORED shape (``my-test-shape``, a renamed copy so it is structurally
+    valid). Returns the dir. Built on the production :func:`write_shape` author
+    path, so the files load through the same :func:`load_shapes` the route reads."""
+    shapes_dir = tmp_path / "shapes"
+    shapes_dir.mkdir()
+    write_shape(load_shape("linear"), shapes_dir=shapes_dir)  # a real built-in
+    user = dataclasses.replace(
+        load_shape("linear"),
+        name="my-test-shape",
+        description="a user-authored throwaway shape",
+    )
+    write_shape(user, shapes_dir=shapes_dir)
+    return shapes_dir
+
+
+def test_delete_user_shape_shrinks_catalog_builtin_protected(tmp_path):
+    """The b9 acceptance over HTTP: ``DELETE /shapes/{name}`` removes a USER shape
+    so the SELECTION CATALOG (``GET /shapes`` ← ``load_shapes``, what the planner
+    picks a shape from) shrinks by exactly that shape; its persisted ``max_iter``
+    override row is dropped (no orphaned row outlives the deleted file); the shipped
+    BUILT-IN is REFUSED (409) so only the user's own shapes are clearable; and the
+    surviving built-in stays selectable (no orphaned reference breaks selection).
+    A re-delete / unknown name is a clean 404."""
+    shapes_dir = _seed_shapes_dir(tmp_path)
+    store = ShapeConfigStore(tmp_path)
+    service = ShapeConfigService(store, shapes_dir=shapes_dir)
+    app = FastAPI()
+    register_shape_routes(app, service)
+
+    with TestClient(app) as client:
+        # the selection catalog holds BOTH the built-in and the user shape.
+        before = {s["name"] for s in client.get("/shapes").json()["shapes"]}
+        assert {"linear", "my-test-shape"} <= before
+
+        # give the user shape a PERSISTED override so the delete must clean the row.
+        assert (
+            client.put("/shapes/my-test-shape/max_iter", json={"max_iter": 5}).status_code
+            == 200
+        )
+        assert store.get_max_iter("my-test-shape") == 5
+
+        # DELETE the user shape → 200 with the {ok, deleted} receipt the UI drops on.
+        deleted = client.delete("/shapes/my-test-shape")
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"ok": True, "deleted": "my-test-shape"}
+
+        # the catalog SHRANK by EXACTLY the user shape.
+        after = {s["name"] for s in client.get("/shapes").json()["shapes"]}
+        assert "my-test-shape" not in after
+        assert before - after == {"my-test-shape"}
+        # and NO orphaned override row outlives the unlinked file (FILE-then-ROW).
+        assert store.get_max_iter("my-test-shape") is None
+
+        # NO ORPHAN BREAK: the surviving built-in is still listed AND viewable.
+        assert "linear" in after
+        assert client.get("/shapes/linear").status_code == 200
+
+        # BUILT-IN PROTECTED: deleting a shipped shape is refused (409), file kept.
+        assert client.delete("/shapes/linear").status_code == 409
+        assert "linear" in {
+            s["name"] for s in client.get("/shapes").json()["shapes"]
+        }
+
+        # a re-delete / unknown shape is a clean 404, never a 500.
+        assert client.delete("/shapes/my-test-shape").status_code == 404
+        assert client.delete("/shapes/never-existed").status_code == 404
+
+    store.close()

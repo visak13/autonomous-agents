@@ -1,7 +1,9 @@
 """llm_framework — standalone LLM transport layer for the reactive agent.
 
-RUNTIME = pure phi4-mini via Ollama (http://localhost:11435). ZERO Claude
-anywhere in the runtime (d1). Built first, tested live later (d7/d8): the
+RUNTIME = pure gemma4-e4b-candidate-ctx32k via local Ollama (http://localhost:11434;
+s8/b8 swap, formerly gemma4-e2b-agent at s8/b1, phi4-mini before that on :11435).
+ZERO Claude anywhere in the
+runtime (d1). Built first, tested live later (d7/d8): the
 deterministic FakeTransport lets the whole chain run fully offline with zero
 GPU use.
 
@@ -9,7 +11,7 @@ Public surface
 --------------
 - ``Transport``       : the protocol every transport satisfies
 - ``ChatResult``      : a (role, content, raw) reply
-- ``OllamaTransport`` : real phi4-mini transport (OpenAI-compat + native API)
+- ``OllamaTransport`` : real gemma4-e4b transport (OpenAI-compat + native API)
 - ``FakeTransport``   : scripted, deterministic, offline transport
 - ``estimate_tokens`` : dependency-light heuristic token estimator
 - ``Context`` / ``Chain`` : the lambda-chainable pipeline core

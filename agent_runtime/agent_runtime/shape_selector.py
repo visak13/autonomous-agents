@@ -8,22 +8,30 @@ FOLLOWS the choice (the readiness gate, the dispatch FSM) is deterministic and
 lives in :mod:`agent_runtime.scheduler`; the choice itself is a Gemma judgment
 point, so it uses the proven d1 native structured path:
 
-* the OUTPUT SCHEMA's ``shape`` field is an ``enum`` whose values are HARVESTED
-  from the shape files (:func:`~agent_runtime.shapes.shape_names`) PLUS a reserved
-  ``escalate`` value the model picks when it is NOT confident any shape fits — so
-  a low-confidence selection is an explicit, structured signal the caller can
-  route to a human / a default, never a silent mis-pick;
-* ``think=False`` TOP-LEVEL (gemma is a thinking model — off so the whole budget
-  goes to the JSON decision, not a CoT trace), ``temperature=0`` (deterministic),
-  a raised ``num_predict``, and the schema passed as Ollama native
-  ``format=<schema>`` with ``required`` keys — the exact 24/24 planner path (d1);
+* the choice is the model's REASONED one (s9/c2, d46/d50.1): the selection is a
+  REASONED field, so it does NOT ride ``format=<schema>`` — a single constrained
+  enum sample lets the small model emit a *legal-but-different* value than its CoT
+  concluded (the s9 RCA reason≠emit gap: thinking says ``linear``, the constrained
+  emission samples ``modular-parallel``). Instead the JSON is elicited by the PROMPT
+  and the emission is ANCHORED to the reasoning (the d39 remedy already proven on the
+  DAG planner + the shape author): ``think=True`` so gemma reasons first, then it
+  emits STRICT JSON whose values MUST equal its concluded choice, parsed + repaired by
+  the ``llm_framework`` ``structured_output`` stage (fence-strip + balanced-JSON
+  safety-net), and VALIDATED against the legal shape set with a bounded repair loop.
+  The ``shape`` value may still ONLY be a real shape name or the reserved ``escalate``
+  low-confidence signal — but that is enforced by a post-parse membership check, NOT a
+  wire enum, so the reasoned value survives;
+* ``temperature=0`` (deterministic), a raised ``num_predict`` (4096, so the CoT
+  cannot starve the JSON decision to EMPTY);
 * driven through the existing ``llm_framework`` chain (``call_stage`` + bounded
   ``structured_output`` repair), with the blocking phi round-trip offloaded off the
   event loop and traced like the planner's other judgment calls.
 
-The enum is rebuilt from the on-disk catalog at call time, so adding a shape file
-(or the s4 UI adding one) makes it selectable with NO code change here — the
-growable-shapes requirement, mirrored from the growable tool registry.
+The legal shape set (and the per-call schema, kept only as the documented contract /
+proof artifact in ``last_schema``) is rebuilt from the on-disk catalog at call time,
+so adding a shape file (or the s4 UI adding one) makes it selectable with NO code
+change here — the growable-shapes requirement, mirrored from the growable tool
+registry.
 """
 from __future__ import annotations
 
@@ -33,6 +41,7 @@ from typing import Any, Mapping, Optional, Sequence
 from llm_framework import Chain, Context, Transport
 from llm_framework.stages import call_stage, prompt_assembly, structured_output
 
+from .identity import with_identity
 from .selfheal import MalformedOutputError
 from .shapes import ShapeSpec, load_shapes
 from .tracing import get_tracer, run_blocking_in_span
@@ -43,15 +52,20 @@ from .tracing import get_tracer, run_blocking_in_span
 # a default rather than dispatching a mis-selected shape.
 ESCALATE = "escalate"
 
-# Native structured-call options (d1): the proven think=false / temp 0 path. The
-# per-call JSON schema (with the harvested shape enum) is added as ``format=`` in
-# :meth:`ShapeSelector.select`. ``think`` OFF so gemma emits the JSON selection
-# directly; ``num_predict`` raised so the rationale never truncates the JSON.
+# Native call options. s1/b1 REASONING ROLLOUT: ``think=True`` so gemma4 reasons
+# about which shape fits (CoT in the SEPARATE message.thinking field) before emitting
+# the JSON selection. s9/c2 (d46/d50.1): the selection is REASONED, so NO
+# ``format=<schema>`` is added — the JSON is prompt-elicited and parse/repaired, then
+# validated against the legal set, so the emitted value stays faithful to the CoT
+# (a single constrained enum sample let the model emit a legal-but-different value
+# than it reasoned — the s9 RCA reason≠emit gap). ``num_predict`` raised 256->4096
+# (a2-proven load-bearing: thinking tokens compete with content, and at <=512 the
+# content truncates to EMPTY). temp 0 deterministic.
 _SELECT_OPTS: dict[str, Any] = {
     "api": "native",
-    "think": False,
+    "think": True,
     "temperature": 0,
-    "num_predict": 256,
+    "num_predict": 4096,
 }
 
 
@@ -108,6 +122,12 @@ class ShapeSelection:
     requested_specs: list[str] = field(default_factory=list)
     wants_file: bool = False
     unmet_specs: list[str] = field(default_factory=list)
+    # PLAN-CHAINING signal (c1b/d49.4): the model's read of whether the requested
+    # file output is LARGE / multi-page (a multi-page report, a multi-section / "deep"
+    # document) — so the router can route it through plan-chaining (research → a
+    # write-file shape whose per-page nodes fill the file) instead of one writer node.
+    # Fail-open: only an explicit true sets it (else False = the single-file path).
+    multi_page: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -118,18 +138,23 @@ class ShapeSelection:
             "requested_specs": list(self.requested_specs),
             "wants_file": self.wants_file,
             "unmet_specs": list(self.unmet_specs),
+            "multi_page": self.multi_page,
         }
 
 
 def build_selection_schema(
     shape_names: list[str], spec_names: Optional[list[str]] = None
 ) -> dict[str, Any]:
-    """The per-call OUTPUT SCHEMA: a ``shape`` enum (names + escalate) + required keys.
+    """The per-call OUTPUT SCHEMA — kept as the documented CONTRACT / proof artifact.
 
-    The enum is the harvested catalog of shape names PLUS :data:`ESCALATE` — so the
-    model can ONLY return a real shape or the explicit escalation value; Ollama's
-    native ``format=<schema>`` enforces that at the wire (d1). ``required`` makes
-    every key mandatory so a parse can never silently omit the decision.
+    s9/c2 (d46/d50.1): this schema is NO LONGER passed to the wire as
+    ``format=<schema>`` (the reasoned ``shape``/``requested_specs`` fields must stay
+    faithful to the CoT — a constrained enum sample lets the model emit a
+    legal-but-different value than it reasoned). It is now built only so the caller
+    can (a) advertise the field contract in the PROMPT and (b) derive the legal shape
+    set for the post-parse membership check + record ``last_schema`` as a proof
+    artifact. The ``shape`` enum is the harvested catalog of shape names PLUS
+    :data:`ESCALATE`; the post-parse check enforces that set, not the wire.
 
     F5: the schema also carries two INTENT signals the model fills by READING the
     goal (not a keyword list) — ``search_allowed`` (may this request use the web?)
@@ -184,6 +209,15 @@ def build_selection_schema(
                     "or saved as a document/report/file on disk (e.g. 'write a "
                     "markdown file', 'save it as a file', 'create a .md document'); "
                     "false when they just want an answer in the chat."
+                ),
+            },
+            "multi_page": {
+                "type": "boolean",
+                "description": (
+                    "true when the user asks for a LARGE / MULTI-PAGE / multi-section "
+                    "file — a multi-page report, a long/'detailed'/'in-depth' document "
+                    "with several sections, a multi-page site/doc; false for a short or "
+                    "single-section file, or a chat-only answer."
                 ),
             },
             "unmet_specs": {
@@ -287,20 +321,22 @@ class ShapeSelector:
         # gather and combine = modular-parallel; an exhaustive multi-round survey
         # with critique = a deep-research-style shape), never by the surface wording.
         lines.append(
-            "\nChoose the shape by the WORK the request needs, NOT by its phrasing: "
-            "a question, a 'describe…', and an imperative that ask for the SAME "
-            "result must route to the SAME shape. Do not over-escalate a simple "
-            "informational request to a heavy multi-round shape just because it is "
-            "phrased as a question."
+            "\nChoose by the WORK the request needs, NOT its phrasing (SELECTION "
+            "GUIDELINES, docs/SELECTION_GUIDELINES.md): a question, a "
+            "'describe…' and an imperative asking for the SAME result route to the "
+            "SAME shape. Match the shape's weight to the work's — one straight pass "
+            "= linear; independent parts to gather then combine = a parallel shape; "
+            "an exhaustive multi-round survey of ONE topic = a deep-research shape. "
+            "Do not over-escalate a simple informational request to a heavy "
+            "multi-round shape just because it is phrased as a question."
         )
         # F5 SIGNAL 1 — no-search constraint. The model JUDGES whether the request
         # forbids the web (intent, across any phrasing), not a keyword match.
         lines.append(
-            "\nALSO decide 'search_allowed': true normally, but FALSE when the user "
-            "explicitly says not to use the web (e.g. 'do not search', 'without "
-            "searching', 'just from what you already know', 'from your own "
-            "knowledge'). When it is false, prefer a non-search shape (linear/"
-            "modular-parallel), never a web-research shape."
+            "\nDecide 'search_allowed': true normally, FALSE only when the user "
+            "explicitly forbids the web (e.g. 'do not search', 'from your own "
+            "knowledge'). When false, prefer a non-search shape, never a "
+            "web-research shape."
         )
         # F5 SIGNAL 2 — user-named specialization(s). Advertise the catalog so the
         # model can recognise a name the user actually requested.
@@ -309,9 +345,8 @@ class ShapeSelector:
             for s in sorted(self.spec_names):
                 lines.append(f"  - {s}")
             lines.append(
-                "Set 'requested_specs' to the specialization name(s) above the user "
-                "EXPLICITLY asked to use by name (e.g. 'using the markdown-writer "
-                "specialization'); use [] when the user named none. Do not guess."
+                "Set 'requested_specs' to the listed specialization name(s) the user "
+                "EXPLICITLY asked for by name; [] when none. Do not guess."
             )
             # MISSING-SPECIALIST SIGNAL (scenario-3 structural trigger, a8). The
             # model CLASSIFIES a requested specialization by whether it appears in
@@ -322,12 +357,10 @@ class ShapeSelector:
             # names). The model only NAMES the request; the runtime decides "missing".
             lines.append(
                 "\nIf the user EXPLICITLY asks for a specialization / expert role / "
-                "named output-style that is NOT in the AVAILABLE SPECIALIZATIONS list "
-                "above (e.g. asks for a 'forensic-accountant report' when no such "
-                "specialization is listed), set 'unmet_specs' to that needed "
-                "capability in the user's own terms. Use [] when the user named none "
-                "or every specialization they asked for IS in the list above. Do not "
-                "invent a need the user did not express."
+                "output-style NOT in the list above (e.g. a 'forensic-accountant "
+                "report'), set 'unmet_specs' to that capability in the user's own "
+                "terms; [] when none or all requested specs ARE listed. Do not "
+                "invent a need."
             )
         else:
             lines.append(
@@ -340,27 +373,46 @@ class ShapeSelector:
         # request wants the result saved to a file (intent, across any phrasing) —
         # a file request must end in a written file, never a chat-only answer.
         lines.append(
-            "\nALSO decide 'wants_file': true when the user asks for the result to "
-            "be WRITTEN TO A FILE or saved as a document/report/file on disk (e.g. "
-            "'write a markdown file', 'save it as a file', 'create a .md document'); "
-            "false when they only want an answer shown in the chat."
+            "\nDecide 'wants_file': true when the user asks for the result WRITTEN "
+            "TO A FILE / saved as a document on disk (e.g. 'write a markdown file', "
+            "'save it as a .md'); false when they only want an answer in the chat."
+        )
+        # PLAN-CHAINING signal (c1b). The model JUDGES whether the file is LARGE /
+        # multi-page so a big document is built across chained plans (research → a
+        # write-file shape filling it page by page), not crammed into one writer.
+        lines.append(
+            "\nDecide 'multi_page': true when the file is LARGE / multi-page / "
+            "multi-section (a multi-page or 'detailed'/'in-depth' report, a doc with "
+            "several sections); false for a short or single-section file."
         )
         lines.append(
             "\nEmit STRICT JSON {\"shape\": <one of the names above or "
             f"'{ESCALATE}'>, \"rationale\": <one line>, "
             "\"search_allowed\": <true|false>, \"requested_specs\": <list of names "
-            "or []>, \"wants_file\": <true|false>, \"unmet_specs\": <list of needed "
-            "specialization names not available, or []>}."
+            "or []>, \"wants_file\": <true|false>, \"multi_page\": <true|false>, "
+            "\"unmet_specs\": <list of needed specialization names not available, or []>}."
         )
-        return "\n".join(lines)
+        # ANCHOR EMISSION TO REASONING (s9/c2, d39/d50.1): the selection is now
+        # prompt-JSON (no wire enum), so the ONE failure to guard is reason≠emit —
+        # the model reasoning to one shape then emitting another legal value. Make the
+        # JSON the faithful transcription of the conclusion, not a fresh guess.
+        lines.append(
+            "Your JSON values MUST be the SAME choice your reasoning concluded above: "
+            "if you reasoned the shape is 'linear', emit \"shape\": \"linear\" — never "
+            "a heavier shape you considered and rejected. Do not over-escalate a simple "
+            "request. The JSON is the transcript of your decision, not a new one."
+        )
+        # The universal identity (prepended below) already requires a JSON-only
+        # visible reply, so no per-prompt "reason privately / no fences" tail.
+        return with_identity("\n".join(lines))
 
     async def select(self, goal: str) -> ShapeSelection:
         """Select a shape for ``goal`` (raises :class:`MalformedOutputError` on a
         non-enum result after the bounded repair loop).
 
         Builds the per-call schema with the harvested shape enum + ``escalate``,
-        runs the d1 native structured call (``think=False`` top-level, ``temp 0``,
-        raised ``num_predict``, ``format=<schema>``) through the ``llm_framework``
+        runs the d1 native structured call (s1/b1: ``think=True`` top-level, ``temp
+        0``, raised ``num_predict``, ``format=<schema>``) through the ``llm_framework``
         chain with bounded JSON repair, and parses the enum decision into a
         :class:`ShapeSelection`. The blocking phi round-trip is offloaded off the
         event loop (the freeze-fix doctrine) and the call is traced under a
@@ -376,7 +428,13 @@ class ShapeSelector:
 
         system = self._system_prompt(catalog)
         user = f"GOAL: {goal}\n\nReturn ONLY the JSON shape selection."
-        opts = {**self._call_opts, "format": schema}
+        # s9/c2 (d46/d50.1): NO ``format=schema`` on the wire — the reasoned shape /
+        # requested_specs must stay faithful to the CoT (a constrained enum sample
+        # emits a legal-but-different value than the model reasoned). The JSON is
+        # prompt-elicited, parse/repaired by ``structured_output``, then VALIDATED
+        # against ``legal`` below (membership check, not a wire enum). ``last_schema``
+        # keeps the schema as the documented contract / proof artifact.
+        opts = dict(self._call_opts)
         chain = Chain()
         chain.use(prompt_assembly())
         chain.use(call_stage(self.transport, **opts))
@@ -440,6 +498,13 @@ class ShapeSelector:
                 parsed.get("wants_file") if isinstance(parsed, Mapping) else None
             )
             wants_file = raw_wants_file if isinstance(raw_wants_file, bool) else False
+            # PLAN-CHAINING signal (c1b) parsed LENIENTLY (fail-open): only an explicit
+            # boolean true marks the request as multi-page; anything else → False (the
+            # single-file path), so a reply omitting it is byte-identical to pre-c1b.
+            raw_multi_page = (
+                parsed.get("multi_page") if isinstance(parsed, Mapping) else None
+            )
+            multi_page = raw_multi_page if isinstance(raw_multi_page, bool) else False
             # MISSING-SPECIALIST signal (a8) parsed LENIENTLY (fail-open): kept as
             # FREE strings (NOT filtered to registered names — the whole point is to
             # carry a spec the registry does NOT have), order-preserving + deduped.
@@ -464,12 +529,14 @@ class ShapeSelector:
                 requested_specs=requested_specs,
                 wants_file=wants_file,
                 unmet_specs=unmet_specs,
+                multi_page=multi_page,
             )
             span.set_attribute("select.shape", choice)
             span.set_attribute("select.escalate", escalate)
             span.set_attribute("select.search_allowed", search_allowed)
             span.set_attribute("select.requested_specs", requested_specs)
             span.set_attribute("select.wants_file", wants_file)
+            span.set_attribute("select.multi_page", multi_page)
             span.set_attribute("select.unmet_specs", unmet_specs)
             self.last_selection = selection
             return selection

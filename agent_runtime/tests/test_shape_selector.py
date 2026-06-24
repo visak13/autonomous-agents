@@ -76,11 +76,13 @@ def test_schema_requested_specs_enum_is_registered_spec_names():
 
 def test_selector_advertises_d1_options():
     sel = ShapeSelector(FakeTransport([_reply("linear")]))
-    # the proven d1 native path: think OFF top-level, deterministic temp 0.
+    # s1/b1 reasoning rollout: native path, think ON top-level (gemma4 reasons in the
+    # SEPARATE message.thinking field), deterministic temp 0, and a num_predict raised
+    # to give the CoT headroom (a2-proven: a small budget truncates content to EMPTY).
     assert sel._call_opts["api"] == "native"
-    assert sel._call_opts["think"] is False
+    assert sel._call_opts["think"] is True
     assert sel._call_opts["temperature"] == 0
-    assert sel._call_opts["num_predict"] >= 128
+    assert sel._call_opts["num_predict"] >= 4096
 
 
 # --------------------------------------------------------------------------- #

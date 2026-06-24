@@ -93,6 +93,9 @@ def call_stage(transport: Optional[Transport] = None, **call_opts: Any) -> Stage
             )
         result = tp.chat(ctx.messages, **call_opts)
         ctx.raw_output = result.content
+        # s13: surface the model's NATIVE tool calls (when the call passed ``tools=``)
+        # so a ReAct loop can dispatch them directly instead of string-parsing prose.
+        ctx.tool_calls = getattr(result, "tool_calls", None)
         ctx.meta.setdefault("calls", []).append(
             {
                 "messages": list(ctx.messages),

@@ -14,3 +14,26 @@ __pycache__/
 artifacts/
 var/
 evidence/
+
+# Build/dev scratch — internal recipe journal, probes, evidence, drivers (NOT the product)
+.audit-s2/
+.config-sweep/
+.model-eval/
+.recipe-notes/
+.s13_design/
+.s4-evidence/
+.s4-findings/
+.s5-measure/
+.s8-b2-proof/
+.s8-b5-proof/
+.s8-b6-proof/
+.s9_probe/
+.ruff_cache/
+
+# Databases / local state (chat.db, memory.db, sqlite) — runtime data, NEVER commit (even outside var/)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm

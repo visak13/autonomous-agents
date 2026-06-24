@@ -139,6 +139,9 @@ class PlannerScope:
     def parse_dag(self, structured: Any) -> PlanDAG:
         return self._factory.parse_dag(structured)
 
+    def parse_dag_safe(self, structured: Any) -> tuple[PlanDAG, list[str]]:
+        return self._factory.parse_dag_safe(structured)
+
     def assert_scoped(self) -> None:
         """Raise if this scope (or a built context) could reach a body/loader."""
         for attr in self._FORBIDDEN:

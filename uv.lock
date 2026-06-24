@@ -25,6 +25,7 @@ version = "0.1.0"
 source = { editable = "agent_runtime" }
 dependencies = [
     { name = "llm-framework" },
+    { name = "memory" },
     { name = "openinference-semantic-conventions" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
@@ -35,6 +36,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "llm-framework", editable = "llm_framework" },
+    { name = "memory", editable = "memory" },
     { name = "openinference-semantic-conventions", specifier = ">=0.1.30" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.42.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.42.1" },

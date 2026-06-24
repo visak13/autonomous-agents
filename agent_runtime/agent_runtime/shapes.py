@@ -29,7 +29,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .factory import PlanDAG, PlanError, PlanNode, VALID_ROLES
+from .factory import PlanDAG, PlanError, PlanNode
+from .roles import ROLE_SYNTHESIZER, ROLE_WORKER, position_framing
+
+# Deep-research ROUND POSITIONS (d48). A cyclic shape declares its per-round
+# sequence as POSITIONS — a FIXED, bounded vocabulary, DECOUPLED from the node-role
+# vocabulary (:data:`~agent_runtime.factory.VALID_ROLES` = {worker, synthesizer}).
+# The unroll maps each position onto a worker/synthesizer NODE and injects the
+# matching :data:`~agent_runtime.roles.POSITION_FRAMINGS` text into the node's TASK
+# (behavior via PROMPTING, not a role code-switch). Positions are NOT node roles
+# and are NOT LLM-extensible beyond this set.
+VALID_POSITIONS: frozenset[str] = frozenset(
+    {"research", "critic", "synthesis", "verify", "worker"}
+)
 
 # The default on-disk shape directory (this package's ``shapes/``). Kept beside
 # the code so a checkout ships the built-in shapes; the s4 UI may add more files.
@@ -56,7 +68,7 @@ VALID_EXECUTION: frozenset[str] = frozenset(
 
 
 class ShapeError(PlanError):
-    """A shape text file is missing/malformed or declares an unknown role."""
+    """A shape text file is missing/malformed or declares an unknown position."""
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,43 @@ class ShapeSpec:
         unroll logic lives in the executor).
     source:
         The file the spec was parsed from (provenance for the UI).
+    completeness_stop:
+        P2.4 (d131/d132.D) — the COMPLETENESS-DRIVEN stop SIGNAL the shape hands the
+        LLM: "keep poking the right gap-questions until every blank is filled, then
+        STOP". This is the deep-research shape's stop semantics DEFINED IN THE SHAPE
+        (text the model reasons over), NOT an arbitrary depth cap hard-coded in
+        ``research_tree._DECISION_INSTRUCTION``. Empty string → the runtime keeps its
+        baked-in default stop wording (byte-identical, offline / shapes without it).
+    deny_domains:
+        P2.4 (d131/d133) — the shape-level SOURCE deny-list, the cross-cutting source
+        policy expressed at the SHAPE (TOOL-ENFORCED by the P2.1 web-tool baseline +
+        the per-call ``exclude_domains`` arg). ``wikipedia.org`` (+ wikimedia /
+        wiktionary) is the baseline; a shape names the domains the research must never
+        fetch or cite. Empty tuple → only the tool's always-on baseline applies.
+    expand_on_gaps:
+        P2.5b (d134/d135) — the DECLARATIVE iterative-gap-expansion capability that lets
+        the GENERIC engine reproduce ``run_research_tree``'s ITERATIVE breadth. When True
+        the shape is NOT pre-unrolled into all its rounds: :func:`unroll_shape` emits ONLY
+        the FIRST (seed) research layer and tags the :class:`~agent_runtime.factory.PlanDAG`
+        ``growable``; the runtime's drive loop then GROWS the DAG round-by-round by invoking
+        the SAME ``research_tree.run_decision_node`` over the persisted ``ResearchState`` —
+        each note's gaps author the next layer's research nodes (growing-visibility edges),
+        bounded by ``max_layers`` / ``fan_out`` + ``no_expansion`` + the ``completeness_stop``
+        the model reasons over (``stop_research``). This relaxes EXACTLY ONE invariant ("node
+        set fixed at unroll time") and REUSES the tree's already-generic tool-driven loop; it
+        is the parity lever for retiring the bespoke tree. False → the legacy frozen unroll
+        (every round emitted at unroll time, byte-identical to pre-P2.5b).
+    fan_out:
+        P2.5b — the per-decision-layer expansion cap handed to the grower's
+        :class:`~agent_runtime.research_tree.Tree` (≤ this many ``expand_branch`` keeps per
+        layer). 0 → fall back to the runtime's ``TreeConfig.fan_out``. Only consulted when
+        ``expand_on_gaps`` is set.
+    max_layers:
+        P2.5b — the GROWTH bound: the maximum number of research layers the growable drive
+        loop runs (seed = layer 1; growth adds up to ``max_layers - 1`` more). A hard
+        termination-safety ceiling alongside ``no_expansion`` / ``stop_research``; further
+        clamped by ``TreeConfig.depth`` (the user-fixed depth ceiling). 0 → fall back to the
+        runtime's ``TreeConfig.depth``. Only consulted when ``expand_on_gaps`` is set.
     """
 
     name: str
@@ -97,6 +146,11 @@ class ShapeSpec:
     edges: dict[str, Any] = field(default_factory=dict)
     source: str = ""
     execution: str = "concurrent"
+    completeness_stop: str = ""
+    deny_domains: tuple[str, ...] = ()
+    expand_on_gaps: bool = False
+    fan_out: int = 0
+    max_layers: int = 0
 
     def __post_init__(self) -> None:
         if not self.name or not str(self.name).strip():
@@ -116,12 +170,13 @@ class ShapeSpec:
         # hard_cap defaults to max_iter (never below it) when unset/too small.
         if int(self.hard_cap) < int(self.max_iter):
             object.__setattr__(self, "hard_cap", int(self.max_iter))
-        # Every declared role must be a known node role (fail fast on a typo).
-        for role in tuple(self.round_roles) + tuple(self.final_roles):
-            if role not in VALID_ROLES:
+        # Every declared round/final entry must be a known POSITION (d48 — these are
+        # deep-research positions, not node roles). Fail fast on a typo.
+        for position in tuple(self.round_roles) + tuple(self.final_roles):
+            if position not in VALID_POSITIONS:
                 raise ShapeError(
-                    f"shape {self.name!r} declares unknown role {role!r}; "
-                    f"valid roles: {sorted(VALID_ROLES)}"
+                    f"shape {self.name!r} declares unknown position {position!r}; "
+                    f"valid positions: {sorted(VALID_POSITIONS)}"
                 )
 
     @property
@@ -160,6 +215,11 @@ class ShapeSpec:
             "edges": dict(self.edges),
             "source": self.source,
             "execution": self.execution,
+            "completeness_stop": self.completeness_stop,
+            "deny_domains": list(self.deny_domains),
+            "expand_on_gaps": self.expand_on_gaps,
+            "fan_out": self.fan_out,
+            "max_layers": self.max_layers,
         }
 
 
@@ -179,6 +239,11 @@ def _parse_shape(path: Path) -> ShapeSpec:
         edges=dict(data.get("edges", {})),
         source=str(path),
         execution=str(data.get("execution", "concurrent")),
+        completeness_stop=str(data.get("completeness_stop", "")),
+        deny_domains=tuple(str(d) for d in data.get("deny_domains", ())),
+        expand_on_gaps=bool(data.get("expand_on_gaps", False)),
+        fan_out=int(data.get("fan_out", 0)),
+        max_layers=int(data.get("max_layers", 0)),
     )
 
 
@@ -191,8 +256,20 @@ def unroll_shape(
     *,
     spec: Optional[str] = None,
     max_iter_override: Optional[int] = None,
+    grow: bool = False,
 ) -> PlanDAG:
     """Expand a cyclic ``shape`` into a bounded ACYCLIC, role-tagged DAG (a3).
+
+    GROWABLE MODE (P2.5b, d134/d135): when ``grow=True`` AND the shape declares
+    ``expand_on_gaps``, the unroll emits ONLY the FIRST (seed) RESEARCH layer and tags the
+    returned :class:`PlanDAG` ``growable`` — the runtime's drive loop then GROWS the DAG
+    round-by-round on note gaps via ``research_tree.run_decision_node`` (the iterative-breadth
+    lever that lets the generic engine reproduce ``run_research_tree``). ``grow`` is the
+    ENGINE's opt-in: a caller passes it ONLY when it wires a grower to drive the growth, so a
+    shape gaining ``expand_on_gaps`` never silently turns a NON-growing caller's full unroll
+    into a seed-only DAG (the inline ``_run_deep_research`` route keeps ``grow=False`` → the
+    frozen unroll, byte-identical). ``grow=True`` on a shape WITHOUT ``expand_on_gaps`` is a
+    no-op (the frozen unroll runs) — the capability must be declared on the shape.
 
     This is the GENERIC unroll that replaced the per-shape ``DeepResearchExecutor``
     (no per-shape python remains on the execution path). It is driven ENTIRELY by
@@ -231,27 +308,78 @@ def unroll_shape(
     specs = (spec,) if spec else ()
     nodes: list[PlanNode] = []
     prior_ids: list[str] = []  # EVERY node authored so far → full growing visibility
-    for r in range(1, effective + 1):
-        is_final = r == effective
-        roles = shape.final_roles if is_final else shape.round_roles
-        for role in roles:
-            nid = f"r{r}_{role}"
+    # P2.5b (d134/d135) — ITERATIVE GAP-EXPANSION. When the shape declares ``expand_on_gaps``
+    # we DO NOT pre-unroll every round (the frozen-DAG cause of the parity gap). Instead we
+    # emit ONLY the SEED layer — the FIRST round's RESEARCH position(s) — and tag the DAG
+    # ``growable``. The runtime's drive loop then grows the rest by re-frontiering on the
+    # decision node's gap-driven ``expand_branch`` calls (the SAME tool surface the bespoke
+    # tree uses), bounded by ``max_layers`` / ``fan_out`` + no_expansion + completeness_stop.
+    # The seed drops the per-round CRITIC node: in growable mode the decision node IS the
+    # critic, so the seed mirrors ``run_research_tree``'s gather-then-decide layer exactly.
+    # Gated on BOTH the shape capability AND the engine's ``grow`` opt-in (so a non-growing
+    # caller of an ``expand_on_gaps`` shape still gets the full frozen unroll — no regression).
+    if grow and shape.expand_on_gaps:
+        seed_positions = tuple(p for p in shape.round_roles if p == "research") or ("research",)
+        for position in seed_positions:
+            nid = f"r1_{position}"
+            tool = "web_search" if position == "research" else None
+            tool_args = {"query": str(goal)[:200]} if tool else {}
             nodes.append(
                 PlanNode(
                     id=nid,
-                    task=f"[{role} · round {r}] {goal}",
+                    task=f"[{position} · round 1] {position_framing(position)}\n\n{goal}",
+                    spec=spec,
+                    specs=specs,
+                    depends_on=tuple(prior_ids),
+                    role=ROLE_SYNTHESIZER if position == "synthesis" else ROLE_WORKER,
+                    tool=tool,
+                    tool_args=tool_args,
+                )
+            )
+            prior_ids.append(nid)
+        return PlanDAG(
+            nodes=nodes,
+            rationale=(
+                f"{shape.name} growable seed (1 layer; runtime grows on note gaps, "
+                f"max_layers={shape.max_layers or 'cfg'}, fan_out={shape.fan_out or 'cfg'})"
+            ),
+            shape=shape.name,
+            growable=True,
+            fan_out=int(shape.fan_out),
+            max_layers=int(shape.max_layers),
+        )
+    for r in range(1, effective + 1):
+        is_final = r == effective
+        positions = shape.final_roles if is_final else shape.round_roles
+        for position in positions:
+            nid = f"r{r}_{position}"
+            # d48: map the POSITION onto a NODE ROLE (worker|synthesizer) and inject
+            # the position's behavior framing into the TASK — so a research/critic/
+            # verify node behaves as such via PROMPTING, not a per-role code switch.
+            node_role = ROLE_SYNTHESIZER if position == "synthesis" else ROLE_WORKER
+            # A research-position node reads real sources via the GENERIC
+            # search-then-read TOOL path (the retired role-research gate's job, now
+            # keyed on the tool, not a role): bind web_search + a seed query.
+            tool = "web_search" if position == "research" else None
+            tool_args = {"query": str(goal)[:200]} if tool else {}
+            nodes.append(
+                PlanNode(
+                    id=nid,
+                    task=f"[{position} · round {r}] {position_framing(position)}\n\n{goal}",
                     spec=spec,
                     specs=specs,
                     # Depend on every prior node: the rounds run in order and each
                     # node's inputs carry all earlier layers (growing visibility).
                     depends_on=tuple(prior_ids),
-                    role=role,
+                    role=node_role,
+                    tool=tool,
+                    tool_args=tool_args,
                 )
             )
             prior_ids.append(nid)
     return PlanDAG(
         nodes=nodes,
-        rationale=f"{shape.name} unroll ({effective} rounds, role-differentiated)",
+        rationale=f"{shape.name} unroll ({effective} rounds, position-framed)",
         shape=shape.name,
     )
 
@@ -294,6 +422,7 @@ __all__ = [
     "SHAPES_DIR",
     "DEEP_RESEARCH",
     "VALID_EXECUTION",
+    "VALID_POSITIONS",
     "unroll_shape",
     "load_shapes",
     "load_shape",

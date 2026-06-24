@@ -67,6 +67,11 @@ class Context:
     """Transport-ready message list, built by ``prompt_assembly``."""
     raw_output: Optional[str] = None
     """Raw assistant text from the model, set by ``call_stage``."""
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    """Native tool calls from the model (s13), set by ``call_stage`` from
+    ``ChatResult.tool_calls``. Normalised ``[{"name", "arguments"}, ...]``; ``None``
+    when the request carried no ``tools`` or the reply was plain prose. Lets a ReAct
+    loop read a structured tool call directly instead of string-parsing ``raw_output``."""
     structured: Any = None
     """Parsed structured output, set by ``structured_output`` (None if absent)."""
 

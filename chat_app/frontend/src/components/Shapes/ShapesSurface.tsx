@@ -29,6 +29,8 @@
 import { useState } from "react";
 import {
   useAuthorShape,
+  useDeleteShape,
+  useRefineShape,
   useSetShapeMaxIter,
   useShapes,
 } from "../../api/queries";
@@ -38,6 +40,28 @@ import "./ShapesSurface.css";
 interface ShapesSurfaceProps {
   onClose: () => void;
 }
+
+/**
+ * The 6 shipped BUILT-IN shapes (s4/a4, d13 no-regression).
+ *
+ * SOURCE OF TRUTH: chat_app/chat_app/shape_config.py:62-71 (`BUILTIN_SHAPES`).
+ * This is a deliberate MIRROR of that backend guard — the backend DELETE route
+ * 409s these names (only the user's OWN authored shapes are deletable), which is
+ * the load-bearing safety floor; this frontend copy only HIDES the delete control
+ * cosmetically. If a built-in is ever added/removed, update BOTH this set and the
+ * backend set above (keep them in lockstep). Built-ins and user-authored shapes
+ * share the same SHAPES_DIR, so `ShapeView.source` (an identical-shaped path for
+ * both) can't distinguish them — the NAME is the reliable detector. A 409 is still
+ * handled gracefully (visible error) as the real safety net if a built-in delete
+ * is ever attempted. */
+const BUILTIN_SHAPES: ReadonlySet<string> = new Set([
+  "linear",
+  "modular-parallel",
+  "concurrent-multi-topic-gathering",
+  "deep-research",
+  "iterative-deep-research",
+  "iterative-writing-improvement",
+]);
 
 export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
   const shapes = useShapes();
@@ -79,18 +103,22 @@ export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
             <p className="shapes-hint">No text-file shapes are defined.</p>
           )}
           {list.map((shape) => (
-            <button
-              key={shape.name}
-              type="button"
-              className={`shapes-row${shape.name === activeName ? " shapes-row-active" : ""}`}
-              onClick={() => setSelected(shape.name)}
-              aria-current={shape.name === activeName}
-              aria-label={`View ${shape.name}`}
-            >
-              <span className="shapes-row-name">{shape.name}</span>
-              <ExecutionBadge execution={shape.execution} />
-              <span className="shapes-row-iter">{iterSummary(shape)}</span>
-            </button>
+            <div key={shape.name} className="shapes-row-item">
+              <button
+                type="button"
+                className={`shapes-row${shape.name === activeName ? " shapes-row-active" : ""}`}
+                onClick={() => setSelected(shape.name)}
+                aria-current={shape.name === activeName}
+                aria-label={`View ${shape.name}`}
+              >
+                <span className="shapes-row-name">{shape.name}</span>
+                <ExecutionBadge execution={shape.execution} />
+                <span className="shapes-row-iter">{iterSummary(shape)}</span>
+              </button>
+              {!BUILTIN_SHAPES.has(shape.name) && (
+                <ShapeDeleteButton name={shape.name} />
+              )}
+            </div>
           ))}
           </nav>
         </div>
@@ -176,6 +204,46 @@ function ShapeAuthorForm({ onAuthored }: { onAuthored: (name: string) => void })
   );
 }
 
+/**
+ * Per-row DELETE control for a USER-AUTHORED shape (s4/a4, d13 UI). A REAL
+ * hit-testable button rendered as a sibling of the row's view button (never
+ * nested inside it — that would be invalid HTML + un-clickable). Only rendered for
+ * non-built-in shapes (the caller gates on BUILTIN_SHAPES); a 409 from the backend
+ * guard still surfaces gracefully via the mutation error as the real safety net.
+ * Click → confirm → delete; the mutation invalidates the catalog so the row
+ * clears. Double-delete is guarded by disabling while the mutation is pending. */
+function ShapeDeleteButton({ name }: { name: string }) {
+  const del = useDeleteShape();
+  const onDelete = () => {
+    if (del.isPending) return;
+    if (!window.confirm(`Delete shape "${name}"? This cannot be undone.`)) {
+      return;
+    }
+    del.mutate({ name });
+  };
+  return (
+    <span className="shapes-row-delete-wrap">
+      <button
+        type="button"
+        className="shapes-row-delete"
+        onClick={onDelete}
+        disabled={del.isPending}
+        aria-label={`Delete ${name}`}
+        title={`Delete ${name}`}
+      >
+        {del.isPending ? "Deleting…" : "Delete"}
+      </button>
+      {del.isError && (
+        // A failed delete is shown plainly, never a silent no-op — e.g. a 409 if a
+        // built-in were ever attempted, or a 404 if the shape vanished concurrently.
+        <span className="shapes-row-delete-err" role="alert">
+          {del.error.message}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** A short "ceiling" summary for the list row (genuine: only iterative shapes
  * iterate, so others read as single-pass). */
 function iterSummary(shape: ShapeView): string {
@@ -215,8 +283,75 @@ function ShapeDetail({ shape }: { shape: ShapeView }) {
 
       <ShapeStructure shape={shape} />
 
+      <ShapeRefineForm shape={shape} />
+
       <MaxIterEditor shape={shape} />
     </article>
+  );
+}
+
+// =========================================================================== //
+// refine-a-shape: the user EDITS the selected shape in plain language and the live
+// Gemma model authors the next version BUILDING ON the current one (s8/b6, d18a).
+// This is the free-flow ITERATIVE authoring the describe→create box can't do —
+// describe creates a NEW shape; this refines an EXISTING one in place (the file is
+// overwritten). On success the per-shape cache + catalog row update, so an edit
+// that flips the posture (e.g. a collapsed sequential "linear plus modular
+// parallel" → concurrent) is reflected live. Mirrors the author box's UX.
+// =========================================================================== //
+function ShapeRefineForm({ shape }: { shape: ShapeView }) {
+  // Re-mounted per shape via the parent's `key={active.name}`, so the working text
+  // resets cleanly when the user switches shapes (no server→state mirroring).
+  const [instruction, setInstruction] = useState("");
+  const refine = useRefineShape();
+
+  const submit = () => {
+    const trimmed = instruction.trim();
+    if (!trimmed || refine.isPending) return;
+    refine.mutate(
+      { name: shape.name, instruction: trimmed },
+      { onSuccess: () => setInstruction("") },
+    );
+  };
+
+  return (
+    <form
+      className="shapes-refine"
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
+      <h3 className="shapes-struct-title">Refine this shape</h3>
+      <p className="shapes-struct-note">
+        Describe a change in plain language — the local model rewrites this shape,
+        building on its current definition. Use this to evolve a shape (e.g. “run the
+        second phase in parallel instead of in sequence”); it edits this shape in
+        place, it does not create a new one.
+      </p>
+      <label className="shapes-field">
+        <span className="shapes-field-label">Refinement</span>
+        <textarea
+          className="shapes-field-input shapes-author-input"
+          value={instruction}
+          onChange={(e) => setInstruction(e.target.value)}
+          placeholder="e.g. add a modular parallel phase after the linear foundation, then combine the results"
+          maxLength={4000}
+          rows={3}
+          aria-label={`Refine the shape ${shape.name}`}
+        />
+      </label>
+      {refine.isError && (
+        <p className="shapes-error" role="alert">{refine.error.message}</p>
+      )}
+      <button
+        type="submit"
+        className="shapes-primary"
+        disabled={refine.isPending || instruction.trim() === ""}
+      >
+        {refine.isPending ? "Refining…" : "Refine shape"}
+      </button>
+    </form>
   );
 }
 
