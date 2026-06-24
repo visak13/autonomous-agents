@@ -59,6 +59,16 @@ from .heal_router import (
     HealRouter,
     register_heal_rule,
 )
+from .reactor import (
+    EVENT_NODE_CLARIFICATION,
+    REACTOR_KINDS,
+    PlannerReactor,
+)
+from .review_injection import (
+    FINAL_REVIEW_ID,
+    REVIEW_SUFFIX,
+    inject_reviews,
+)
 from .runtime import (
     EVENT_NODE_CANCELLED,
     EVENT_NODE_DONE,
@@ -115,16 +125,14 @@ from .selfheal import (
 )
 from .status import IllegalTransition, NodeState, NodeStatus
 from .roles import (
-    ROLE_CRITIC,
-    ROLE_RESEARCH,
-    ROLE_REVIEWER,
-    ROLE_SYNTHESIS,
-    ROLE_VERIFY,
+    ROLE_SYNTHESIZER,
     ROLE_WORKER,
     ROLE_FRAMINGS,
     ROLE_SCHEMAS,
     ROLE_VERDICTS,
     JUDGMENT_ROLES,
+    POSITION_FRAMINGS,
+    position_framing,
     is_judgment_role,
     legal_verdict,
     role_framing,
@@ -135,6 +143,7 @@ from .shapes import (
     DEEP_RESEARCH,
     SHAPES_DIR,
     VALID_EXECUTION,
+    VALID_POSITIONS,
     ShapeError,
     ShapeSpec,
     load_shape,
@@ -175,6 +184,28 @@ from .missing_spec import (
     missing_from_requested,
     missing_specialist_payload,
 )
+from .research_tree import (
+    Branch,
+    DagGrower,
+    DecisionResult,
+    LeafResult,
+    N4_TREE_DEPTH_CEILING,
+    ResearchState,
+    Tree,
+    TreeConfig,
+    TREE_TOOLS,
+    parse_tree_call,
+    run_decision_node,
+)
+from .discovery_tools import (
+    GET_SHAPES_TOOL,
+    GET_SPECS_TOOL,
+    GetShapesArgs,
+    GetSpecsArgs,
+    make_get_shapes,
+    make_get_specs,
+    register_discovery_tools,
+)
 from . import stub
 
 __all__ = [
@@ -186,17 +217,15 @@ __all__ = [
     "FACTORY_DESCRIPTION",
     "NODE_SCHEMA",
     "VALID_ROLES",
-    # node roles (templates + per-role output schemas)
-    "ROLE_RESEARCH",
-    "ROLE_CRITIC",
+    # node roles (d48: worker|synthesizer only) + deep-research positions
     "ROLE_WORKER",
-    "ROLE_REVIEWER",
-    "ROLE_SYNTHESIS",
-    "ROLE_VERIFY",
+    "ROLE_SYNTHESIZER",
     "ROLE_FRAMINGS",
     "ROLE_SCHEMAS",
     "ROLE_VERDICTS",
     "JUDGMENT_ROLES",
+    "POSITION_FRAMINGS",
+    "position_framing",
     "is_judgment_role",
     "legal_verdict",
     "role_framing",
@@ -208,6 +237,7 @@ __all__ = [
     "SHAPES_DIR",
     "DEEP_RESEARCH",
     "VALID_EXECUTION",
+    "VALID_POSITIONS",
     "unroll_shape",
     "load_shape",
     "load_shapes",
@@ -246,6 +276,14 @@ __all__ = [
     "HEAL_RULE_KINDS",
     "EVENT_NODE_FAILURE_DETECTED",
     "EVENT_HEAL_ROUTED",
+    # event-driven planner reaction (P2.2, d129.2)
+    "PlannerReactor",
+    "EVENT_NODE_CLARIFICATION",
+    "REACTOR_KINDS",
+    # framework-injected review (P2.2, d129.3)
+    "inject_reviews",
+    "REVIEW_SUFFIX",
+    "FINAL_REVIEW_ID",
     # runtime
     "AgentRuntime",
     "RuntimeResult",
@@ -320,4 +358,24 @@ __all__ = [
     "InvalidStepError",
     # offline stubs (pluggable transport)
     "stub",
+    # s9/N4 — TREE-shaped research with pruning + persisted-state decision node
+    "Branch",
+    "DagGrower",
+    "DecisionResult",
+    "LeafResult",
+    "N4_TREE_DEPTH_CEILING",
+    "ResearchState",
+    "Tree",
+    "TreeConfig",
+    "TREE_TOOLS",
+    "parse_tree_call",
+    "run_decision_node",
+    # discovery tools (get_shapes / get_specs) — queryable shape/spec catalog
+    "GET_SHAPES_TOOL",
+    "GET_SPECS_TOOL",
+    "GetShapesArgs",
+    "GetSpecsArgs",
+    "make_get_shapes",
+    "make_get_specs",
+    "register_discovery_tools",
 ]
