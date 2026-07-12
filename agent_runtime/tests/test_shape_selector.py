@@ -293,3 +293,75 @@ def test_unmet_specs_non_list_is_failopen_empty():
     sel = ShapeSelector(FakeTransport([reply]), spec_names=["markdown-writer"])
     out = asyncio.run(sel.select("write a report"))
     assert out.unmet_specs == []
+
+
+# --------------------------------------------------------------------------- #
+# RP-3a SELECTOR RELIABILITY — self-policing: the advertisement must SEPARATE
+# shapes from specs as DISTINCT KINDS (a spec is a node CAPABILITY, never a
+# selectable shape), and the fix stays in the DEFINITION LAYER (no engine flag/
+# hardcode, no spec-name control-flow conditional). RP-0 measured the misroute:
+# E4B emitted the SPEC 'web-research' into the shape slot → membership reject →
+# the deep-research report diverted onto the flat acyclic path.
+# --------------------------------------------------------------------------- #
+def _selector_prompt_with_specs():
+    sel = ShapeSelector(
+        FakeTransport([_reply("linear")]),
+        spec_names=["web-research", "research-methodology", "research-analyst"],
+        spec_catalog=[
+            {"name": "web-research", "description": "the LIVE-WEB variant of the method"},
+            {"name": "research-methodology", "description": "the core research method"},
+            {"name": "html-writer", "description": "format the deliverable as HTML"},
+        ],
+    )
+    return sel._system_prompt(sel.catalog())
+
+
+def test_advertisement_separates_shape_and_spec_kinds():
+    prompt = _selector_prompt_with_specs()
+    low = prompt.lower()
+    # The shape field is explicitly bounded to the SHAPE names only.
+    assert "only legal values for the 'shape' field" in low
+    # Specs are presented as a DIFFERENT KIND that is NOT a shape.
+    assert "specializations" in low and "not shapes" in low
+    # A spec name is never a valid shape value (the anti-conflation instruction).
+    assert "never put one in the shape field" in low
+    # The concrete trap is called out: a research-flavoured SPEC is a capability,
+    # and a deep investigation is the deep-research SHAPE (not shape='web-research').
+    assert "web-research" in low
+    assert "shape='deep-research'" in low or "shape=\"deep-research\"" in low
+
+
+def test_spec_name_is_not_in_the_shape_enum():
+    # No engine hardcode: a specialization is NEVER selectable as a shape — the
+    # shape enum stays EXACTLY the on-disk shape names + escalate, so a spec name
+    # can never masquerade as a shape at the schema/membership boundary.
+    sel = ShapeSelector(
+        FakeTransport([_reply("linear")]),
+        spec_names=["web-research", "research-methodology"],
+        spec_catalog=[{"name": "web-research", "description": "web research capability"}],
+    )
+    names = sorted(sel.catalog())
+    schema = build_selection_schema(names, sel.spec_names)
+    enum = schema["properties"]["shape"]["enum"]
+    assert "web-research" not in enum
+    assert "research-methodology" not in enum
+    assert set(enum) == set(names) | {ESCALATE}
+
+
+def test_no_engine_spec_name_conditional_in_selector():
+    # DEFINITION-LAYER guarantee (anti-fabrication charter d311): the selector code
+    # must not branch on a specific spec NAME (that would move reliability into an
+    # engine hardcode). The spec names appear ONLY inside prompt STRINGS (teaching
+    # the model the KIND boundary), never in Python control flow.
+    import inspect
+    import agent_runtime.shape_selector as mod
+
+    src = inspect.getsource(mod)
+    for banned in (
+        'if "web-research"',
+        "if 'web-research'",
+        '== "web-research"',
+        "== 'web-research'",
+        'shape == "web-research"',
+    ):
+        assert banned not in src, f"engine spec-name conditional found: {banned}"

@@ -37,3 +37,7 @@ evidence/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Recipe-internal design/gate scratch (s14/s15 era)
+.s14_design/
+.s15_gate/

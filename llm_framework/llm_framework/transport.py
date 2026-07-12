@@ -220,7 +220,7 @@ class Transport(Protocol):
 
 
 # --------------------------------------------------------------------------- #
-# Real transport: local Ollama / phi4-mini
+# Real transport: local Ollama (gemma4-e4b-candidate-ctx32k on :11434)
 # --------------------------------------------------------------------------- #
 
 
@@ -332,12 +332,50 @@ class OllamaTransport:
             msgs.insert(0, {"role": "system", "content": AGENT_IDENTITY})
         return msgs
 
+    @staticmethod
+    def _normalize_tool_roles(messages: Sequence[Message]) -> list[Message]:
+        """Return a COPY of ``messages`` with every ``role: "tool"`` turn rewritten
+        to ``role: "user"`` (d262 / d199 / d202).
+
+        Gemma's Ollama chat template is PROMPT-ONLY: it renders ``system`` /
+        ``user`` / ``assistant`` turns but IGNORES ``role: "tool"`` entirely, so
+        any observation fed back as a tool message is INVISIBLE to the model. The
+        runtime hands tool observations (plan acks, file-write confirmations,
+        reviewer file slices, self-select acks, research note-acks, …) back as
+        ``role: "tool"`` at many call sites. Normalising HERE — the one chokepoint
+        both wire paths route through, each of which copies the message list
+        verbatim (``list(messages)``) and never inspects roles — guarantees the
+        model SEES every observation and cannot regress at a new 14th call site.
+
+        The rewrite is content-PRESERVING: only the role label changes, never the
+        content. d202 cautioned against a blanket REVERT of observation content,
+        not against role normalisation — for this prompt-rendered model the role is
+        only meaningful for whether a turn is rendered at all, so tool→user is the
+        visible, correct rendering every site wants. We never mutate the caller's
+        list (a chain may reuse it): tool turns are emitted as fresh dicts, other
+        turns pass through unchanged."""
+        out: list[Message] = []
+        for m in messages:
+            if m.get("role") == "tool":
+                nm = dict(m)
+                nm["role"] = "user"
+                out.append(nm)
+            else:
+                out.append(m)
+        return out
+
     def chat(self, messages: Sequence[Message], **opts: Any) -> ChatResult:
         # d15: ship the universal agent identity on EVERY real model call. This is
         # the one shared seam every call site (planner, runtime nodes, shape/spec
         # authoring, summariser, chat) routes through, so injecting here — rather
         # than at each call site — guarantees a consistent identity everywhere.
         messages = self._inject_identity(messages)
+        # d262/d199/d202: gemma's Ollama template ignores role:"tool", so any
+        # observation handed back as a tool message is invisible to the model.
+        # Rewrite tool roles to "user" at this one chokepoint (both wire paths copy
+        # the message list verbatim and never inspect roles) so every tool
+        # observation is SEEN by the model — fixing all ~13 call sites at once.
+        messages = self._normalize_tool_roles(messages)
         api = opts.pop("api", self.api)
         # No tracing available (httpx-only install): behave exactly as before.
         if not _OTEL_AVAILABLE:

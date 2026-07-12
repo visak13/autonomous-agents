@@ -22,7 +22,7 @@ the same process*. Two endpoints make this concrete:
   when the client disconnects (a disconnect surfaces as ``CancelledError``).
 
 Transport (d12): everything still runs on the deterministic STUB/Fake transport.
-NO live Ollama / phi4-mini call is made here; the live transport swaps in at s8
+NO live Ollama call is made here; the live transport swaps in at s8
 with no other code change (the llm_framework ``Transport`` protocol is the seam).
 Self-scoped teardown (d8): a single in-process uvicorn instance is stopped only
 by its own PID via graceful shutdown — never a name/image-wide kill.
@@ -73,6 +73,7 @@ from agent_runtime import (
     stub,
 )
 from specialization.seed import seed_canonical_rulesets
+from chat_app.curation import CURATED_SHAPES, CURATED_SPECS, curate_index
 from chat_app.agentic import run_agentic, run_offline
 from chat_app.cron_scheduler import CronScheduler, make_cron_fire
 # Tracing (s6): the a1 factory owns the single shared TracerProvider; b3 builds
@@ -93,6 +94,8 @@ RUNTIME_EVENT_KINDS: tuple[str, ...] = (
     EVENT_NODE_CANCELLED,
     EVENT_NODE_REPLANNED,
     EVENT_NODE_SKIPPED,
+    # TERMINAL SYNTHESIZER summary (D4, d215) — relayed on the firehose too.
+    "agent_run_synthesis",
     "tool_call",
     "tool_result",
 )
@@ -255,7 +258,7 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
     memory = MemoryRecall(store)
 
     # LIVE MODE (s8): REACTIVE_AGENTS_LIVE=1 swaps the deterministic stub
-    # transports for the real phi4-mini OllamaTransport — the whole point of the
+    # transports for the real gemma4-e4b OllamaTransport — the whole point of the
     # pluggable Transport seam (d7). Default stays stub so the offline harness /
     # existing evidence are unaffected. keep_alive is short so the server does not
     # hog the SHARED GPU between turns (d8).
@@ -286,7 +289,11 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
     # the hook on the event plane. ``specs_dir`` is the live on-disk spec registry so
     # get_specs reflects specs compiled since startup (d10: descriptions only, never a
     # body). shapes_dir defaults to the packaged shapes catalog.
-    register_discovery_tools(agentic_registry, specs_dir=data / "specs")
+    register_discovery_tools(
+        agentic_registry, specs_dir=data / "specs",
+        # d230 registry scoping: get_shapes/get_specs advertise only the curated set.
+        exposed_shapes=CURATED_SHAPES, exposed_specs=CURATED_SPECS,
+    )
     if live:
         from llm_framework import OllamaTransport
 
@@ -298,8 +305,15 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
         # gemma's SOLE consumer, so keeping the model warm across every turn kills the
         # per-call reload thrash (~30x on a multi-node run) — E4B text-only Q4 fits the
         # 6 GB card at 0% offload (s10/s11), so resident is safe.
+        # RP-4c (d338/d339): raise the per-call HTTP timeout 300 -> 600s. The 300s ceiling
+        # was too tight for E4B's slowest single authoring/write turn under transient :11434
+        # latency (perf d97/d101) — a spike surfaced as the RP-4b baseline schedule-only miss
+        # (a bare read-timeout, NOT a code fault). 600s gives ~2x headroom for a cold/contended
+        # authoring call and covers the long-report (~360s) write phase's longest single turn
+        # (RP-5 readiness). This is a CONFIG VALUE, not a behavior flag/gate; connect stays 5s
+        # (default) so an actually-down :11434 still fails fast.
         live_transport = OllamaTransport(
-            api="native", keep_alive=-1, timeout=300
+            api="native", keep_alive=-1, timeout=600
         )
         engine = SpecializationEngine(
             registry, hook=hook, condense_transport=live_transport,
@@ -311,8 +325,12 @@ def build_wiring(*, data_dir: str | os.PathLike[str] | None = None) -> Wiring:
     # 4) agent runtime — the planner reasons over ONLY the body-free factory +
     #    spec lookup (d10); the runtime launches DAG nodes as in-process tasks on
     #    the SHARED plane/hook (d2 — no shell forking). Live phi or stub transport.
+    # d230 CLEAN-SLATE CURATION: the planner reasons over only the curated required-now
+    # SPEC lookup (advertisement-only — the management/missing-spec/body-load surfaces
+    # still see EVERY registered spec). The selector + discovery tools are curated above.
     factory = AbstractPlanFactory(
-        registry.index(), tool_catalog=hook.registry.catalog()
+        curate_index(registry.index(), CURATED_SPECS),
+        tool_catalog=hook.registry.catalog(),
     )
     if live:
         # s8/b1: the DECISIVE swap fix. gemma4 is a thinking model, so the

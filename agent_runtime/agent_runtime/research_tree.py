@@ -49,6 +49,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -57,8 +59,10 @@ from typing import Any, Mapping, Optional, Sequence
 # gap-driven branches onto research PlanNodes. factory/roles/synth_tools are leaf modules
 # (none import research_tree), so these top-level imports add no cycle.
 from .factory import PlanDAG, PlanNode
+from .plan_tools import NEW_MEMORY_SENTINEL, normalize_brief_memory_index
 from .roles import ROLE_WORKER, position_framing
-from .synth_tools import unwrap_output_envelope
+from specialization.seed import RESEARCH_METHODOLOGY_SPEC
+from .synth_tools import select_relevant_excerpt, unwrap_output_envelope
 
 # ---------------------------------------------------------------------------- #
 # Config — DEPTH, fan-out, leaf breadth are TUNEABLE via env (Q-C HARD REQ: NEVER
@@ -168,6 +172,13 @@ class Branch:
     question: str
     rationale: str = ""
     depth: int = 1
+    # d285 SB-3 — the research-MEMORY this seed branch's brief works in: an existing
+    # index to CONTINUE, or the textual ``<<NEW>>`` sentinel to start a fresh line. The
+    # model authors it on its ``expand_branch`` call (default <<NEW>> — a seed branch
+    # opens a new research line); carried onto the branch's PlanNode brief. The actual
+    # per-branch memory OPENING (vs the run's shared memory) is SB-4 — SB-3 only carries
+    # the planner-authored choice on the brief surface.
+    memory_index: str = NEW_MEMORY_SENTINEL
 
 
 class Tree:
@@ -268,6 +279,9 @@ class Tree:
             question=question,
             rationale=str(args.get("rationale", "")).strip(),
             depth=depth,
+            # d285 SB-3 — the planner-authored research-memory choice for this branch's
+            # brief (an index to continue, or <<NEW>>); canonicalized (empty → <<NEW>>).
+            memory_index=normalize_brief_memory_index(args.get("memory_index")),
         )
         self.branches[bid] = branch
         return (
@@ -315,12 +329,15 @@ class Tree:
 # ---------------------------------------------------------------------------- #
 TREE_TOOLS: tuple[str, ...] = (
     "expand_branch", "prune_branch", "set_next_direction", "stop_research",
-    # s13/B3 — the AGENT-DECIDED DOCUMENT DIRECTION channel (design §3, the faithfulness
-    # linchpin): low-arity outline tools that author/refine the document's section plan.
-    # They mutate the tree's OutlinePlan (NOT the research topology) and are persisted to the
-    # ResearchState outline channel + read back each layer (same anti-hallucination read-back
-    # as the leaf notes), then handed to PHASE-2 as the primary section scaffold.
-    "add_section", "drop_section",
+    # s14/a12 (d154) — the s13/B3 add_section / drop_section OUTLINE tools were REMOVED from the
+    # served decision-node surface because they were a DEAD source_id channel. The generic
+    # engine discards the tree-authored outline (PHASE-2 runs outline_hint=None, d56), so the
+    # model was offered TWO surfaces to author source_ids on — add_section (whose source_ids arg
+    # is SILENTLY DROPPED) and the file_write nodes (live, gate-checked) — and routed between
+    # them arbitrarily (a7 vanished 0/9, a9 11/13-variable). Dropping the dead surface leaves the
+    # file_write write-planner as the SOLE source_id surface, so authoring is deterministic. The
+    # Tree.add_section / drop_section methods + ResearchState outline channel are KEPT (inert,
+    # still unit-tested in isolation) but are no longer OFFERED to the model.
 )
 
 
@@ -339,6 +356,33 @@ def _first_json_object(s: str) -> Optional[str]:
             if depth == 0:
                 return s[start:i + 1]
     return None
+
+
+# d222 trace finding — E4B routes its tree/note tool calls through the STRING-parse path
+# (not the native tool_calls channel), so a single malformed escape silently DROPS the call.
+# The working trace (77b2…) showed a research note lost TWICE to ``the conflict\'s instability``
+# (``\'`` is valid in Python/JS but ILLEGAL in JSON → json.loads fails → treated as prose →
+# note_gate re-asks → the retry reproduces the SAME bad escape), plus a stray ``<tool_call|>``
+# special token appended to the object. This repair makes those recoverable.
+_MODEL_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|?/?(?:tool_call|end_of_turn|start_of_turn|eos|bos|im_end|im_start)\|?>",
+    re.IGNORECASE,
+)
+
+
+def repair_model_json(blob: str) -> str:
+    """Best-effort repair of a small model's malformed JSON tool call (d222).
+
+    Fixes the two recurring E4B malformations the trace surfaced, so ``json.loads`` can
+    recover the call instead of silently dropping it:
+      * an illegal ``\\'`` escape inside a string → a literal apostrophe (``\\'`` is never
+        valid JSON, so this is always safe);
+      * a stray model special token (e.g. ``<tool_call|>``) left in the object.
+    Idempotent and safe on already-valid JSON (neither pattern occurs in well-formed JSON)."""
+    s = blob or ""
+    s = _MODEL_SPECIAL_TOKEN_RE.sub("", s)
+    s = s.replace("\\'", "'")
+    return s
 
 
 def _strip_fence(s: str) -> str:
@@ -369,7 +413,12 @@ def parse_tree_call(raw: str) -> Optional[tuple[str, dict[str, Any]]]:
     try:
         parsed = json.loads(blob)
     except (ValueError, TypeError):
-        return None
+        # d222 — retry after repairing E4B's common malformations (illegal \' escape /
+        # stray special token) so a single bad escape never silently drops a tree call.
+        try:
+            parsed = json.loads(repair_model_json(blob))
+        except (ValueError, TypeError):
+            return None
     if not isinstance(parsed, Mapping):
         return None
     tool = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
@@ -419,29 +468,39 @@ def make_tool_spec(
 
 # The decision/decompose tools as native schemas (mirror TREE_TOOLS + _DECISION_INSTRUCTION
 # arg shapes). Passed as ``tools=[...]`` so the model emits real tool_calls.
-# These descriptions CARRY the research FLOW so it is legible from the tool surface
-# itself (d125/d126/d133 tool-drives-the-flow): IDENTIFY the thesis -> EXPAND into
-# the gaps along what/why/when/how -> PRUNE bad/off-thesis leads -> STOP when the
-# notes answer the thesis with no meaning-adding gap left. The hardcoded
-# _DECISION/_DECOMPOSE prompts are KEPT as a backstop, but the tools say what they
-# are FOR so an agent can drive the loop from the descriptions alone.
+# d184 — these descriptions CARRY the CANONICAL RESEARCH LOOP so it is legible from the tool
+# surface itself (tool-drives-the-flow, no force-N / no min-layers seatbelt): identify the
+# concerns -> search -> read MULTIPLE relevant chunks -> NOTE what was learned + the gaps ->
+# EXPAND a concern (which COMMITS to a new gathered round) -> PRUNE a concern that added no
+# meaning -> STOP only when every concern is settled-noted OR collapsed and no new concern
+# remains. The hardcoded _DECISION/_DECOMPOSE prompts are KEPT as a backstop, but the tools
+# say what they are FOR — and, crucially, that expanding is a COMMITMENT TO GATHER (so a pass
+# that expands cannot also stop) — so an agent can drive the loop from the descriptions alone.
 TREE_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     make_tool_spec(
         "expand_branch",
-        "EXPAND the research into a GAP. Author one focused, scoped child question "
-        "that fills a MISSING meaning the report needs — probe the next unanswered "
-        "WHAT / WHY / WHEN / HOW of the thesis (e.g. a missing timeline event, an "
-        "unquantified cost, an unexplained cause). Each child must be answerable by "
-        "ONE focused research node; do not restate the whole goal.",
+        "EXPAND a concern into the NEXT research ROUND. Author one focused, scoped child "
+        "question for a MISSING meaning the report still needs — the next unanswered "
+        "WHAT / WHY / WHEN / HOW (a missing timeline event, an unquantified cost, an "
+        "unexplained cause, a figure only one source gave). Expanding COMMITS TO GATHER: this "
+        "child WILL be run as a new research round (search -> read -> note) and its findings "
+        "come back on a LATER turn — so you CANNOT expand and stop in the same pass; an "
+        "expansion means there is still work to gather. Each child must be answerable by ONE "
+        "focused research node; do not restate the whole goal. Set 'memory_index' to the "
+        "research memory this branch works in: an existing INDEX to CONTINUE that research "
+        "line, or \"<<NEW>>\" / leave empty to start a FRESH line (the default for a new "
+        "seed facet).",
         {"parent": {"type": "string"}, "question": {"type": "string"},
-         "rationale": {"type": "string"}},
+         "rationale": {"type": "string"}, "memory_index": {"type": "string"}},
         ["question"],
     ),
     make_tool_spec(
         "prune_branch",
-        "PRUNE a bad lead. Cut a branch/note that ADDS NO MEANING — redundant, "
-        "off-thesis, already answered, a dead end, or low-trust — so the budget goes "
-        "to gaps that matter. Give the reason it fails the meaning test.",
+        "PRUNE — COLLAPSE a concern that added no meaning. A normal, expected move every "
+        "layer: cut a branch/note that is redundant, off-thesis, already answered, a dead end, "
+        "or low-trust so the budget funds the concerns that still matter. A concern is either "
+        "settled by a note OR collapsed here — pruning is how you close one out without "
+        "gathering it further. Name the reason it fails the meaning test.",
         {"branch": {"type": "string"}, "reason": {"type": "string"}},
         ["branch"],
     ),
@@ -454,27 +513,20 @@ TREE_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     make_tool_spec(
         "stop_research",
-        "STOP when SUFFICIENT. Call this once the gathered notes answer the thesis "
-        "with NO meaning-adding gap left (the blanks are filled) — not at an "
-        "arbitrary depth. State briefly why coverage is now complete.",
+        "STOP — only when EVERY concern is SETTLED (its meaning is recorded in a note) OR has "
+        "been COLLAPSED with prune_branch, AND no new concern remains. A concern resting on a "
+        "single source, a figure without its surrounding detail, or an open follow-up is NOT "
+        "settled — expand it instead. If you authored ANY expand_branch this pass you are NOT "
+        "done: those rounds have not gathered yet, so there is nothing to stop on. State "
+        "briefly why every concern is now settled or collapsed.",
         {"reason": {"type": "string"}},
         [],
     ),
-    make_tool_spec(
-        "add_section",
-        "SHAPE the report. Add a section the final report should have, grounded in "
-        "the notes it will cover — let the outline EMERGE from what the research "
-        "actually found.",
-        {"title": {"type": "string"}, "covers": {"type": "string"}},
-        ["title"],
-    ),
-    make_tool_spec(
-        "drop_section",
-        "SHAPE the report. Drop an outlined section the gathered notes cannot "
-        "support, so the report never promises a section it has no evidence for.",
-        {"title": {"type": "string"}, "reason": {"type": "string"}},
-        ["title"],
-    ),
+    # s14/a12 (d154): add_section / drop_section specs REMOVED — the served generic engine
+    # discards the tree-authored outline (outline_hint=None, d56), so offering these outline
+    # tools only gave the model a SECOND, silently-dropped surface to author source_ids on.
+    # The report's section structure now comes solely from PHASE-2 findings-driven decomposition
+    # over the file_write write-planner (the surface that actually consumes source_ids).
 )
 
 
@@ -542,6 +594,870 @@ def _split_sentences(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- #
+# s14/P3A — the COMPACT RESEARCH MEMORY builders (the SINGLE source of truth).
+#
+# These were authored in Stage A (a2) on the chat_app write side; Stage B (a4) moves
+# them DOWN here so research_tree OWNS the memory pattern and BOTH the in-research
+# DECISION node (`ResearchState.render_for_decision`) and the post-research WRITE
+# planner (`chat_app.agentic` re-exports these) reason over the SAME compact memory —
+# one narrative builder + one verbatim-index builder, NO divergent copies (the d-dup
+# hazard). Two artifacts with different disciplines:
+#   * a SUMMARIZED running NARRATIVE (covered/gaps/direction) — the only thing summarized;
+#   * a byte-faithful VERBATIM SOURCE INDEX keyed by a stable 1-based [S#] — never
+#     paraphrased, structure-aware chunk MAP only (no bodies), so it stays compact while
+#     the writers still resolve each [S#] to its full scoped text.
+# Bounded, model-independent, deterministic; NO fabrication (an unresolved claim is
+# rendered WITHOUT an [S#], never a minted id). research_tree is a leaf module (factory/
+# roles/synth_tools only), so these add no import cycle.
+# ---------------------------------------------------------------------------- #
+
+# Caps so the memory stays compact (the whole point — the Stage A run2 died at the
+# UNSCOPED planner ingesting a 12k blob). Bounded, model-independent, deterministic.
+_NARRATIVE_COVERED_CAP = 24
+_NARRATIVE_GAPS_CAP = 12
+_INDEX_CHUNKS_PER_SOURCE = 8
+_INDEX_HEADING_CHARS = 120
+
+# d156 — the BOUNDED scoped feed for the section WRITER / anchored REVIEWER. The bodies are
+# NOT dumped inline (that overfed the served write/review llm.chat input to 12-17k tok on
+# trace b359a87f); a small, genuinely-compact LEAD excerpt grounds the turn and the verbatim
+# bodies are pulled on demand via ``load_source``. ``_SCOPED_LEAD_CHARS`` (~512 tok) caps one
+# source's lead; ``_SCOPED_LEAD_TOTAL`` caps the section's TOTAL lead across its sources — so
+# the whole scoped block (index map + leads) stays a few KB, well under num_ctx, BECAUSE the
+# representation is compact + chunked, not because of an app truncation cap.
+# d163/d168 — raised from 1800/8000: run2 measured the served write/review feed at only 32% of
+# the num_ctx envelope (12K of ~26K usable tok), so there is large headroom to PUSH more
+# figure-bearing source text to the writer (good-run class ~dozens of figures). The renderer
+# still total-caps at ``_SCOPED_LEAD_TOTAL`` so the feed stays source-count-stable and well
+# under num_ctx by construction; the per-source cap rises so each source contributes more
+# figure/date passages (select_relevant_excerpt prefer_figures), not just its lede.
+_SCOPED_LEAD_CHARS = 3600
+_SCOPED_LEAD_TOTAL = 18000
+
+# A markdown ATX heading line (`# … `..`###### … `) — the structure boundary the verbatim
+# index chunks a source on (structure-aware, NOT fixed byte windows).
+_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
+
+
+def _normalize_index_url(url: Any) -> str:
+    """Loose URL key for matching an ArticleNote's runtime-owned url to a global source.
+
+    The note url and the source url both come from the SAME fetched article (both
+    runtime-owned), so an exact match is the norm; this only guards trailing-slash / case
+    drift. NEVER used to mint a citation — only to resolve which existing [S#] grounds a
+    claim; an unresolved claim is rendered WITHOUT an [S#] (no fabricated id)."""
+    return str(url or "").strip().lower().rstrip("/")
+
+
+def _structure_aware_chunks(markdown: str, sid: int) -> list[dict[str, Any]]:
+    """Break ONE source's verbatim markdown into structure-aware chunk METADATA.
+
+    Splits on the source's own ATX headings (its real structure), not fixed byte windows.
+    Each chunk records a stable hierarchical ``cid`` (``S{sid}.c{k}``), its nearest
+    heading copied VERBATIM (bounded for compactness, never paraphrased), and the
+    ``char_span`` [start,end) so the chunk resolves back to an exact re-readable region of
+    the source. Returns the MAP only — no body text — so the planner/decision node stay
+    compact while a writer still loads the full verbatim text via the scoped-source path or
+    the ``load_source`` retrieval tool. A source with no headings yields one
+    ``(full document)`` chunk spanning the whole text."""
+    text = str(markdown or "")
+    if not text.strip():
+        return []
+    matches = list(_MD_HEADING_RE.finditer(text))
+    chunks: list[dict[str, Any]] = []
+    if not matches:
+        heading = "(full document)"
+        chunks.append({"cid": f"S{sid}.c0", "heading": heading, "char_span": [0, len(text)]})
+        return chunks
+    # Leading material before the first heading, if any non-trivial.
+    first_start = matches[0].start()
+    k = 0
+    if first_start > 0 and text[:first_start].strip():
+        chunks.append({"cid": f"S{sid}.c{k}", "heading": "(intro)", "char_span": [0, first_start]})
+        k += 1
+    for idx, m in enumerate(matches):
+        start = m.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        heading = m.group(2).strip()[:_INDEX_HEADING_CHARS]
+        chunks.append({"cid": f"S{sid}.c{k}", "heading": heading, "char_span": [start, end]})
+        k += 1
+    return chunks
+
+
+def resolve_chunk(markdown: str, sid: int, cid: Optional[str]) -> dict[str, Any]:
+    """Resolve a ``[S#]`` / ``[S#.cK]`` reference to its VERBATIM chunk text (s14/P3A §3C).
+
+    The byte-faithful resolver behind the ``load_source`` retrieval tool: given a source's
+    full markdown and an optional chunk id, return that chunk's exact ``text`` (a verbatim
+    slice of the source — never paraphrased) plus its ``heading`` and span. With no/unknown
+    ``cid`` it returns the FIRST chunk (the source's lead). ``more`` flags that the source
+    has further chunks the caller can request by cid. Empty text for an empty source."""
+    chunks = _structure_aware_chunks(markdown, sid)
+    text = str(markdown or "")
+    if not chunks:
+        return {"sid": f"S{sid}", "chunk": None, "heading": "", "text": "", "more": False}
+    target = None
+    if cid:
+        want = str(cid).strip()
+        for c in chunks:
+            if c["cid"] == want or want == f"S{sid}":
+                target = c
+                break
+    if target is None:
+        target = chunks[0]
+    s, e = target["char_span"]
+    return {
+        "sid": f"S{sid}",
+        "chunk": target["cid"],
+        "heading": target["heading"],
+        "text": text[s:e],
+        "more": len(chunks) > 1,
+    }
+
+
+def render_verbatim_source_index(sources: Sequence[Mapping[str, Any]]) -> str:
+    """The VERBATIM, stable-[S#]-keyed SOURCE INDEX (s14/P3A §3B) — the compact memory MAP.
+
+    Replaces the raw findings blob + positional ``render_source_catalog`` as the grounding
+    map for BOTH the decision node and the write planner. Each source is keyed by its STABLE
+    1-based ``[S#]`` (identical to the id ``render_scoped_sources`` resolves a section's
+    ``source_ids`` against — so a planner assignment lines up with the writer's scoped feed),
+    with its URL + title copied VERBATIM (never paraphrased) and a structure-aware chunk map
+    (cid + heading + span). Compact MAP only — no article bodies — so the prompt stays inside
+    the window. Returns ``""`` for no sources (callers then degrade to the legacy path)."""
+    if not sources:
+        return ""
+    lines = [
+        "SOURCE INDEX (the REAL fetched sources — VERBATIM, never paraphrased). Each is keyed "
+        "by its [S#] number; set each section's source_ids to the [S#] numbers whose "
+        "facts/URLs that section uses. The chunk headings show each source's structure so "
+        "you can route it to the right section — the section WRITER is fed each assigned "
+        "source's full verbatim text, so you do NOT need the bodies here:",
+    ]
+    for i, s in enumerate(sources, 1):
+        title = str(s.get("title") or "").strip()
+        url = str(s.get("url") or "").strip()
+        lines.append(f"\n[S{i}] {title or url}")
+        lines.append(f"    url: {url}")
+        chunks = _structure_aware_chunks(s.get("markdown") or "", i)
+        if chunks:
+            shown = chunks[:_INDEX_CHUNKS_PER_SOURCE]
+            for c in shown:
+                span = c["char_span"]
+                lines.append(f"    {c['cid']} [{span[0]}:{span[1]}] {c['heading']}")
+            if len(chunks) > len(shown):
+                lines.append(f"    … (+{len(chunks) - len(shown)} more sections)")
+    return "\n".join(lines)
+
+
+def render_scoped_source_index(
+    sources: Sequence[Mapping[str, Any]],
+    source_ids: Sequence[int],
+    *,
+    section_topic: str = "",
+    full_index: bool = False,
+    lead_ids: Optional[Sequence[int]] = None,
+    lead_chars: int = _SCOPED_LEAD_CHARS,
+    lead_total: int = _SCOPED_LEAD_TOTAL,
+) -> str:
+    """The BOUNDED, tool-chunked scoped feed for a section WRITER / anchored REVIEWER (d156).
+
+    Replaces the legacy full-body scoped dump (``render_scoped_sources`` × N sources, which
+    overfed the served write/review ``llm.chat`` input to 12-17k tok — trace b359a87f, where
+    ``load_source`` was bound but called 0× because the bodies were already dumped). Emits:
+
+      * the SOURCE INDEX MAP for the relevant ``[S#]`` (global stable numbering preserved) —
+        url + structure-aware chunk headings, **no bodies**;
+      * a small, genuinely-compact per-source LEAD excerpt (section-relevant, total-capped at
+        ``lead_total``) so a turn that makes no tool call still has real grounding; and
+      * an explicit instruction to call ``load_source('S#'[, 'S#.cK'])`` for any further
+        verbatim text — so deeper text is retrieved CHUNKED on demand instead of an 85KB raw
+        dump, and no single input exceeds a sane bound BECAUSE the representation is compact +
+        chunked (not an app truncation cap).
+
+    ``full_index=True`` lists EVERY source's ``[S#]`` in the map (the reviewer's resolution
+    view — so a valid cross-section citation always resolves to a real ``[S#]`` and is never
+    falsely deleted), while the LEAD excerpts + ``section_topic`` stay focused on the node's
+    assigned ``source_ids``. ``lead_ids`` overrides WHICH sources get a LEAD excerpt
+    (defaults to the assigned ids): the d162 UNSCOPED terminal writer — a single-section
+    synthesis the planner left without ``source_ids`` — passes EVERY shown id so it is fed
+    real grounding over ALL sources (the scoped path's bounded substance, not the
+    num_ctx-saturating raw-body fold), still total-capped by ``lead_total`` so the feed is
+    bounded by the WINDOW and stays stable as the source count grows. Global ``[S#]``
+    numbering is identical to
+    :func:`render_verbatim_source_index` / :func:`resolve_chunk` / ``load_source`` so a
+    citation written here resolves through the SAME index and cannot regress. Returns ``""``
+    when there are no sources, or no assigned ids and ``full_index`` is False (caller
+    degrades gracefully — the unscoped single-section path is unchanged)."""
+    if not sources:
+        return ""
+    n = len(sources)
+    assigned = [i for i in source_ids if isinstance(i, int) and 1 <= i <= n]
+    if not assigned and not full_index:
+        return ""
+    # Map view: ALL sources for the reviewer's resolution view, else only assigned ids.
+    shown_ids = list(range(1, n + 1)) if full_index else assigned
+    # WHICH sources get a LEAD excerpt: ``lead_ids`` when given (d162 unscoped writer passes
+    # every shown id), else the section's assigned ids (the scoped/reviewer default).
+    if lead_ids is not None:
+        lead_set = {i for i in lead_ids if isinstance(i, int) and 1 <= i <= n}
+    else:
+        lead_set = set(assigned)
+    # The LEAD total is shared across the lead sources (the grounding floor); each lead is
+    # bounded by ``lead_chars`` and by an even share of ``lead_total`` — so MORE sources mean
+    # THINNER per-source leads while the TOTAL stays bounded by the window (source-count-stable).
+    n_lead = max(1, len(lead_set))
+    per_lead = max(400, min(int(lead_chars), int(lead_total) // n_lead))
+    lines = [
+        "SOURCE INDEX — the REAL fetched sources, each keyed by its stable [S#] (url + the "
+        "section map below; VERBATIM, never paraphrased). The full bodies are NOT all inline: "
+        "a compact LEAD excerpt is shown for grounding, and you CALL load_source('S#') (or "
+        "load_source('S#','S#.cK') for a specific section) to read any source's further "
+        "verbatim text ON DEMAND — request only the chunks you actually need. Cite each claim "
+        "with a real [S#] and its URL VERBATIM; fill any table/Sources citation cell with a "
+        "real [S#]+URL from this index or drop the row — never a worded stand-in like "
+        "\"Source N\", \"URL Placeholder\", \"[Name, 2025]\", or a URL not listed here:",
+    ]
+    for i in shown_ids:
+        s = sources[i - 1]
+        title = str(s.get("title") or "").strip()
+        url = str(s.get("url") or "").strip()
+        full = str(s.get("markdown") or "").strip()
+        lines.append(f"\n[S{i}] {title or url}")
+        lines.append(f"    url: {url}")
+        chunks = _structure_aware_chunks(full, i)
+        if chunks:
+            shown = chunks[:_INDEX_CHUNKS_PER_SOURCE]
+            for c in shown:
+                span = c["char_span"]
+                lines.append(f"    {c['cid']} [{span[0]}:{span[1]}] {c['heading']}")
+            if len(chunks) > len(shown):
+                lines.append(
+                    f"    … (+{len(chunks) - len(shown)} more sections — "
+                    f"load_source('S{i}','S{i}.cK'))"
+                )
+        # Bounded LEAD excerpt only for the lead sources (the grounding floor; a reviewer's
+        # extra full_index sources outside the lead set stay map-only and load on demand).
+        if i in lead_set and full:
+            # d163 — PUSH the figure/date-bearing passages into the lead (not just the lede),
+            # so the writer is fed concrete figures to quote verbatim within the bounded feed.
+            lead = select_relevant_excerpt(full, section_topic, per_lead, prefer_figures=True)
+            if lead:
+                lines.append(f"    LEAD [S{i}] (excerpt — load_source('S{i}') for the rest):")
+                lines.append(lead)
+                if len(full) > len(lead):
+                    lines.append(
+                        f"    [showing {len(lead)} of {len(full)} chars — this source has "
+                        f"MORE; call load_source('S{i}') for the rest, do not assume this is "
+                        "the whole article]"
+                    )
+    return "\n".join(lines)
+
+
+def compose_research_narrative(
+    research_notes: Optional[Sequence[Mapping[str, Any]]],
+    sources: Sequence[Mapping[str, Any]],
+) -> str:
+    """The running NARRATIVE summary (covered / gaps / direction) (s14/P3A §3A).
+
+    Built from already-gathered ArticleNotes (NO new model call, NO fabrication): each
+    note's ``key_claims`` become COVERED bullets (grounded in the global ``[S#]`` resolved by
+    matching the note's runtime-owned url to the source list — unresolved => no [S#], never a
+    minted id), and ``gaps_or_followups`` become the OPEN GAPS that set DIRECTION. This is the
+    ONLY summarized artifact; the SOURCE INDEX stays verbatim, so citations resolve through
+    the index and cannot regress. Bounded for compactness. Returns ``""`` when no notes are
+    available (callers then degrade to the legacy render)."""
+    if not research_notes:
+        return ""
+    url2sid: dict[str, int] = {}
+    for i, s in enumerate(sources or [], 1):
+        key = _normalize_index_url(s.get("url"))
+        if key and key not in url2sid:
+            url2sid[key] = i
+    covered: list[tuple[str, Optional[int]]] = []
+    gaps: list[str] = []
+    seen_claims: set[str] = set()
+    seen_gaps: set[str] = set()
+    for note in research_notes:
+        if not isinstance(note, Mapping):
+            continue
+        sid = url2sid.get(_normalize_index_url(note.get("url")))
+        for claim in note.get("key_claims") or []:
+            c = str(claim).strip()
+            key = c.lower()
+            if not c or key in seen_claims:
+                continue
+            seen_claims.add(key)
+            covered.append((c, sid))
+        for gap in note.get("gaps_or_followups") or []:
+            g = str(gap).strip()
+            key = g.lower()
+            if not g or key in seen_gaps:
+                continue
+            seen_gaps.add(key)
+            gaps.append(g)
+    if not covered and not gaps:
+        return ""
+    covered = covered[:_NARRATIVE_COVERED_CAP]
+    gaps = gaps[:_NARRATIVE_GAPS_CAP]
+    lines = [
+        "RESEARCH NARRATIVE (a running SUMMARY of what the research established — use it to "
+        "decide the section breakdown. It is a summary for ORIENTATION; cite facts/figures "
+        "from the SOURCE INDEX below, not from this narrative):",
+    ]
+    if covered:
+        lines.append("COVERED (settled points, each grounded in the source [S#] it came from):")
+        for claim, sid in covered:
+            tag = f" [S{sid}]" if sid else ""
+            lines.append(f"  - {claim}{tag}")
+    if gaps:
+        lines.append("OPEN GAPS (questions the report still needs to address):")
+        for gap in gaps:
+            lines.append(f"  - {gap}")
+        lines.append(
+            "DIRECTION: ensure the sections cover the settled points above and, where the "
+            "sources support it, address the open gaps; do NOT invent facts to fill a gap."
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------- #
+# s15/a15 (d185) — NOTES-ARCH Layer 1: the EXPLICIT per-concern RESEARCH GRAPH.
+#
+# The research memory was ALREADY granular (one ArticleNote per source — never a single
+# blob, d50.1) but its STRUCTURE was IMPLICIT: notes lived in a flat per-leaf list, the
+# concern a note belonged to was only the leaf's branch id, and a note's gaps_or_followups
+# were a flat bullet list. This makes that structure an EXPLICIT GRAPH the decision loop
+# WALKS:
+#
+#     concern NODE  ──has──▶  its NOTES  ──cite──▶  SOURCES [S#]
+#         │
+#         └── gap EDGE (a note's gaps_or_followups) ──▶  spawns a NEW concern NODE
+#
+# It is a DERIVED PROJECTION over the SAME persisted ResearchState records + verbatim source
+# index + the Tree's live/pruned branch structure (d49 read-real-state). It adds NO new
+# persistence (a17 owns session-bound persistence) and fabricates nothing: a concern node is
+# a real gathered leaf (or a real live/pruned Tree branch), a source edge resolves a note's
+# runtime-owned url to an EXISTING [S#] (never a minted id), a gap edge is a note's own
+# follow-up. The decision node READS this graph (``render`` → folded into
+# ``render_for_decision``, beside the gap lens it preserves) so the loop's ``expand_branch`` /
+# ``prune_branch`` are DRIVEN BY it: expand follows an OPEN gap edge to a new concern node,
+# prune collapses a concern node. ``to_dict`` serializes the whole shape so a smoke/gate can
+# assert it is GRAPH-shaped (per-concern nodes with note→source + gap edges), not a flat blob.
+# ---------------------------------------------------------------------------- #
+
+# Caps so the graph render stays compact (the decision prompt is num_ctx-bounded).
+_GRAPH_MAX_CONCERNS = 16
+_GRAPH_MAX_GAPS_PER_CONCERN = 4
+_GRAPH_MAX_CLAIMS_PER_CONCERN = 4
+_GRAPH_MAX_COLLAPSED = 8
+
+# Caps for the per-research BRIEF (d185 Layer 2) — a thesis-level digest stays short
+# and addressable (not the whole graph): the dominant findings + the open gaps.
+_BRIEF_MAX_THESIS = 8
+_BRIEF_MAX_GAPS = 6
+
+
+@dataclass
+class SourceRef:
+    """A CITED-SOURCE edge: a concern's note → a verbatim source (the stable [S#])."""
+
+    sid: Optional[int]  # 1-based [S#] in the run's verbatim index; None if unresolved
+    url: str = ""
+    title: str = ""
+    trust: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"sid": self.sid, "url": self.url, "title": self.title, "trust": self.trust}
+
+
+@dataclass
+class GapEdge:
+    """An OPEN gap a concern surfaced — a candidate EDGE to the NEXT concern node.
+
+    ``text`` is the follow-up (from a note's ``gaps_or_followups``); ``from_concern`` is the
+    concern id that raised it; ``source_sid`` ties it to the source [S#] whose note surfaced
+    it; ``followed_by`` is the child concern id an ``expand_branch`` spawned to pursue it
+    (None while the gap is still OPEN — breadth the loop has NOT yet funded)."""
+
+    text: str
+    from_concern: str
+    source_sid: Optional[int] = None
+    followed_by: Optional[str] = None
+
+    @property
+    def is_open(self) -> bool:
+        return not self.followed_by
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "from_concern": self.from_concern,
+            "source_sid": self.source_sid,
+            "followed_by": self.followed_by,
+            "open": self.is_open,
+        }
+
+
+@dataclass
+class ConcernNode:
+    """One research CONCERN (a facet/branch) — a node of the research graph.
+
+    concern NODE → its NOTES → cited SOURCES, with the concern's open follow-ups as the gap
+    EDGES that branch to the next concern. ``status``: ``live`` (authored via expand, not
+    gathered yet), ``settled`` (gathered — has a persisted leaf record), ``collapsed``
+    (pruned). ``parent`` + ``rationale`` describe the gap edge this concern was spawned from
+    (the tail of its incoming edge)."""
+
+    concern_id: str
+    question: str = ""
+    depth: int = 0
+    status: str = "live"
+    parent: Optional[str] = None
+    rationale: str = ""
+    notes: list[dict[str, Any]] = field(default_factory=list)
+    sources: list[SourceRef] = field(default_factory=list)
+    gaps: list[GapEdge] = field(default_factory=list)
+
+    @property
+    def source_ids(self) -> list[int]:
+        """The distinct [S#] this concern's notes cite, in first-seen order."""
+        seen: list[int] = []
+        for s in self.sources:
+            if s.sid and s.sid not in seen:
+                seen.append(s.sid)
+        return seen
+
+    @property
+    def single_source(self) -> bool:
+        """A SETTLED concern resting on ≤1 distinct source is NOT yet corroborated — an
+        open structural gap the decision node should expand (breadth != depth)."""
+        return self.status == "settled" and len(self.source_ids) <= 1
+
+    @property
+    def open_gaps(self) -> list[GapEdge]:
+        return [g for g in self.gaps if g.is_open]
+
+    @property
+    def claims(self) -> list[str]:
+        """The distinct key_claims across this concern's notes (the COVERED meaning)."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for n in self.notes:
+            for c in n.get("key_claims") or []:
+                t = str(c).strip()
+                k = t.lower()
+                if t and k not in seen:
+                    seen.add(k)
+                    out.append(t)
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "concern_id": self.concern_id,
+            "question": self.question,
+            "depth": self.depth,
+            "status": self.status,
+            "parent": self.parent,
+            "rationale": self.rationale,
+            "note_count": len(self.notes),
+            "source_ids": self.source_ids,
+            "sources": [s.to_dict() for s in self.sources],
+            "gaps": [g.to_dict() for g in self.gaps],
+            "claims": self.claims,
+            "single_source": self.single_source,
+        }
+
+
+@dataclass
+class ConcernGraph:
+    """The explicit per-concern research GRAPH (d185) — a DERIVED projection, not persisted.
+
+    ``nodes`` maps concern_id → :class:`ConcernNode` in stable first-seen order. The graph is
+    the SHAPE the decision loop walks: ``expand_branch`` follows an OPEN gap edge to a new
+    concern node, ``prune_branch`` collapses a concern node. ``to_dict`` serializes the whole
+    shape so a smoke/gate can assert it is GRAPH-shaped (per-concern nodes with note→source +
+    gap edges), NOT a flat note blob."""
+
+    nodes: dict[str, ConcernNode] = field(default_factory=dict)
+
+    def concerns(self) -> list[ConcernNode]:
+        return list(self.nodes.values())
+
+    def live(self) -> list[ConcernNode]:
+        return [n for n in self.nodes.values() if n.status != "collapsed"]
+
+    def settled(self) -> list[ConcernNode]:
+        return [n for n in self.nodes.values() if n.status == "settled"]
+
+    def collapsed(self) -> list[ConcernNode]:
+        return [n for n in self.nodes.values() if n.status == "collapsed"]
+
+    def open_gaps(self) -> list[GapEdge]:
+        return [g for n in self.nodes.values() if n.status != "collapsed" for g in n.open_gaps]
+
+    def edges(self) -> list[dict[str, Any]]:
+        """Every directed edge: concern→source (``cites``) + concern→gap/child (``gap``)."""
+        out: list[dict[str, Any]] = []
+        for n in self.nodes.values():
+            for sid in n.source_ids:
+                out.append({"kind": "cites", "from": n.concern_id, "to_source": sid})
+            for g in n.gaps:
+                out.append(
+                    {
+                        "kind": "gap",
+                        "from": g.from_concern,
+                        "to_concern": g.followed_by,
+                        "open": g.is_open,
+                        "text": g.text,
+                    }
+                )
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the graph SHAPE (the queryable artifact the a14 gate reads)."""
+        return {
+            "shape": "per_concern_graph",
+            "concern_count": len(self.nodes),
+            "settled_count": len(self.settled()),
+            "collapsed_count": len(self.collapsed()),
+            "open_gap_count": len(self.open_gaps()),
+            "concerns": [n.to_dict() for n in self.nodes.values()],
+            "edges": self.edges(),
+        }
+
+    def render(
+        self,
+        *,
+        max_concerns: int = _GRAPH_MAX_CONCERNS,
+        max_gaps_per_concern: int = _GRAPH_MAX_GAPS_PER_CONCERN,
+        max_claims_per_concern: int = _GRAPH_MAX_CLAIMS_PER_CONCERN,
+        max_collapsed: int = _GRAPH_MAX_COLLAPSED,
+    ) -> str:
+        """Render the graph for the decision prompt (compact, bounded, deterministic).
+
+        Returns ``""`` when the graph has no live concern with any content (the caller then
+        skips the block — no empty noise on a genuinely-empty branch)."""
+        live = [n for n in self.live() if n.question or n.notes or n.gaps or n.sources]
+        if not live:
+            return ""
+        lines = [
+            "CONCERN GRAPH (the research as a GRAPH the loop WALKS — each CONCERN node → the "
+            "SOURCES [S#] that fed it → its OPEN GAPS, which are the EDGES that branch to the "
+            "NEXT concern. A concern resting on a SINGLE source, or carrying an open gap, is "
+            "NOT settled — EXPAND its gap. Prune a concern that added no meaning):"
+        ]
+        for n in live[:max_concerns]:
+            sids = ", ".join(f"S{s}" for s in n.source_ids) or "none yet"
+            flag = " — SINGLE SOURCE (corroborate)" if n.single_source else ""
+            head = f"  ● [{n.concern_id}] {n.question or '(open concern)'}"
+            lines.append(f"{head}  (sources: {sids}{flag})")
+            claims = n.claims[:max_claims_per_concern]
+            if claims:
+                lines.append("      covered: " + "; ".join(claims))
+            for g in n.open_gaps[:max_gaps_per_concern]:
+                src = f" [from S{g.source_sid}]" if g.source_sid else ""
+                lines.append(f"      → open gap: {g.text}{src}")
+        collapsed = self.collapsed()[:max_collapsed]
+        if collapsed:
+            lines.append("  COLLAPSED (pruned concerns — closed without further gather):")
+            for n in collapsed:
+                why = f" ({n.rationale})" if n.rationale else ""
+                lines.append(f"    ⊘ [{n.concern_id}] {n.question}{why}")
+        return "\n".join(lines)
+
+    # ----------------------------------------------------------------------- #
+    # d185 NOTES-ARCH Layer 2 — per-research BRIEF (a thesis-level digest of THIS
+    # research, DERIVED from the graph). Like the graph itself it is a pure
+    # projection (d148-clean: data, no behavior flags, NO new LLM call) and
+    # FABRICATES nothing — every thesis line is a key_claim a settled concern's
+    # NOTE actually carried, every source is an already-resolved [S#]. Layer 1 is
+    # the GRAPH the loop walks; Layer 2 is the short ADDRESSABLE digest a chat
+    # session keeps so multiple researches coexist, each looked up by its brief.
+    # ----------------------------------------------------------------------- #
+    def thesis(self, *, limit: int = _BRIEF_MAX_THESIS) -> list[str]:
+        """The thesis-level findings: the dominant distinct key_claims this research
+        ESTABLISHED, taken across its SETTLED concerns in first-seen order (ranked by
+        how many concerns corroborate each claim, so a cross-concern finding leads).
+
+        No fabrication — every line is a claim a real note carried; an empty graph
+        (nothing gathered) yields an empty thesis, never a placeholder."""
+        order: list[str] = []
+        weight: dict[str, int] = {}
+        text: dict[str, str] = {}
+        first_seen: dict[str, int] = {}
+        for n in self.settled():
+            for c in n.claims:
+                key = c.lower()
+                if key not in weight:
+                    weight[key] = 0
+                    text[key] = c
+                    first_seen[key] = len(order)
+                    order.append(key)
+                weight[key] += 1
+        order.sort(key=lambda k: (-weight[k], first_seen[k]))
+        return [text[k] for k in order[:limit]]
+
+    def to_brief(self, *, topic: str = "", memory_index: Any = None,
+                 limit_thesis: int = _BRIEF_MAX_THESIS,
+                 limit_gaps: int = _BRIEF_MAX_GAPS) -> dict[str, Any]:
+        """Project the per-research BRIEF (d185 Layer 2) from the graph — a compact,
+        JSON-serializable, ADDRESSABLE digest of what THIS research established.
+
+        ``topic`` is the research question/goal (the graph holds per-concern questions
+        but not the overall ask); when omitted it falls back to the first settled
+        concern's question. The brief carries the thesis-level findings, the settled
+        concerns, the distinct cited sources ([S#]+url+title), the still-OPEN gaps
+        (what this research did NOT yet close), and headline counts. It is the unit a
+        chat session stores + looks up; ``digest`` is its one-glance human form.
+
+        ``memory_index`` (d285 SB-3) is the research-memory INDEX this brief addresses —
+        the handle of the SB-1 memory it digests, so a downstream step can pass it back
+        to CONTINUE the research. Canonicalized (empty/None → the ``<<NEW>>`` sentinel,
+        meaning this brief is not yet bound to a persisted memory line)."""
+        settled = self.settled()
+        topic = (topic or "").strip() or (settled[0].question if settled else "")
+        # distinct cited sources across settled concerns (stable [S#] order, no dup id)
+        srcs: list[dict[str, Any]] = []
+        seen_sids: set[int] = set()
+        for n in settled:
+            for s in n.sources:
+                if s.sid and s.sid not in seen_sids:
+                    seen_sids.add(s.sid)
+                    srcs.append({"sid": s.sid, "url": s.url, "title": s.title})
+        srcs.sort(key=lambda d: d["sid"])
+        thesis = self.thesis(limit=limit_thesis)
+        open_gaps: list[str] = []
+        seen_gap: set[str] = set()
+        for g in self.open_gaps():
+            k = g.text.lower().strip()
+            if g.text.strip() and k not in seen_gap:
+                seen_gap.add(k)
+                open_gaps.append(g.text.strip())
+        concerns = [
+            {
+                "concern_id": n.concern_id,
+                "question": n.question,
+                "source_ids": n.source_ids,
+                "single_source": n.single_source,
+            }
+            for n in settled
+        ]
+        brief: dict[str, Any] = {
+            "shape": "per_research_brief",
+            "topic": topic,
+            # d285 SB-3: the research-memory INDEX this brief addresses (an index to
+            # CONTINUE, or <<NEW>> when not yet bound to a persisted memory line).
+            "memory_index": normalize_brief_memory_index(memory_index),
+            "thesis": thesis,
+            "concerns": concerns,
+            "sources": srcs,
+            "open_gaps": open_gaps[:limit_gaps],
+            "concern_count": len(self.concerns()),
+            "settled_count": len(settled),
+            "source_count": len(srcs),
+            "open_gap_count": len(open_gaps),
+        }
+        brief["digest"] = self.render_brief(brief)
+        return brief
+
+    @staticmethod
+    def render_brief(brief: Mapping[str, Any]) -> str:
+        """A compact one-glance text digest of a brief dict (the addressable summary).
+
+        Deterministic + bounded; safe on a brief with no thesis/sources (an honest
+        'research established nothing yet' rather than a fabricated summary)."""
+        topic = str(brief.get("topic") or "").strip() or "(untitled research)"
+        lines = [f"RESEARCH BRIEF — {topic}"]
+        thesis = list(brief.get("thesis") or [])
+        if thesis:
+            lines.append("Established:")
+            lines += [f"  • {t}" for t in thesis]
+        else:
+            lines.append("Established: (nothing gathered yet)")
+        srcs = list(brief.get("sources") or [])
+        if srcs:
+            cited = ", ".join(f"S{s.get('sid')}" for s in srcs)
+            lines.append(f"Sources ({len(srcs)}): {cited}")
+        gaps = list(brief.get("open_gaps") or [])
+        if gaps:
+            lines.append("Open gaps:")
+            lines += [f"  → {g}" for g in gaps]
+        return "\n".join(lines)
+
+
+def build_research_brief(
+    records: Optional[Sequence[Mapping[str, Any]]],
+    sources: Optional[Sequence[Mapping[str, Any]]],
+    *,
+    topic: str = "",
+    memory_index: Any = None,
+    tree: Optional["Tree"] = None,
+) -> dict[str, Any]:
+    """Project the per-research BRIEF (d185 Layer 2) straight from persisted state.
+
+    Convenience over ``build_concern_graph(...).to_brief(...)`` for callers that hold
+    the records + verbatim source index (and optionally the live Tree) but not a graph
+    object. Derived, never persisted here (chat_app owns the session-level store).
+    ``memory_index`` (d285 SB-3) is carried through to the brief unchanged."""
+    return build_concern_graph(records, sources, tree=tree).to_brief(
+        topic=topic, memory_index=memory_index
+    )
+
+
+def build_concern_graph(
+    records: Optional[Sequence[Mapping[str, Any]]],
+    sources: Optional[Sequence[Mapping[str, Any]]],
+    *,
+    tree: Optional["Tree"] = None,
+) -> ConcernGraph:
+    """Project the EXPLICIT per-concern graph (d185) from persisted state (+ the live Tree).
+
+    The graph is DERIVED, never persisted (a17 owns persistence): a SETTLED concern node is a
+    real gathered leaf ``record`` (its notes attached; each note's url resolved to an EXISTING
+    [S#] as a CITES edge; each note's ``gaps_or_followups`` as a GAP edge); a LIVE concern node
+    is a Tree branch the model authored via ``expand_branch`` but has not gathered yet; a
+    COLLAPSED concern node is a Tree ``prune`` target. When ``tree`` is supplied, expand/prune
+    are folded so the graph REFLECTS the loop's walk (a just-expanded gap → a live child node;
+    a pruned concern → collapsed); a child branch whose parent is a graphed concern marks that
+    parent's matching OPEN gap as ``followed_by`` (the edge the loop walked). No fabrication: a
+    note that resolves to no source carries no [S#] edge; a tree-only branch carries no notes."""
+    # url → stable [S#] (same join the narrative uses; never mints an id).
+    url2sid: dict[str, int] = {}
+    sid_meta: dict[int, dict[str, str]] = {}
+    for i, s in enumerate(sources or [], 1):
+        if not isinstance(s, Mapping):
+            continue
+        key = _normalize_index_url(s.get("url"))
+        if key and key not in url2sid:
+            url2sid[key] = i
+        sid_meta[i] = {
+            "url": str(s.get("url") or "").strip(),
+            "title": str(s.get("title") or "").strip(),
+        }
+    graph = ConcernGraph()
+
+    # (1) SETTLED concern nodes — the gathered leaf records (concern → notes → sources → gaps).
+    for rec in records or []:
+        if not isinstance(rec, Mapping):
+            continue
+        cid = str(rec.get("branch_id") or "").strip() or f"layer{rec.get('layer', '?')}"
+        node = graph.nodes.get(cid)
+        if node is None:
+            node = ConcernNode(
+                concern_id=cid,
+                question=str(rec.get("question") or "").strip(),
+                depth=int(rec.get("layer") or 0),
+            )
+            graph.nodes[cid] = node
+        node.status = "settled"  # a persisted record means this concern was gathered
+        seen_gaps: set[str] = {g.text.lower() for g in node.gaps}
+        for raw in rec.get("notes") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            note = dict(raw)
+            node.notes.append(note)
+            sid = url2sid.get(_normalize_index_url(note.get("url")))
+            if sid is not None and sid not in node.source_ids:
+                meta = sid_meta.get(sid, {})
+                node.sources.append(
+                    SourceRef(
+                        sid=sid,
+                        url=meta.get("url", ""),
+                        title=meta.get("title", ""),
+                        trust=str(note.get("source_trust") or ""),
+                    )
+                )
+            for gap in note.get("gaps_or_followups") or []:
+                g = str(gap).strip()
+                key = g.lower()
+                if g and key not in seen_gaps:
+                    seen_gaps.add(key)
+                    node.gaps.append(GapEdge(text=g, from_concern=cid, source_sid=sid))
+
+    # (2) LIVE concern nodes + parent/gap edges from the Tree (expand/prune WALK the graph).
+    if tree is not None:
+        for branch in tree.branches.values():
+            bid = str(getattr(branch, "id", "")).strip()
+            if not bid:
+                continue
+            node = graph.nodes.get(bid)
+            if node is None:
+                # An authored-but-not-yet-gathered concern: a live node (no notes yet).
+                node = ConcernNode(
+                    concern_id=bid,
+                    question=str(getattr(branch, "question", "")).strip(),
+                    depth=int(getattr(branch, "depth", 0) or 0),
+                    status="live",
+                )
+                graph.nodes[bid] = node
+            # Record the incoming gap edge (where this concern was spawned from).
+            node.parent = str(getattr(branch, "parent", "") or "").strip() or node.parent
+            node.rationale = str(getattr(branch, "rationale", "") or "").strip() or node.rationale
+            # FOLLOW the edge: mark the parent concern's matching OPEN gap as followed by this
+            # child (best-effort — exact text match, else the rationale's words, else the first
+            # open gap). This is the loop's walk made explicit; unresolved → the gap stays open.
+            parent = graph.nodes.get(node.parent or "")
+            if parent is not None and parent is not node:
+                _follow_gap(parent, node)
+        # (3) COLLAPSED concern nodes — prune targets (a concern closed without more gather).
+        for pr in getattr(tree, "pruned", []) or []:
+            if not isinstance(pr, Mapping):
+                continue
+            tgt = str(pr.get("target") or "").strip()
+            if not tgt:
+                continue
+            reason = str(pr.get("reason") or "").strip()
+            node = graph.nodes.get(tgt)
+            if node is None:
+                node = ConcernNode(concern_id=tgt, rationale=reason)
+                graph.nodes[tgt] = node
+            node.status = "collapsed"
+            if reason:
+                node.rationale = reason
+    return graph
+
+
+def _follow_gap(parent: ConcernNode, child: ConcernNode) -> None:
+    """Mark the parent concern's OPEN gap that ``child`` was spawned to pursue as followed.
+
+    Best-effort edge resolution: prefer a gap whose text overlaps the child's rationale or
+    question; else the first still-open gap. Idempotent (a gap already followed by this child
+    is left alone); if nothing matches the gap simply stays OPEN — never a fabricated link."""
+    opens = parent.open_gaps
+    if not opens:
+        return
+    hay = f"{child.rationale} {child.question}".lower()
+    chosen: Optional[GapEdge] = None
+    for g in opens:
+        words = [w for w in re.split(r"\W+", g.text.lower()) if len(w) > 3]
+        if words and sum(1 for w in words if w in hay) >= max(1, len(words) // 3):
+            chosen = g
+            break
+    if chosen is None and child.concern_id in {g.followed_by for g in parent.gaps}:
+        return  # already linked to this child under some gap
+    chosen = chosen or opens[0]
+    chosen.followed_by = child.concern_id
+
+
+# s15/a6 (d182) — the OPEN-GAP LENS appended to EVERY decision render. The gap lane now lives in
+# the DATA the decision node reads (this render), not only in a distant prose doctrine wall: it
+# tells the node to reason over the BLANKS each covered facet still has, so an early-stop-prone
+# small model does not read a short COVERED list as "every facet is done" and stop after layer 1.
+# DECISION-ONLY: it is appended in ``render_for_decision`` and is NEVER folded into the shared
+# ``compose_research_narrative`` (which the WRITE planner also reads, where "go research more"
+# would be the wrong signal).
+_DECISION_GAP_LENS = (
+    "OPEN-GAP LENS — reason over the BLANKS, not just the COVERED list above. For EACH covered "
+    "facet, ask what is still UNVERIFIED or MISSING: a figure only one source gave, a date without "
+    "its surrounding detail, a claim no second source corroborates, an unanswered follow-up. Each "
+    "such blank is a GAP to EXPAND. A short COVERED list (or one with no OPEN GAPS listed yet) is "
+    "the START of the investigation, NOT proof it is complete — keep expanding while real blanks "
+    "remain."
+)
+
+
+# ---------------------------------------------------------------------------- #
 # Persisted research-state file — the single source of truth (d49 read-real-state).
 # ---------------------------------------------------------------------------- #
 class ResearchState:
@@ -553,18 +1469,94 @@ class ResearchState:
     compactly for its prompt. Provenance is owned by the runtime (the leaf supplies the
     notes the leaf's own research produced) — the decision node never invents a source."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], *, session_bound: bool = False
+    ) -> None:
+        # s15/a17 (d185) — NOTES-ARCH Layer 3: SESSION BINDING. By DEFAULT the state is
+        # RUN-scoped — the file is truncated on open so the decision node reads only THIS
+        # run (byte-identical to the pre-a17 behaviour for the inline/non-chat path). When
+        # ``session_bound`` is True the file is keyed by the CHAT SESSION (see
+        # chat_app._research_state_path) and STICKS: a follow-up turn in the SAME session
+        # opens the SAME file and READS BACK the prior notes + verbatim sources (so it can
+        # build on / load_source them instead of re-researching), while a DIFFERENT session
+        # opens a DIFFERENT file and never sees them (isolation). Persistence is ADDITIVE —
+        # a sidecar ``.sources.jsonl`` carries the verbatim source bodies (the leaf JSONL
+        # only kept notes + a digest), so the read-back restores BOTH notes and sources.
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Truncate any stale prior-run file so the decision node reads only THIS run.
-        self.path.write_text("", encoding="utf-8")
+        self.session_bound = bool(session_bound)
+        # The verbatim SOURCE INDEX sidecar — append-only, [S#]-ordered (line N == [S#] N).
+        # Persisting it is what lets a session follow-up resolve a prior source's body via
+        # load_source; the leaf records alone never carried the markdown.
+        self.sources_path = self.path.parent / (self.path.stem + ".sources.jsonl")
+        if not self.session_bound:
+            # Truncate any stale prior-run file so the decision node reads only THIS run.
+            self.path.write_text("", encoding="utf-8")
         self._records: list[dict[str, Any]] = []
-        # s13/B3 — the OUTLINE channel: an append-only sidecar of the agent's document-
+        # s14/P3A Stage B (item 2) — the VERBATIM SOURCE INDEX: the run's fetched sources
+        # accumulated in fetch order, URL-deduped, each holding {title,url,markdown}. Its
+        # 1-based position is the STABLE [S#] id the decision render + the write side both
+        # resolve against (identical id to chat_app's `_collect_chain_sources` dedup, which
+        # also dedupes by url in launch order). Append-only: a re-fetched URL re-uses its
+        # existing [S#] (cross-layer URL-dedup, closes the d76 gap) — an id is never reused.
+        # This REPLACES the per-leaf `findings_digest[:500]` paraphrase as the source memory
+        # the decision node reasons over (the raw bodies live here verbatim, never summarized).
+        self._sources: list[dict[str, Any]] = []
+        self._source_url_index: dict[str, int] = {}  # normalized-url -> 1-based [S#]
+        # The OUTLINE channel: an append-only sidecar of the agent's document-
         # direction ops (add_section / drop_section), persisted ALONGSIDE the leaf state and
         # read BACK from disk into each decision layer (the same anti-hallucination read-back
         # as the leaf notes — the rendered outline comes from disk, never the model's memory).
         self.outline_path = self.path.parent / (self.path.stem + ".outline.jsonl")
-        self.outline_path.write_text("", encoding="utf-8")
+        if not self.session_bound:
+            self.outline_path.write_text("", encoding="utf-8")
+        if self.session_bound:
+            # SESSION READ-BACK (a17): rehydrate this session's prior notes + verbatim
+            # sources from disk so the decision loop reasons over (and load_source can pull
+            # from) everything the session gathered so far — never a wiped slate. The leaf
+            # records (notes/digest) live in self.path; the verbatim bodies in the sidecar.
+            self._records = self.read()
+            self._load_sources()
+
+    @property
+    def memory_handle(self) -> str:
+        """The stable HANDLE of this research memory (d221 memory-by-handle).
+
+        The file stem is the run/session-stable identifier (session-bound → the chat
+        session key; run-scoped → the run id), so it is the natural name a downstream
+        node is BOUND to and reads back via its source tools. Pure derivation, no I/O."""
+        return self.path.stem
+
+    def _load_sources(self) -> None:
+        """Rehydrate the verbatim SOURCE INDEX from the sidecar (session read-back, a17).
+
+        Append-only + [S#]-ordered on disk (line N == [S#] N), so reloading preserves the
+        stable ids: each entry is re-appended in file order and its url re-indexed. Safe on
+        a missing/partial sidecar (an unparseable line is skipped, never fabricated)."""
+        self._sources = []
+        self._source_url_index = {}
+        if not self.sources_path.exists():
+            return
+        for line in self.sources_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(entry, Mapping):
+                continue
+            url = str(entry.get("url") or "").strip()
+            rec = {
+                "title": str(entry.get("title") or "").strip(),
+                "url": url,
+                "markdown": str(entry.get("markdown") or ""),
+            }
+            self._sources.append(rec)
+            key = _normalize_index_url(url)
+            if key and key not in self._source_url_index:
+                self._source_url_index[key] = len(self._sources)  # 1-based [S#]
 
     def append_outline_ops(self, ops: Sequence[Mapping[str, Any]]) -> None:
         """Append the decision layer's outline ops (add_section/drop_section) to disk (B3)."""
@@ -623,8 +1615,47 @@ class ResearchState:
             lines.append(f"  {i}. {title}" + (f" — covers: {covers}" if covers else ""))
         return "\n".join(lines)
 
+    def _index_sources(self, fetched: Sequence[Mapping[str, Any]]) -> None:
+        """Fold a leaf's fetched sources into the VERBATIM SOURCE INDEX (s14/P3A item 2).
+
+        Append-only, URL-deduped: a fetched source whose (normalized) url is already indexed
+        re-uses its existing [S#] (cross-layer dedup); a new url is appended and assigned the
+        next 1-based [S#]. The full ``{title,url,markdown}`` is kept VERBATIM (never
+        paraphrased) so the index resolves a citation back to an exact source. Ids are never
+        reused or renumbered — the anti-regression spine."""
+        for src in fetched or []:
+            if not isinstance(src, Mapping):
+                continue
+            url = str(src.get("url") or "").strip()
+            key = _normalize_index_url(url)
+            if key and key in self._source_url_index:
+                continue  # already indexed under its stable [S#]
+            entry = {
+                "title": str(src.get("title") or "").strip(),
+                "url": url,
+                "markdown": str(src.get("markdown") or ""),
+            }
+            self._sources.append(entry)
+            if key:
+                self._source_url_index[key] = len(self._sources)  # 1-based [S#]
+            if self.session_bound:
+                # PERSIST the verbatim body to the sidecar so a session follow-up can read
+                # it back + load_source it (a17). Append-only, in [S#] order — the body the
+                # leaf record never carried. Best-effort: a sidecar write must never break a
+                # research run (the in-memory index is still authoritative for THIS run).
+                try:
+                    with self.sources_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(entry, default=str) + "\n")
+                except OSError as exc:
+                    print(f"[research-state] source-sidecar append skipped: {exc}", flush=True)
+
     def append_leaf(self, leaf: LeafResult, *, layer: int) -> None:
-        """Append ONE leaf's gathered state (notes + findings digest) to the file (d49)."""
+        """Append ONE leaf's gathered state (notes + findings digest) to the file (d49).
+
+        s14/P3A item 2 — ALSO folds the leaf's fetched sources into the run's VERBATIM SOURCE
+        INDEX (append-only, URL-deduped, stable [S#]); the index is the source memory the
+        decision render now reasons over, replacing the per-leaf ``findings_digest`` slice."""
+        self._index_sources(leaf.fetched or [])
         record = {
             "layer": layer,
             "branch_id": leaf.branch_id,
@@ -652,76 +1683,148 @@ class ResearchState:
                 continue
         return records
 
-    def render_for_decision(self, records: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
-        """Render the persisted notes compactly for the decision prompt (512-SWA-friendly).
+    def sources(self) -> list[dict[str, Any]]:
+        """The run's VERBATIM SOURCE INDEX entries (``[{title,url,markdown}]``), [S#]-ordered.
 
-        Shows each note's id, trust tier, key_claims and gaps — the signal the decision node
-        reasons over to author expansions (grounded in gaps) and prunes (weak/redundant
-        notes). Reads from disk when ``records`` is not supplied (d49 real state)."""
-        records = list(records) if records is not None else self.read()
-        if not records:
-            return "ARTICLE NOTES (already gathered): (none yet)"
-        lines = ["ARTICLE NOTES (already gathered):"]
+        Position is the stable 1-based [S#]. The same list the write side resolves
+        ``source_ids`` against (chat_app re-collects it with the identical URL-dedup), so a
+        decision-time citation and a write-time citation share one id space."""
+        return list(self._sources)
+
+    def collect_notes(self) -> list[dict[str, Any]]:
+        """Every ArticleNote gathered so far, across all leaf records (decision memory input).
+
+        Read-back from the persisted records (d49 real state) so the narrative is built from
+        what was actually gathered, never the model's memory."""
+        notes: list[dict[str, Any]] = []
+        for rec in self.read():
+            for note in rec.get("notes") or []:
+                if isinstance(note, Mapping):
+                    notes.append(dict(note))
+        return notes
+
+    def concern_graph(self, tree: Optional["Tree"] = None) -> ConcernGraph:
+        """The EXPLICIT per-concern research GRAPH (d185) projected from the persisted state.
+
+        A DERIVED view (no new persistence — a17 owns that): concern nodes are the gathered
+        leaf records read back from disk (d49), notes→[S#] cites + gap edges from the verbatim
+        source index. Pass the live ``tree`` to fold in authored-but-ungathered concerns
+        (expand) and pruned concerns (collapse), so the graph REFLECTS the loop's walk. The
+        object serializes via ``to_dict`` for a smoke/gate to assert the graph SHAPE."""
+        return build_concern_graph(self.read(), self._sources, tree=tree)
+
+    def render_concern_graph(self, tree: Optional["Tree"] = None) -> str:
+        """Render the per-concern graph for the decision prompt (``""`` when empty)."""
+        return self.concern_graph(tree=tree).render()
+
+    def research_brief(
+        self, *, topic: str = "", tree: Optional["Tree"] = None
+    ) -> dict[str, Any]:
+        """The per-research BRIEF (d185 Layer 2) — a thesis-level digest of THIS run.
+
+        DERIVED from the same concern graph (Layer 1) over the persisted state (d49 read
+        -back, no fabrication): the dominant findings this research established, its
+        settled concerns, the distinct cited sources, and the still-open gaps. ``topic``
+        is the research question/goal; pass the live ``tree`` to fold in the loop's walk.
+        chat_app stores this dict at the CHAT-SESSION level keyed by a research id so
+        multiple researches in one chat coexist, each addressable by its brief."""
+        return self.concern_graph(tree=tree).to_brief(topic=topic)
+
+    def _findings_fallback_covered(self, records: Sequence[Mapping[str, Any]]) -> str:
+        """COVERED bullets derived from findings prose when NO ArticleNotes were emitted.
+
+        s13 FINDINGS BRIDGE, preserved: a small model can produce REAL findings yet emit 0
+        structured notes — the narrative (built from notes) would then be empty and the
+        decision node would STOP/PRUNE blind. So when there are no notes, surface a compact
+        COVERED list from each leaf's persisted ``findings_digest`` (real gathered prose, the
+        [S#] left off because no note tied a claim to a source — never a minted id), so the
+        decision node still reasons over what was gathered. Returns ``""`` when there is no
+        findings prose either (an honest 'nothing yet')."""
+        bullets: list[str] = []
+        seen: set[str] = set()
         for rec in records:
-            q = str(rec.get("question", "")).strip()
-            notes = rec.get("notes") or []
-            lines.append(f"# layer {rec.get('layer')} · branch {rec.get('branch_id')}: {q}")
-            # Per-branch MEANING signal (2a) — computed from the PERSISTED record only (no
-            # new fetch): how many claims/sources this branch contributed and at what trust.
-            # Lets the decision node judge whether a branch ADDS MEANING or is prune-worthy.
-            n_claims = sum(len(note.get("key_claims") or []) for note in notes)
-            tiers = sorted({str(note.get("source_trust", "")).strip()
-                            for note in notes if str(note.get("source_trust", "")).strip()})
-            trust = "/".join(tiers) if tiers else "n/a"
-            if notes:
-                lines.append(
-                    f"    contributes: {n_claims} claims, {len(notes)} sources, trust={trust}"
-                )
-            else:
-                # s13 P1-findings — FINDINGS BRIDGE. A leaf can produce REAL findings (the
-                # raw research prose) yet emit 0 ArticleNotes (the small model under-emits
-                # the structured note tool). The notes-only signal above would then read
-                # "0 claims, 0 sources" for a branch full of real content, and the decision
-                # node would PRUNE/STOP blind. So when notes are empty, derive a NON-ZERO
-                # contribution from the PERSISTED findings_digest + fetched_count (both real,
-                # never fabricated): a node that gathered findings can NEVER read "0 sources".
-                findings_digest = str(rec.get("findings_digest", "") or "").strip()
-                fetched_count = int(rec.get("fetched_count", 0) or 0)
-                if findings_digest:
-                    # Coarse claim floor from the findings prose (sentence-like segments),
-                    # at least 1 — a presence signal, not a fabricated note count.
-                    segs = [s for s in _split_sentences(findings_digest) if len(s) > 20]
-                    derived_claims = max(1, len(segs))
-                    # Sources = the real fetched sources the leaf READ. If a leaf produced
-                    # findings without recording a fetch count, still floor at 1 (it read
-                    # SOMETHING to write findings) so the branch is never shown as empty.
-                    derived_sources = max(1, fetched_count)
-                    lines.append(
-                        f"    contributes: {derived_claims} claims (from findings), "
-                        f"{derived_sources} sources, trust=findings (notes not emitted)"
-                    )
-                    # Let the planner SEE the actual findings content it must decide on —
-                    # a compact digest, so the decision is grounded in real data, not a 0.
-                    digest = findings_digest if len(findings_digest) <= 500 \
-                        else findings_digest[:500].rstrip() + "…"
-                    lines.append(f"    findings: {digest}")
-                else:
-                    # Genuinely empty branch (no notes AND no findings) — honest 0/0.
-                    lines.append(
-                        f"    contributes: {n_claims} claims, {len(notes)} sources, trust={trust}"
-                    )
-            for note in notes:
-                sid = note.get("source_id")
-                trust = note.get("source_trust", "")
-                title = str(note.get("title", "")).strip()
-                claims = note.get("key_claims") or []
-                gaps = note.get("gaps_or_followups") or []
-                lines.append(
-                    f"- S{sid} [{trust}] {title}\n"
-                    f"    key_claims: {claims}\n"
-                    f"    gaps_or_followups: {gaps}"
-                )
+            digest = str(rec.get("findings_digest", "") or "").strip()
+            if not digest:
+                continue
+            for seg in _split_sentences(digest):
+                s = seg.strip()
+                if len(s) <= 20:
+                    continue
+                key = s.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                bullets.append(s)
+                if len(bullets) >= _NARRATIVE_COVERED_CAP:
+                    break
+            if len(bullets) >= _NARRATIVE_COVERED_CAP:
+                break
+        if not bullets:
+            return ""
+        lines = [
+            "RESEARCH NARRATIVE (running SUMMARY from the gathered findings — the note lane "
+            "emitted nothing, so these are settled points pulled from the raw findings prose):",
+            "COVERED (settled points so far):",
+        ]
+        lines.extend(f"  - {b}" for b in bullets)
         return "\n".join(lines)
+
+    def render_for_decision(
+        self,
+        records: Optional[Sequence[Mapping[str, Any]]] = None,
+        *,
+        tree: Optional["Tree"] = None,
+    ) -> str:
+        """Render the COMPACT research MEMORY for the decision prompt (s14/P3A items 1+2).
+
+        RETIRES the old raw per-branch dump (which re-rendered ALL prior-layer state in full
+        every layer → unbounded linear context growth, d146(2)). The decision node now reasons
+        over the SAME compact memory the write planner uses (the a2 builders, now research-
+        owned above):
+
+          * the running NARRATIVE summary — COVERED (each grounded in its [S#]) / OPEN GAPS /
+            DIRECTION, built from the gathered ArticleNotes (the ONLY summarized artifact); and
+          * the VERBATIM SOURCE INDEX — stable [S#] + url + structure-aware chunk map, the raw
+            sources never paraphrased.
+
+        The node grows from the GAPS and prunes COVERED redundancy, grounded in stable ids, not
+        a lossy 500-char excerpt. Reads notes/records from disk when ``records`` is not supplied
+        (d49 real state); the source index is the run-accumulated verbatim list (``sources()``).
+        Falls back to a findings-derived COVERED list when no notes were emitted (the s13
+        findings-bridge, preserved) so the decision node is never blind on a notes-light run."""
+        records = list(records) if records is not None else self.read()
+        notes: list[dict[str, Any]] = []
+        for rec in records:
+            for note in rec.get("notes") or []:
+                if isinstance(note, Mapping):
+                    notes.append(dict(note))
+        srcs = self._sources
+        narrative = compose_research_narrative(notes, srcs)
+        if not narrative:
+            # No structured notes → derive COVERED from the real findings prose (bridge).
+            narrative = self._findings_fallback_covered(records)
+        index = render_verbatim_source_index(srcs)
+        if not narrative and not index:
+            return (
+                "RESEARCH NARRATIVE (already gathered): (none yet)\n\n"
+                "SOURCE INDEX: (no sources fetched yet)"
+            )
+        parts: list[str] = []
+        parts.append(narrative or "RESEARCH NARRATIVE: (no settled points yet)")
+        parts.append(index or "SOURCE INDEX: (no sources fetched yet)")
+        # s15/a15 (d185) — fold in the EXPLICIT per-concern GRAPH so the decision node reasons
+        # over the structure it WALKS (concern → notes → sources, gaps = edges to the next
+        # concern), not only the flattened COVERED/GAPS narrative. Built from the SAME records
+        # (+ the live tree when supplied, so authored/pruned concerns show); additive — the
+        # narrative + index + gap lens are untouched. Empty (no graphable concern) → skipped.
+        graph_render = build_concern_graph(records, srcs, tree=tree).render()
+        if graph_render:
+            parts.append(graph_render)
+        # s15/a6 (d182) part (c) — surface the OPEN-GAP LENS prominently right beside the data so
+        # the decision node reasons over blanks-to-fill, not COVERED-only. Decision-only (the shared
+        # narrative builder stays clean for the write planner).
+        parts.append(_DECISION_GAP_LENS)
+        return "\n\n".join(parts)
 
     def all_fetched(self) -> list[dict[str, Any]]:
         """(Accumulated count helper.) Records hold ``fetched_count``; the real source
@@ -730,34 +1833,211 @@ class ResearchState:
 
 
 # ---------------------------------------------------------------------------- #
+# The RESEARCH-MEMORY TOOL — an ABSTRACT, index-keyed create-and-lookup surface
+# over the existing :class:`ResearchState` (d285 SB-1). NOT a second store.
+# ---------------------------------------------------------------------------- #
+class _NewMemorySentinel:
+    """The ``NEW`` sentinel a caller passes to :meth:`ResearchMemoryStore.open_memory`
+    to mean "start a FRESH research memory" (as opposed to reusing one by index).
+
+    A distinct singleton object (identity-compared) so it can never collide with a real
+    index string — passing it is unambiguous, where ``None``/``""`` could be an accident."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "NEW_MEMORY"
+
+
+# The one sentinel value. ``open_memory(NEW_MEMORY)`` (or ``open_memory()`` / ``None``)
+# creates a brand-new memory; ``open_memory("<index>")`` reuses an existing one.
+NEW_MEMORY = _NewMemorySentinel()
+
+
+def _normalize_memory_index(index: str) -> str:
+    """Sanitize a memory INDEX into a filesystem-safe stem (the same rule the served path
+    uses for run/session ids). Idempotent — a normalized index normalizes to itself, so a
+    node that passes back a memory's ``memory_handle`` always resolves to the SAME file."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(index or "").strip())
+
+
+class ResearchMemoryStore:
+    """The abstract research-memory SINGLETON tool (d285 SB-1).
+
+    The d285 memory model: nodes NEVER construct or manage a research store directly — they
+    only pass an INDEX to this tool, and the tool owns creation and lookup:
+
+    * an **existing index** → the SAME memory is returned (same ``memory_handle``, and its
+      prior notes + verbatim sources are readable back), so a downstream node continues the
+      research a prior node gathered;
+    * the **NEW sentinel** (``NEW_MEMORY``) **or nothing** (``None``) → a brand-new, DISTINCT
+      memory is created under a freshly-minted index, isolated from every existing one.
+
+    It is "singleton" in two senses: there is ONE store per root (see
+    :func:`get_research_memory_store`), and within a store there is ONE live memory per index
+    (memoized) — so two nodes passing the same index share one memory rather than racing
+    divergent copies. It is built ON the existing :class:`ResearchState` + its
+    ``memory_handle`` + the ``.sources.jsonl`` sidecar (index-keyed memories open
+    ``session_bound=True`` so the read-back of prior notes + sources is the real disk state),
+    NOT a second/parallel store.
+
+    Anti-fabrication: the tool is GENERIC and domain-neutral — it has zero spec-name or
+    role-name conditionals and authors no behavior keyed to which caller opened it. The
+    WHEN-to-reuse-vs-create-a-memory methodology lives in the research-methodology spec body
+    + the planner's reasoning, never here; this tool provides only the
+    index→reuse / NEW→create mechanism."""
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        # Where index-keyed memories live; one ``<index>.jsonl`` (+ sidecars) per memory.
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        # index → the live ResearchState (per-index singleton for THIS store/process).
+        self._memories: dict[str, ResearchState] = {}
+
+    def _path_for(self, index: str) -> Path:
+        return self.root / f"{index}.jsonl"
+
+    def _mint_index(self) -> str:
+        """A fresh, collision-free index for a NEW memory (distinct from any existing one,
+        in-memory or on disk)."""
+        while True:
+            candidate = f"mem_{uuid.uuid4().hex}"
+            if candidate not in self._memories and not self._path_for(candidate).exists():
+                return candidate
+
+    def open_memory(
+        self, index: "str | _NewMemorySentinel | None" = None
+    ) -> ResearchState:
+        """Open a research memory by INDEX — the sole surface a node uses.
+
+        ``index`` is one of: an existing index string (→ reuse that memory), ``NEW_MEMORY``
+        or ``None`` (→ create a new distinct memory). Returns the :class:`ResearchState`;
+        the caller never constructs one itself. Read ``.memory_handle`` to learn the index a
+        new memory was minted under (so a later node can pass it back to continue)."""
+        if index is None or index is NEW_MEMORY:
+            resolved = self._mint_index()
+        else:
+            resolved = _normalize_memory_index(index)
+            if not resolved:
+                # An empty/whitespace index is not a usable handle → treat as NEW (a fresh
+                # memory) rather than silently sharing one blank-stem file.
+                resolved = self._mint_index()
+        cached = self._memories.get(resolved)
+        if cached is not None:
+            return cached
+        # Index-keyed memories are session_bound=True: opening an EXISTING index reads its
+        # prior notes + verbatim sources back (no truncate); opening a never-seen index just
+        # starts empty. Built ON ResearchState — no second store.
+        state = ResearchState(self._path_for(resolved), session_bound=True)
+        self._memories[resolved] = state
+        return state
+
+    def has_memory(self, index: str) -> bool:
+        """Whether an index already names a memory (live in this store OR persisted on disk).
+        A read-only probe; it never creates one."""
+        resolved = _normalize_memory_index(index)
+        if not resolved:
+            return False
+        return resolved in self._memories or self._path_for(resolved).exists()
+
+
+# One store per root directory (process-wide), so "the research-memory tool" is a genuine
+# singleton: every node that opens a memory under the same root shares the same store (and
+# therefore the same per-index memories). Keyed by the resolved absolute root.
+_MEMORY_STORES: dict[str, ResearchMemoryStore] = {}
+
+
+def get_research_memory_store(root: str | os.PathLike[str]) -> ResearchMemoryStore:
+    """Return THE research-memory store for ``root`` (created once, then reused)."""
+    key = str(Path(root).resolve())
+    store = _MEMORY_STORES.get(key)
+    if store is None:
+        store = ResearchMemoryStore(root)
+        _MEMORY_STORES[key] = store
+    return store
+
+
+def resolve_brief_memory(
+    root_or_store: "str | os.PathLike[str] | ResearchMemoryStore",
+    memory_index: Any,
+) -> ResearchState:
+    """Resolve a STEP BRIEF's ``memory_index`` field THROUGH SB-1's store (d285 SB-3).
+
+    The bridge from the planner's AUTHORED choice (the brief field — an index string or
+    the textual ``<<NEW>>`` sentinel) onto SB-1's create-and-lookup mechanism:
+
+    * an existing index → SB-1 returns the SAME memory (its prior notes + sources read
+      back), so this step CONTINUES the research a prior step gathered;
+    * the ``<<NEW>>`` sentinel (or an empty/unspecified field) → SB-1 mints a FRESH,
+      distinct memory under a newly-minted index.
+
+    ``root_or_store`` is either a directory ROOT (→ the per-root singleton store via
+    :func:`get_research_memory_store`) or an already-built :class:`ResearchMemoryStore`.
+    Returns the :class:`ResearchState`; read ``.memory_handle`` to learn the index a fresh
+    memory was minted under (so a LATER step can pass it back to continue).
+
+    Anti-fabrication (d285, d10-clean): the engine STAMPS no index here — it only RELAYS
+    the planner-authored value to SB-1's index→reuse / <<NEW>>→create mechanism. The
+    WHEN-to-continue-vs-create decision is the planner's reasoning over data, never code."""
+    store = (
+        root_or_store
+        if isinstance(root_or_store, ResearchMemoryStore)
+        else get_research_memory_store(root_or_store)
+    )
+    canonical = normalize_brief_memory_index(memory_index)
+    if canonical == NEW_MEMORY_SENTINEL:
+        return store.open_memory(NEW_MEMORY)
+    return store.open_memory(canonical)
+
+
+# ---------------------------------------------------------------------------- #
 # The DECISION NODE — reasoning-driven, persisted-state-fed, DD-informed protocol.
 # ---------------------------------------------------------------------------- #
 _DECISION_INSTRUCTION = (
     "----\n"
     "You are a RESEARCH PLANNER growing a research TREE for a deep, well-sourced report. "
-    "The ARTICLE NOTES below are everything gathered SO FAR; each branch shows what it "
-    "CONTRIBUTES (claims, sources, trust). Judge every note/branch by ONE test — does it "
-    "ADD MEANING to the report's thesis: a distinct claim, corroboration, a contradiction, "
-    "or a concrete figure/date? PRUNE whatever is redundant, off-thesis, answered, "
-    "dead-end, or low-trust. EXPAND only where a MISSING meaning would change the report. "
+    "The RESEARCH MEMORY above — COVERED points (each with its source [S#]), OPEN GAPS, and the "
+    "OPEN-GAP LENS — is everything gathered SO FAR. Your job each layer is to FILL THE BLANKS the "
+    "memory shows: judge every note/branch by ONE test — does it ADD MEANING (a distinct claim, "
+    "corroboration, a contradiction, a concrete figure/date)? EXPAND into the gaps where a missing "
+    "meaning would change the report; PRUNE whatever is redundant, off-thesis, answered, dead-end, "
+    "low-trust, or over-covered (call prune_branch and name the reason, so pruning is auditable and "
+    "the depth budget funds real blanks instead of padding).\n\n"
+    # s15/a6 (d182) parts (e)+(f) — the a3 deepening/prune doctrine WALL is shrunk to a lean
+    # reminder. The gap signal now lives in the DATA (the OPEN GAPS + OPEN-GAP LENS the render puts
+    # right above this prompt) and in the message-chaining (the gather loop records
+    # gaps_or_followups per source, fed back as role 'tool'), so this prompt no longer carries the
+    # whole argument. Intent preserved — breadth != depth, continue while gaps remain, prune every
+    # layer — but NOT a min-layer floor / force-N / deterministic override (d14/d148).
+    "Breadth is NOT depth: the first wave gave ONE first-pass note per facet — that OPENS each "
+    "facet, it does not FILL it. A facet is STILL an open gap while it rests on a single source, "
+    "names a figure/date without its surrounding detail, or carries an unanswered follow-up. So "
+    "CONTINUING to expand the gaps is the normal path — calling stop_research right after the first "
+    "breadth wave is almost always PREMATURE.\n\n"
     "When the notes already cover the thesis with no meaning-adding gap left, STOP — do "
     "NOT pad with more branches.\n\n"
     "Call ONE tool per turn by replying with ONLY a JSON object and NOTHING else:\n"
     '  {"tool":"expand_branch","args":{"parent":"root","question":"<focused sub-question that fills a MISSING meaning>","rationale":"<the note id/gap it comes from, e.g. S1 gap>"}}\n'
     '  {"tool":"prune_branch","args":{"branch":"<a note id like S5 or a branch id like B2>","reason":"<redundant|off-thesis|answered|dead-end|low-trust>"}}\n'
-    '  {"tool":"add_section","args":{"title":"<a section the FINAL report should have>","covers":"<the claims/notes this section will cover, e.g. S1,S3 damage figures>"}}\n'
-    '  {"tool":"drop_section","args":{"title":"<an outlined section the notes cannot support>","reason":"<unsupported|redundant|off-thesis>"}}\n'
     '  {"tool":"set_next_direction","args":{"branch":"<branch id>","reason":"<why pursue next>"}}\n'
-    '  {"tool":"stop_research","args":{"reason":"<why the gathered notes already answer the thesis — enough, no meaning-adding gap left>"}}\n\n'
-    "As the notes reveal the report's shape, SHAPE ITS OUTLINE: add_section for each section "
-    "the final report should have (grounded in the notes it will cover), drop_section for a "
-    "planned section the notes cannot support. The outline below is YOUR document direction — "
-    "refine it; it becomes the section scaffold the writer follows. "
+    '  {"tool":"stop_research","args":{"reason":"<ONLY in a SETTLED turn: you authored NO new expansion this turn AND every branch you expanded earlier already has its findings in the notes above, with no meaning-adding gap left>"}}\n\n'
+    # s14/a12 (d154): the add_section / drop_section OUTLINE example calls + the "SHAPE ITS
+    # OUTLINE" paragraph were REMOVED here. They invited the model to author the document
+    # outline (and, with it, source_ids) during the RESEARCH phase — a surface the generic
+    # engine discards (outline_hint=None, d56) while silently dropping the source_ids. The
+    # report's sections now come solely from PHASE-2 findings-driven decomposition; source_ids
+    # are authored ONLY on the consumed file_write write-planner surface.
     "Ground EVERY expansion in a specific note's gaps_or_followups (cite the note id). "
-    "After you have expanded the meaning-adding directions and pruned the weak notes, "
-    "EITHER call stop_research (enough) OR write your FINAL TREE PLAN as plain prose (NOT "
-    "JSON): the live branches with their questions, the pruned items with reasons, and "
-    "which branch to pursue first. ONE tool call per turn."
+    "The flow is SEQUENTIAL, not a one-pass choice between expanding and stopping: a turn "
+    "that authors ANY expand_branch ENDS RIGHT THERE — you have only OPENED work (the new "
+    "child branches hold NO notes yet, so there is nothing to 'stop' on); those branches RUN "
+    "as the next layer and return their findings, which you read on a LATER turn. So "
+    "stop_research is NOT a co-equal alternative to expanding this turn — it is the move ONLY "
+    "in a SETTLED turn: one where you authored NO new expansion AND every branch you expanded "
+    "earlier already has its findings in the notes above. When the research has settled that "
+    "way, EITHER call stop_research OR write your FINAL TREE PLAN as plain prose (NOT JSON): "
+    "the live branches with their questions, the pruned items with reasons, and which branch "
+    "to pursue first. ONE tool call per turn."
 )
 
 # P2.4 (d131/d132.D) — the EXACT default stop sentence inside _DECISION_INSTRUCTION.
@@ -944,13 +2224,9 @@ async def run_decision_node(
             obs = tree.expand(args, depth=child_depth)
         elif name == "prune_branch":
             obs = tree.prune(args)
-        elif name == "add_section":
-            # s13/B3 — author/refine the document outline. Mutates the OutlinePlan (NOT the
-            # research topology) and continues the loop (not a stop). MUST sit before the
-            # set_next catch-all so an outline call is never mis-routed into a next-direction.
-            obs = tree.add_section(args)
-        elif name == "drop_section":
-            obs = tree.drop_section(args)
+        # s14/a12 (d154): the add_section / drop_section dispatch branches were REMOVED — those
+        # tools are no longer offered (see TREE_TOOLS / TREE_TOOL_SPECS), so the model cannot
+        # author the dead outline/source_id surface here. ``outline_ops`` therefore stays empty.
         elif name == "stop_research":
             # d95 — the AGENT decided the gathered notes already answer the thesis. Record
             # the reason and STOP the decision loop now (the layer loop reads this and halts
@@ -960,7 +2236,11 @@ async def run_decision_node(
             break
         else:
             obs = tree.set_next(args)
-        convo.append({"role": "user", "content": obs})
+        # s15/a6 (d182) part (d) — feed a TOOL observation back with role 'tool' (function-result),
+        # NOT 'user', so the model does not conflate its OWN tool output (the expand/prune/set_next
+        # ack) with a fresh USER instruction. Native Ollama :11434 accepts a role 'tool' message;
+        # genuine instructions (_DECISION_NUDGE / _NEXT_DIRECTION_REPROMPT) stay role 'user'.
+        convo.append({"role": "tool", "content": obs})
 
     new_branches = [b for bid, b in tree.branches.items() if bid not in before_ids]
     return DecisionResult(
@@ -991,6 +2271,44 @@ _DECOMPOSE_INSTRUCTION = (
     "plan as plain prose (NOT JSON). ONE tool call per turn."
 )
 
+# s14/a15 (d160/d161) — the EXACT default breadth sentence inside _DECOMPOSE_INSTRUCTION.
+# When the deep-research SHAPE supplies a ``decompose_methodology`` doctrine, this single
+# sentence is REPLACED by the shape's text, so the BREADTH SIGNAL is DEFINED IN THE SHAPE
+# (reasoned over by the model), not hard-coded here — exactly mirroring how
+# ``completeness_stop`` overrides ``_DEFAULT_STOP_SENTENCE``. It must remain a verbatim
+# substring of _DECOMPOSE_INSTRUCTION; _decompose_instruction() fails fast below if it drifts.
+_DEFAULT_DECOMPOSE_SENTENCE = (
+    "Author 2-5 scoped sub-questions that TOGETHER cover the goal, then write a one-line "
+    "plan as plain prose (NOT JSON). ONE tool call per turn."
+)
+assert _DEFAULT_DECOMPOSE_SENTENCE in _DECOMPOSE_INSTRUCTION, (
+    "research_tree: _DEFAULT_DECOMPOSE_SENTENCE drifted from _DECOMPOSE_INSTRUCTION — the "
+    "shape-defined decompose_methodology substitution would silently no-op"
+)
+
+
+def _decompose_instruction(decompose_criteria: Optional[str] = None) -> str:
+    """The decompose-node instruction, with the BREADTH DOCTRINE sourced FROM THE SHAPE (d161).
+
+    ``decompose_criteria`` is the selected deep-research SHAPE's ``decompose_methodology``
+    text (d160/d161 — "a detailed report spans MULTIPLE distinct dimensions; scope the real
+    facets the thesis implies"). When present it REPLACES the baked default breadth sentence,
+    so breadth semantics live in the SHAPE file (editable, no code change) — breadth is a SHAPE
+    PROPERTY, not engine code. The substitution is DECLARATIVE METHODOLOGY THE MODEL REASONS
+    OVER, never a hard-coded force-exactly-N branch. When empty / None (offline tests, a shape
+    without the field) the instruction is BYTE-IDENTICAL to the original ``_DECOMPOSE_INSTRUCTION``
+    — no behavioural change off the served path. Mirrors :func:`_decision_instruction` exactly."""
+    dc = (decompose_criteria or "").strip()
+    if not dc:
+        return _DECOMPOSE_INSTRUCTION
+    shape_sentence = (
+        "BREADTH METHODOLOGY — this is DEFINED IN THE DEEP-RESEARCH SHAPE (your decompose "
+        f"doctrine; reason over it to scope the real facets THIS goal implies): {dc} Author "
+        "one scoped sub-question for EACH distinct facet you identify, then write a one-line "
+        "plan as plain prose (NOT JSON). ONE tool call per turn."
+    )
+    return _DECOMPOSE_INSTRUCTION.replace(_DEFAULT_DECOMPOSE_SENTENCE, shape_sentence, 1)
+
 
 async def run_decompose_node(
     transport: Any,
@@ -999,6 +2317,7 @@ async def run_decompose_node(
     tree: Tree,
     config: TreeConfig,
     methodology: Optional[str] = None,
+    decompose_criteria: Optional[str] = None,
 ) -> list[Branch]:
     """Seed-only root (d106 #3): the root DECOMPOSES the goal into scoped sub-questions via
     ``expand_branch`` tool calls BEFORE any gathering — it never runs a whole-goal research
@@ -1012,7 +2331,7 @@ async def run_decompose_node(
     before_ids = set(tree.branches)
     convo: list[dict[str, Any]] = [{
         "role": "user",
-        "content": f"{_methodology_block(methodology)}GOAL: {goal}\n\n{_DECOMPOSE_INSTRUCTION}",
+        "content": f"{_methodology_block(methodology)}GOAL: {goal}\n\n{_decompose_instruction(decompose_criteria)}",
     }]
     unproductive = 0
     for _ in range(config.decide_max_turns):
@@ -1041,7 +2360,9 @@ async def run_decompose_node(
                 "Seed step: author scoped sub-questions with expand_branch (one per turn), "
                 "then write your one-line plan as prose."
             )
-        convo.append({"role": "user", "content": obs})
+        # s15/a6 (d182) part (d) — the seed expand ack is the model's own tool output: feed it as
+        # role 'tool', not 'user' (same anti-conflation chaining fix as the decision node).
+        convo.append({"role": "tool", "content": obs})
     return [b for bid, b in tree.branches.items() if bid not in before_ids]
 
 
@@ -1088,6 +2409,7 @@ class DagGrower:
         tree: Tree,
         methodology: Optional[str] = None,
         stop_criteria: Optional[str] = None,
+        decompose_criteria: Optional[str] = None,
         max_layers: int = 0,
     ) -> None:
         self.transport = transport
@@ -1098,6 +2420,10 @@ class DagGrower:
         self.tree = tree
         self.methodology = methodology
         self.stop_criteria = stop_criteria
+        # s14/a15 (d161) — the SHAPE's decompose_methodology doctrine, handed to the
+        # DECOMPOSE-FIRST seed so breadth (≥3 scoped facets) is a SHAPE PROPERTY the model
+        # reasons over (None → the baked-in default decompose wording, byte-identical).
+        self.decompose_criteria = decompose_criteria
         # The growth bound (research layers incl. the seed). 0 → the config depth ceiling;
         # always clamped to the config depth so a shape can never exceed the user-fixed
         # depth ceiling (termination safety — bounded growth, never unbounded).
@@ -1109,20 +2435,56 @@ class DagGrower:
         # served wiring can report exactly how breadth grew (gathered/expanded/turns/stop).
         self.layers: list[dict[str, Any]] = []
         self.stop_reason: Optional[str] = None
+        # s15/a21 — the SURFACED grow-error "<Type>: <msg>" the drive loop records here when a
+        # grow round RAISES (the runtime also logs the full traceback to stderr). None while no
+        # round raised; the served grow_trace + the gate read it so a crash is VISIBLE, never a
+        # silent early-stop (d186 — a grow failure is a fixable design bug to surface, not hide).
+        self.grow_error: Optional[str] = None
 
-    def _research_node(self, nid: str, question: str, depends_on: tuple[str, ...]) -> PlanNode:
-        """Build ONE research PlanNode (web_search-seeded, growing-visibility) for a branch."""
+    def _research_node(self, nid: str, question: str, depends_on: tuple[str, ...],
+                       memory_index: str = NEW_MEMORY_SENTINEL) -> PlanNode:
+        """Build ONE GATHER PlanNode (SOURCE-AGNOSTIC, growing-visibility) for a branch.
+
+        as4 DE-WEB (d227/d241/d186): the node is TOOL-LESS — it does NOT bind ``web_search``
+        (or any gather tool). Like every in-plan node (d242) it starts with only
+        ``get_bundles`` + ``finish`` and SELF-SELECTS its gather bundle (web / vector-db /
+        codebase-read / files); that bundle's tool drives the gather, and the grower drives
+        expand/prune/stop over WHATEVER structured artifact it yields. The grower owns NO web
+        vocabulary. SB-RR (d292/d293): the gather node is a WORKER-default node (d273) carrying
+        the :data:`~specialization.seed.RESEARCH_METHODOLOGY_SPEC` METHODOLOGY spec — research
+        is a SPECIALIZATION, NOT a role. That spec's body ("self-select your gather bundle
+        first…") is what makes the worker self-select the gather bundle and reach the unified
+        worker loop's gather behavior; the ROLE_RESEARCHER role is RETIRED, so nothing routes
+        the node by a role. The question rides the task framing; ``tool_args['query']`` is
+        carried bookkeeping only (read by ``_node_question`` for ingest/decision read-back) —
+        NOT a tool binding, since ``tool`` is ``None``."""
         q = (question or "").strip() or self.goal
-        specs = (self.spec,) if self.spec else ()
+        # SB-RR (d292): the research-METHODOLOGY spec is the self-select lever; compose it AHEAD
+        # of the round's output-quality spec (``self.spec``, e.g. research-analyst) so the gather
+        # posture leads. Dedup if the caller already passed the methodology spec.
+        extra = (self.spec,) if self.spec and self.spec != RESEARCH_METHODOLOGY_SPEC else ()
+        specs = (RESEARCH_METHODOLOGY_SPEC,) + extra
         return PlanNode(
             id=nid,
             task=f"[research · gap] {position_framing('research')}\n\n{q}",
-            spec=self.spec,
+            spec=RESEARCH_METHODOLOGY_SPEC,
             specs=specs,
             depends_on=depends_on,
+            # WORKER-default (d273): every spawned node is a worker; the gather behavior comes
+            # from the research-methodology SPEC self-selecting the gather bundle, NOT a role.
             role=ROLE_WORKER,
-            tool="web_search",
+            # TOOL-LESS (d242 / as4 de-web): self-selects its gather bundle; the grower does
+            # not assume web_search. ``tool_args['query']`` is inert carried bookkeeping.
+            tool=None,
             tool_args={"query": q[:200]},
+            # MEMORY-BY-HANDLE (d221): bind each gather node to THIS run's research/complex
+            # memory — also the SOURCE-AGNOSTIC marker the grower folds it by (not the tool).
+            research_memory_handle=self.state.memory_handle,
+            # MEMORY-INDEX (d285 SB-3): the planner-authored memory CHOICE the branch's brief
+            # carried (an index to continue, or <<NEW>>). Carried onto the node's brief surface;
+            # the run still gathers into the shared ``self.state`` memory (per-branch OPENING by
+            # this index is SB-4) — SB-3 only surfaces the choice.
+            memory_index=normalize_brief_memory_index(memory_index),
         )
 
     async def seed_layer(self) -> list[PlanNode]:
@@ -1143,6 +2505,7 @@ class DagGrower:
             tree=self.tree,
             config=self.config,
             methodology=self.methodology,
+            decompose_criteria=self.decompose_criteria,
         )
         if not branches:
             return []
@@ -1150,14 +2513,25 @@ class DagGrower:
         for b in branches:
             # seed frontier nodes are INDEPENDENT (depends_on=()) so they gather concurrently;
             # the decision node reads ALL their persisted notes back (cross-layer visibility).
-            node = self._research_node(f"s1_{b.id}", b.question, ())
+            node = self._research_node(
+                f"s1_{b.id}", b.question, (), memory_index=b.memory_index)
             self._consumed.discard(node.id)
             nodes.append(node)
         return nodes
 
     @staticmethod
     def _is_research_node(node: Any) -> bool:
-        """A GATHER node (the research position) — the one seeded with a ``web_search``."""
+        """A GATHER node — recognized SOURCE-AGNOSTICALLY (as4 de-web, d227/d241), never by a
+        web tool and (SB-RR, d292/d293) never by a role. The :data:`ROLE_RESEARCHER` role is
+        RETIRED; a gather node is now a WORKER carrying the research-methodology spec. The
+        grower folds its OWN authored gather nodes by the research/complex-MEMORY HANDLE it
+        binds onto each (``research_memory_handle`` — set in :meth:`_research_node` and the
+        tool-less FALLBACK seed). This is the grower's INGEST recognizer (which completed nodes
+        to fold into the ResearchState), NOT a runtime dispatch discriminator — the runtime
+        routes purely by the node's self-selected bundle. A legacy ``web_search``-bound node
+        still folds (back-compat)."""
+        if getattr(node, "research_memory_handle", None):
+            return True
         return getattr(node, "tool", None) == "web_search"
 
     def _ingest(self, nodes: Sequence[Any], cache: Mapping[str, Any], layer: int) -> int:
@@ -1181,8 +2555,21 @@ class DagGrower:
             notes: list[dict[str, Any]] = []
             fetched: list[dict[str, Any]] = []
             if isinstance(tv, Mapping):
-                notes = [dict(x) for x in (tv.get("article_notes") or []) if isinstance(x, Mapping)]
-                fetched = [dict(x) for x in (tv.get("fetched") or []) if isinstance(x, Mapping)]
+                # SOURCE-AGNOSTIC gather artifacts (as4 de-web, d227/d241): fold the structured
+                # note/record the node's SELF-SELECTED gather bundle yields under EITHER the web
+                # vocabulary (``article_notes`` / ``fetched``) OR a generic key (``notes`` /
+                # ``records``), so a non-web source (vector-db, codebase, files) folds through
+                # the SAME ingest with no web-specific shape. The decision node reasons over the
+                # note gaps regardless of which source produced them.
+                notes = [
+                    dict(x) for x in (tv.get("article_notes") or tv.get("notes") or [])
+                    if isinstance(x, Mapping)
+                ]
+                fetched = [
+                    dict(x)
+                    for x in (tv.get("fetched") or tv.get("records") or tv.get("chunks") or [])
+                    if isinstance(x, Mapping)
+                ]
             findings = unwrap_output_envelope(getattr(r, "output", "") or "")
             self.state.append_leaf(
                 LeafResult(
@@ -1207,12 +2594,17 @@ class DagGrower:
         Mirrors ``run_research_tree``'s layer loop (gather → decide → stop?/expand?) exactly,
         but the GATHER already happened on the generic runtime (this just folds it in)."""
         gathered = self._ingest(dag.nodes, cache, layer)
-        # Read the PERSISTED state back (d49 anti-hallucination) — notes + document outline.
-        state_render = (
-            self.state.render_for_decision()
-            + "\n\n"
-            + self.state.render_outline_for_decision()
-        )
+        # Read the PERSISTED state back (d49 anti-hallucination) — the gathered notes/sources.
+        # s14/a12 (d154): the document-OUTLINE read-back (render_outline_for_decision) was
+        # REMOVED from the decision prompt. It invited the model to author an outline (and route
+        # source_ids into it) during research — a surface the generic engine discards
+        # (outline_hint=None, d56). The report's sections come from PHASE-2 findings-driven
+        # decomposition; source_ids live ONLY on the consumed file_write surface.
+        # s15/a15 (d185) — render the decision state AS THE GRAPH the loop walks: pass the live
+        # ``tree`` so authored-but-ungathered concerns (expand) and pruned concerns (collapse)
+        # are folded in, and the decision node's next expand/prune is DRIVEN BY the graph (its
+        # open gap edges + single-source flags), not only the flattened narrative.
+        state_render = self.state.render_for_decision(tree=self.tree)
         decision = await run_decision_node(
             self.transport,
             goal=self.goal,
@@ -1223,7 +2615,14 @@ class DagGrower:
             methodology=self.methodology,
             stop_criteria=self.stop_criteria,
         )
+        # ``decision.outline_ops`` is now always empty (the outline tools are no longer offered);
+        # the call is a harmless no-op kept so the channel can be re-enabled without a code change.
         self.state.append_outline_ops(decision.outline_ops)
+        # s15/a15 (d185) — snapshot the per-concern GRAPH SHAPE this layer (a compact summary,
+        # not the full serialization) so the served parity trace + the a14 gate can assert the
+        # research is GRAPH-shaped (per-concern nodes with note→source + gap edges), not a flat
+        # blob — and observe the graph the decision actually walked.
+        graph = self.state.concern_graph(tree=self.tree)
         self.layers.append({
             "layer": layer,
             "gathered": gathered,
@@ -1231,22 +2630,43 @@ class DagGrower:
             "pruned": [p.get("target") for p in decision.pruned],
             "decision_turns": decision.turns,
             "stop_research": decision.stop_research,
+            "graph_shape": "per_concern_graph",
+            "graph_concerns": len(graph.nodes),
+            "graph_settled": len(graph.settled()),
+            "graph_open_gaps": len(graph.open_gaps()),
+            "graph_collapsed": len(graph.collapsed()),
         })
-        # STOP — the agent decided the gathered notes already answer the thesis (d95). Honored
-        # BEFORE no_expansion, exactly like the tree's layer loop (an explicit "enough" wins).
-        if decision.stop_research is not None:
-            self.stop_reason = "agent_sufficient"
-            return [], self.stop_reason
-        # STOP — the model authored no new branch this layer → done (no fabricated structure).
+        # d184 — THE ENGINE HONORS THE expand_branch CONTRACT. The rewritten expand_branch
+        # description PROMISES the model "this sub-topic WILL be gathered as a new round"; the
+        # broken link was the engine checking stop_research BEFORE new_branches, so an expansion
+        # the model authored was silently dropped — the engine NOT delivering the tool's stated
+        # contract. So whenever the model authored ANY new branch this layer, those branches RUN
+        # as the next wave (the contract), and a stop_research raised in the SAME pass cannot
+        # cancel them (the new branches hold NO notes yet — nothing is gathered to "stop" on).
+        # This is the engine doing what the tool description says, NOT a stop/expand precedence
+        # seatbelt: the stop signal is decided ONLY in a settled pass that authored no expansion.
         if not decision.new_branches:
-            self.stop_reason = "no_expansion"
+            if decision.stop_research is not None:
+                # STOP — the agent decided every concern is settled/collapsed (d95).
+                self.stop_reason = "agent_sufficient"
+            else:
+                # STOP — no new branch authored this layer → done (no fabricated structure).
+                self.stop_reason = "no_expansion"
             return [], self.stop_reason
         # MAP each model-authored branch → a research PlanNode. GROWING VISIBILITY: depend on
         # EVERY prior node so the new layer sees all earlier findings (the §2c semantic the
         # frozen unroll already used). The next layer's gather feeds the next decision node.
         prior_ids = tuple(n.id for n in dag.nodes)
         new_nodes = [
-            self._research_node(f"g{layer + 1}_{b.id}", b.question, prior_ids)
+            self._research_node(f"g{layer + 1}_{b.id}", b.question, prior_ids,
+                                memory_index=b.memory_index)
             for b in decision.new_branches
         ]
         return new_nodes, None
+
+    def concern_graph(self) -> ConcernGraph:
+        """The current EXPLICIT per-concern research GRAPH (d185) — the live projection over
+        the persisted ResearchState + the loop's Tree (concern → notes → sources, gaps =
+        edges). Exposed so a smoke/gate can serialize it (``to_dict``) and assert the research
+        is GRAPH-shaped (per-concern nodes with note→source + gap edges), NOT a flat blob."""
+        return self.state.concern_graph(tree=self.tree)

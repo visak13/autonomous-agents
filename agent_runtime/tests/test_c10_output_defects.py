@@ -24,11 +24,8 @@ from agent_runtime.factory import PlanDAG, PlanNode
 from agent_runtime.runtime import AgentRuntime
 from agent_runtime.synth_tools import (
     DONE_SENTINEL,
-    begins_html_document,
-    dedupe_html_documents,
     deliverable_extension,
     derive_output_path,
-    top_level_html_doc_count,
 )
 from llm_framework import FakeTransport
 from reactive_tools import EventPlane, ToolHook, register_agentic_tools
@@ -57,33 +54,19 @@ _FULL_DOC_2 = (
 
 
 # --------------------------------------------------------------------------- #
-# #2 — single-document helpers (pure)
+# RP-AUDIT F3 (d319/d341/d330): the pure single-document helpers
+# ``top_level_html_doc_count`` / ``dedupe_html_documents`` / ``begins_html_document``
+# were DEAD HTML-format-pinned code (their re-emission-guard call site was replaced by
+# the FORMAT-NEUTRAL document_restart/section_reemission/html_close_gap trio in
+# RP-3c/d330). They are DELETED from synth_tools; their pure unit tests are removed
+# with them. The two behaviour tests below (which asserted on the number of complete
+# documents that reached disk) count top-level ``</html>`` closes INLINE — they test
+# the LIVE re-emission guard / raw pass-through, not any deleted helper.
 # --------------------------------------------------------------------------- #
-def test_top_level_html_doc_count():
-    assert top_level_html_doc_count(_FULL_DOC_1) == 1
-    assert top_level_html_doc_count(_FULL_DOC_1 + _FULL_DOC_2) == 2
-    # a fragment / markdown / csv has no </html> → 0 (never flagged)
-    assert top_level_html_doc_count("<section>x</section>") == 0
-    assert top_level_html_doc_count("name,moons\nEarth,1") == 0
-    assert top_level_html_doc_count("") == 0
-
-
-def test_dedupe_html_documents_keeps_first():
-    # two concatenated docs → keep ONLY the first complete one
-    deduped = dedupe_html_documents(_FULL_DOC_1 + _FULL_DOC_2)
-    assert deduped == _FULL_DOC_1
-    assert top_level_html_doc_count(deduped) == 1
-    # a single document (or fragment) is returned unchanged
-    assert dedupe_html_documents(_FULL_DOC_1) == _FULL_DOC_1
-    assert dedupe_html_documents("<section>frag</section>") == "<section>frag</section>"
-
-
-def test_begins_html_document():
-    assert begins_html_document("  <!DOCTYPE html><html>...") is True
-    assert begins_html_document("<html lang='en'>...") is True
-    assert begins_html_document("<h2>Next section</h2>") is False
-    assert begins_html_document("name,moons\nEarth,1") is False
-    assert begins_html_document("") is False
+def _top_level_html_doc_count(doc: str) -> int:
+    """Local test helper: number of COMPLETE top-level HTML documents (``</html>``
+    closes) in ``doc``. Inlined so the tests no longer depend on a shipped predicate."""
+    return (doc or "").lower().count("</html>")
 
 
 # --------------------------------------------------------------------------- #
@@ -116,15 +99,17 @@ def test_reemitted_full_document_is_dropped_single_doc_on_disk(tmp_path):
     written = tmp_path / "us-iran.html"
     assert written.is_file()
     # EXACTLY ONE top-level document reached disk (the defect was 2)
-    assert top_level_html_doc_count(written.read_text(encoding="utf-8")) == 1
-    assert top_level_html_doc_count(doc) == 1
+    assert _top_level_html_doc_count(written.read_text(encoding="utf-8")) == 1
+    assert _top_level_html_doc_count(doc) == 1
     assert "Different second pass" not in doc  # the duplicate was dropped
 
 
-def test_two_documents_in_one_emission_are_deduped_and_rewritten(tmp_path):
-    # The model crams TWO complete documents into a SINGLE emission (the guard cannot
-    # pre-empt this — written_path is None on the first write). The final single-document
-    # gate must dedupe to the first AND rewrite the real file so the artifact is clean.
+def test_two_documents_in_one_emission_ship_raw_no_engine_dedup(tmp_path):
+    # RP-1 (d319/d311): the engine SINGLE-DOCUMENT GATE (enforce_single_html_document +
+    # collapse_duplicate_sections normalization of the assembled bytes) is RETIRED — the
+    # engine authors/fixes NOTHING. If the model crams TWO documents into one emission, both
+    # ship VERBATIM (raw model output; single-document coherence is the model's own job,
+    # hardened via the writer spec in RP-2). The served doc equals the on-disk bytes.
     def reply(messages, **opts):
         n = sum(1 for m in messages if m.get("role") == "assistant")
         return (_FULL_DOC_1 + _FULL_DOC_2) if n == 0 else DONE_SENTINEL
@@ -137,27 +122,24 @@ def test_two_documents_in_one_emission_are_deduped_and_rewritten(tmp_path):
     assert out.ok
     doc = out.results["s1"].output or ""
     on_disk = (tmp_path / "combined.html").read_text(encoding="utf-8")
-    assert top_level_html_doc_count(doc) == 1
-    assert top_level_html_doc_count(on_disk) == 1   # the FILE was rewritten, not just the chat
-    assert doc == on_disk
-    assert "Different second pass" not in on_disk
+    # both documents survive — the engine did NOT dedup them (the retired gate would have).
+    assert _top_level_html_doc_count(on_disk) == 2
+    assert doc == on_disk                      # served bytes == on-disk bytes (raw pass-through)
+    assert "Different second pass" in on_disk  # the second doc's content is NOT stripped
 
 
 # --------------------------------------------------------------------------- #
-# #3 — the .txt extension is honored (was downgraded to .md)
+# #3 — RP-1 (d319/d311): format INFERENCE from a request keyword is RETIRED.
 # --------------------------------------------------------------------------- #
-def test_txt_extension_is_honored():
-    # the exact phrasings the c6 matrix proved failing → now .txt
-    for text in ("save to a .txt file", "give me a .txt file", "a plain text file",
-                 "txt file please", "save as text file"):
-        assert deliverable_extension(None, text) == ".txt", text
-    # no regression to the other formats / the .md default
-    assert deliverable_extension(None, "a detailed markdown report") == ".md"
-    assert deliverable_extension(None, "give me a CSV of planets") == ".csv"
-    assert deliverable_extension(None, "an HTML report") == ".html"
-    assert deliverable_extension(None, "just answer the question") == ".md"
-    # the full path derivation carries the .txt through (no content-derived .md)
-    assert derive_output_path("write a haiku", "save it to a .txt file", None).endswith(".txt")
+def test_format_inference_retired_explicit_name_still_honored():
+    # RP-1: deliverable_extension no longer maps a request keyword (.txt / markdown / CSV /
+    # HTML) to an extension — the engine does not infer a FORMAT; it returns the neutral
+    # plain-text default. The model picks its own format by NAMING its file.
+    for text in ("save to a .txt file", "a plain text file", "a detailed markdown report",
+                 "give me a CSV of planets", "an HTML report", "just answer the question"):
+        assert deliverable_extension(None, text) == ".md", text
+    # an EXPLICIT filename the request names still survives verbatim through path derivation.
+    assert derive_output_path("write a haiku", "save it to notes.txt", None) == "notes.txt"
 
 
 # --------------------------------------------------------------------------- #

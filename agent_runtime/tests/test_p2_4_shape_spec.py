@@ -22,10 +22,14 @@ from agent_runtime.research_tree import (
     Tree,
     TreeConfig,
     _DECISION_INSTRUCTION,
+    _DECOMPOSE_INSTRUCTION,
+    _DEFAULT_DECOMPOSE_SENTENCE,
     _DEFAULT_STOP_SENTENCE,
     _decision_instruction,
+    _decompose_instruction,
     _methodology_block,
     run_decision_node,
+    run_decompose_node,
 )
 from agent_runtime.shapes import load_shape, load_shapes
 
@@ -216,3 +220,66 @@ def test_all_shapes_still_load_after_new_fields():
     linear = catalog.get("linear")
     if linear is not None:
         assert linear.completeness_stop == "" and linear.deny_domains == ()
+
+
+# =========================================================================== #
+# s14/a15 (d160/d161) — BREADTH is a SHAPE PROPERTY: the deep-research shape declares
+# a decompose_methodology doctrine that the DECOMPOSE-FIRST seed reasons over to author
+# >=3 scoped facets (curing the d160 thin-report 1-source collapse), WITHOUT a hard-coded
+# force-count. Mirrors the completeness_stop shape-property tests above, for the seed.
+# =========================================================================== #
+def test_shape_declares_decompose_methodology_not_a_force_count():
+    shape = load_shape("deep-research")
+    dm = shape.decompose_methodology
+    # The breadth signal is real, free TEXT the model reasons over — not a number/force-count.
+    assert isinstance(dm, str) and dm.strip()
+    assert not dm.strip().isdigit()
+    low = dm.lower()
+    # It is a MULTI-DIMENSION breadth doctrine (scope the real facets), and it explicitly
+    # frames the >=3 floor as doctrine ("three or more dimensions"), not "emit exactly N".
+    assert "dimension" in low and "facet" in low
+    assert "three or more" in low
+    # It names the canonical facets the thesis spans (timeline / figures / causes / impact).
+    assert "timeline" in low and ("figure" in low or "cost" in low)
+    # It is NOT a code branch: the shape text never instructs a literal node count to emit.
+    assert "exactly" not in low
+
+
+def test_decompose_methodology_is_read_from_shape_into_the_decompose_instruction():
+    shape = load_shape("deep-research")
+    # No shape doctrine supplied → BYTE-IDENTICAL to the baked default (offline / no-shape
+    # path is unchanged — no regression off the served route). Mirrors completeness_stop.
+    assert _decompose_instruction(None) == _DECOMPOSE_INSTRUCTION
+    assert _decompose_instruction("") == _DECOMPOSE_INSTRUCTION
+    # Shape doctrine supplied → the default breadth sentence is REPLACED by the shape's text,
+    # so the breadth SEMANTICS now live in the shape file, not this hard-coded prompt.
+    woven = _decompose_instruction(shape.decompose_methodology)
+    assert _DEFAULT_DECOMPOSE_SENTENCE not in woven
+    assert "DEFINED IN THE DEEP-RESEARCH SHAPE" in woven
+    assert shape.decompose_methodology.strip()[:40] in woven
+    # everything ELSE in the decompose instruction is preserved (only the breadth clause changed).
+    assert "expand_branch" in woven and "DECOMPOSE the goal" in woven
+
+
+def test_decompose_node_shows_the_shape_breadth_doctrine_to_the_model():
+    # The served seam: run_decompose_node(decompose_criteria=shape.decompose_methodology) must
+    # put the shape's breadth doctrine in front of the model (the prompt it actually sees), and
+    # the model's REAL expand_branch calls mutate the tree (no fabricated decomposition).
+    shape = load_shape("deep-research")
+    transport = _ScriptedTransport([
+        '{"tool":"expand_branch","args":{"question":"timeline of the June 2025 events"}}',
+        '{"tool":"expand_branch","args":{"question":"casualty and damage figures"}}',
+        '{"tool":"expand_branch","args":{"question":"causes and regional drivers"}}',
+        "DECOMPOSED: three scoped facets.",
+    ])
+    tree = Tree(fan_out=5)
+    branches = asyncio.run(run_decompose_node(
+        transport, goal=GOAL, tree=tree, config=TreeConfig(decide_max_turns=6),
+        decompose_criteria=shape.decompose_methodology,
+    ))
+    # the model authored THREE scoped facets via real tree mutation (breadth front-loaded).
+    assert len(branches) == 3
+    # The model was shown the shape-defined breadth doctrine, not the baked default sentence.
+    prompt = transport.calls[0]
+    assert "DEFINED IN THE DEEP-RESEARCH SHAPE" in prompt
+    assert _DEFAULT_DECOMPOSE_SENTENCE not in prompt

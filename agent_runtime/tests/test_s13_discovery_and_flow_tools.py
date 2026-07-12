@@ -119,22 +119,29 @@ def _desc(name: str) -> str:
 
 
 def test_tree_tool_descriptions_carry_the_research_flow():
-    # IDENTIFY/EXPAND along what/why/when/how lives in expand_branch
+    # d184 — the descriptions CARRY the canonical loop (identify concerns -> expand a missing
+    # meaning along what/why/when/how -> prune-collapse no-meaning -> stop when all settled).
     expand = _desc("expand_branch").lower()
-    assert "expand" in expand and "gap" in expand
+    assert "expand" in expand
     for facet in ("what", "why", "when", "how"):
         assert facet in expand
-    # PRUNE bad leads
+    # the expand_branch CONTRACT (d184): expanding COMMITS to a gathered round, so a pass that
+    # expands cannot also stop — the description PROMISES the gather (the engine then honors it).
+    assert "round" in expand and "commit" in expand
+    assert "cannot expand and stop" in expand and "still work to gather" in expand
+    # PRUNE — COLLAPSE a concern that added no meaning (a real, reachable move every layer).
     prune = _desc("prune_branch").lower()
-    assert "prune" in prune and ("redundant" in prune or "off-thesis" in prune)
-    # STOP when sufficient (completeness-driven, not arbitrary depth)
+    assert "prune" in prune and "collapse" in prune
+    assert "redundant" in prune or "off-thesis" in prune
+    # STOP — only when every concern is SETTLED-noted OR COLLAPSED and no new concern remains.
     stop = _desc("stop_research").lower()
-    assert "stop" in stop and "sufficient" in stop
-    assert "gap" in stop or "blank" in stop
+    assert "stop" in stop and "settled" in stop and "collapse" in stop
+    assert "concern" in stop
 
 
-def test_tree_section_tools_shape_report_from_findings():
-    add = _desc("add_section").lower()
-    assert "section" in add and ("grounded" in add or "emerge" in add)
-    drop = _desc("drop_section").lower()
-    assert "drop" in drop and "support" in drop
+def test_tree_section_tools_removed_from_offered_specs():
+    # s14/a12 (d154) — the add_section / drop_section OUTLINE tools were REMOVED from the served
+    # decision-node surface (they were a dead, silently-dropped source_id channel). They must no
+    # longer appear in the offered native tool schemas.
+    names = {spec["function"]["name"] for spec in TREE_TOOL_SPECS}
+    assert "add_section" not in names and "drop_section" not in names

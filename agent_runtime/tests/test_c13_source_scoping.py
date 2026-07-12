@@ -21,7 +21,6 @@ from agent_runtime.factory import AbstractPlanFactory, PlanDAG, PlanNode
 from agent_runtime.plan_tools import PlanBuilder
 from agent_runtime.runtime import SubAgent
 from agent_runtime.synth_tools import (
-    assemble_html_spa,
     collect_fetched_sources_full,
     render_scoped_sources,
     render_source_catalog,
@@ -32,6 +31,12 @@ from reactive_tools import EventPlane, ToolHook, register_agentic_tools
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# d242 TRUE self-select: a raw-emission synthesis/file loop starts TOOL-LESS and runs a
+# SELF-SELECT FRONT — the model loads the 'file' bundle (then replies READY) before it
+# authors. Scripts therefore lead with this exchange so the front consumes it, not content.
+_SS_FILE = '{"tool": "get_bundles", "args": {"name": "file"}}'
 
 
 _SOURCES = [
@@ -154,6 +159,61 @@ def test_scoped_node_suppresses_full_index_and_blocks_only_its_sources():
     assert "https://bbc.com/iran" not in block and "https://cfr.org/timeline" not in block
 
 
+_BIG_SOURCES = [
+    {"title": "BBC", "url": "https://bbc.com/iran",
+     "markdown": "# Oil\n" + ("Brent crude rose above $100 after the strike. " * 400)},
+    {"title": "Al Jazeera", "url": "https://aljazeera.com/losses",
+     "markdown": "# Losses\n" + ("Each side reported military losses overnight. " * 400)},
+    {"title": "CFR", "url": "https://cfr.org/timeline",
+     "markdown": "# Timeline\n" + ("A detailed timeline of the escalation. " * 400)},
+]
+
+
+def test_d170_scoped_writer_block_pushes_full_figure_bearing_body_not_a_starving_lead():
+    # d170 (supersedes d156 FOR THE WRITER): the raw-file writer CANNOT emit tool calls (d49),
+    # so it cannot PULL source text on demand — its turn is therefore PUSHED the FULL
+    # figure-bearing BODY of its (few) assigned sources (the good-run calibration, trace
+    # bc7cef17), NOT a compact index + a ~2400-char lead, which STARVED the writer to a thin
+    # report (the d167 mis-calibration). The REVIEWER (full_index, which CAN call load_source)
+    # still gets the compact index — see the next test.
+    node = PlanNode(id="s1", task="Military Losses", tool="file_write", source_ids=(2,))
+    sub = _sub(node, chain_sources=_BIG_SOURCES)
+    block = sub._scoped_source_block()
+    assert "[S2]" in block and "https://aljazeera.com/losses" in block
+    # the REAL verbatim body is pushed (so the writer has the figures to quote), not a stub.
+    assert "military losses overnight" in block
+    # only THIS section's assigned source — sibling urls are not dumped into the writer turn.
+    assert "https://bbc.com/iran" not in block and "https://cfr.org/timeline" not in block
+    # NOT starved: carries a substantial slice of the body (far more than the d167 ~2400 lead).
+    assert len(block) > 8000
+    # still BOUNDED by CONSTRUCTION: a single section's feed stays well under the num_ctx
+    # char envelope (the d162 no-truncation guarantee), never the all-bodies 137KB dump.
+    assert len(block) < int(32768 * 3.5 * 0.6)
+
+
+def test_d156_reviewer_full_index_lists_all_sids_for_citation_resolution():
+    # d156 citation-persistence root: the anchored reviewer resolves against EVERY source's
+    # [S#] (full_index) so a writer's valid cross-section citation never falsely "does not
+    # resolve" and gets deleted — even though this review node is scoped to a subset.
+    node = PlanNode(id="s2_review", task="Military Losses", tool="file_update", source_ids=(2,))
+    sub = _sub(node, chain_sources=_BIG_SOURCES)
+    full = sub._scoped_source_block(full_index=True)
+    # the MAP lists all three [S#] for resolution
+    assert "[S1]" in full and "[S2]" in full and "[S3]" in full
+    # the writer-scoped block (no full_index) maps ONLY the assigned id
+    scoped = sub._scoped_source_block()
+    assert "[S1]" not in scoped and "[S3]" not in scoped and "[S2]" in scoped
+
+
+def test_d157_research_read_is_bounded_to_a_compact_chunk():
+    # d157: the per-source research.react read is bounded to a compact relevant CHUNK so a
+    # multi-turn react loop's accumulated input stays small (the full body is still stored).
+    from agent_runtime.runtime import RESEARCH_READ_CHUNK_CHARS
+    node = PlanNode(id="r1", task="oil prices")
+    sub = SubAgent(node, transport=FakeTransport([]), chunked_read=True)
+    assert sub._read_content_budget() <= RESEARCH_READ_CHUNK_CHARS
+
+
 def test_unscoped_node_keeps_full_upstream_index_and_no_scoped_block():
     # the degenerate 1-section / single-synth path: no source_ids → full index, no scoped
     # block (byte-identical to the pre-c13 behaviour; no regression).
@@ -165,38 +225,6 @@ def test_unscoped_node_keeps_full_upstream_index_and_no_scoped_block():
     out = sub._with_source_index("USER")
     assert "https://bbc.com/iran" in out  # full index appended
     assert sub._scoped_source_block() == ""  # no scoping when unscoped / no chain_sources
-
-
-# --------------------------------------------------------------------------- #
-# 6b) assemble_html_spa — wrap a per-section fragment into ONE navigable SPA
-# --------------------------------------------------------------------------- #
-def test_assemble_spa_wraps_fragment_and_builds_nav_from_headings():
-    frag = (
-        "<h2>Military Losses</h2><p>14 batteries. "
-        "<a href='https://aljazeera.com/losses'>src</a></p>"
-        "<h2>Economic Impact</h2><p>Brent $104.</p>"
-    )
-    spa = assemble_html_spa(frag, title="US-Iran")
-    low = spa.lower()
-    # exactly one well-formed document wrapper
-    assert low.count("<!doctype") == 1 and low.count("<html") == 1
-    assert low.count("</html>") == 1 and low.count("<body") == 1
-    # a nav built FROM the model's own headings, linking to injected anchors
-    assert "<nav" in low
-    assert 'href="#military-losses"' in low and 'href="#economic-impact"' in low
-    assert 'id="military-losses"' in low and 'id="economic-impact"' in low
-    # real content + the model's cited URL are PRESERVED verbatim (no truncation)
-    assert "14 batteries" in spa and "https://aljazeera.com/losses" in spa
-
-
-def test_assemble_spa_idempotent_on_existing_wrapper_and_noop_on_non_html():
-    # an already-wrapped doc gets a nav but NOT a second wrapper
-    full = "<!DOCTYPE html><html><head><title>x</title></head><body><h2>A</h2><p>z</p></body></html>"
-    out = assemble_html_spa(full)
-    assert out.lower().count("<html") == 1 and out.lower().count("</html>") == 1
-    assert "<nav" in out.lower()
-    # a heading-less fragment / non-HTML string is returned unchanged (no nav forced)
-    assert assemble_html_spa("just some markdown text") == "just some markdown text"
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +242,8 @@ def test_scoped_synthesis_writes_section_to_real_file(tmp_path):
     section = "## Military Losses\nEach side reported losses. [Al Jazeera](https://aljazeera.com/losses)"
     sub = SubAgent(
         node,
-        transport=FakeTransport([section, "<<DONE>>"]),
+        # d242: the raw-loop SELF-SELECT front loads 'file' (then READY) before authoring.
+        transport=FakeTransport([_SS_FILE, "READY", section, "<<DONE>>"]),
         hook=_hook(tmp_path),
         chain_sources=_SOURCES,
     )
@@ -226,62 +255,66 @@ def test_scoped_synthesis_writes_section_to_real_file(tmp_path):
     assert "https://aljazeera.com/losses" in text  # the real cited URL landed
 
 
+# RP-3c (d330): the section 8 tests (MS3 R2 section-scoped PER-PAGE verify inside the write
+# loop) are RETIRED with the engine verify/revise lane they drove (``verify_lane`` gone). The
+# per-section no-fab self-review MOVED to the definition-layer writer doctrine; source-SCOPING
+# (which sources reach each section) is unchanged and still covered by the tests above.
+
+
 # --------------------------------------------------------------------------- #
-# 8) MS3 R2 — section-scoped PER-PAGE verify grounds THIS node's section inside
-#    the write loop (not bypassed by the whole-doc >9000-char cap) and rewrites it.
+# SB-6/d299/d301 — a served REPORT WRITE node is now TOOL-LESS and routes to the EXISTING
+# served writer ``_run_file_delivery`` -> ``_run_raw_file_loop`` (which SELF-SELECTS
+# 'file'+'research_read') by DELIVERY-CONTEXT DATA: the runtime's ``deliverable_path``
+# (write-phase EXCLUSIVE), NOT a tool/role/spec stamp and NOT ``chain_sources`` (a follow-up
+# READER also carries chain_sources to resolve prior sources — keying the route on it was
+# over-broad, d301). The ``_run_tool_calling_writer`` PULLER is prod-DEAD (callsite removed) —
+# flagged for SB-7 cleanup. A write node WITHOUT deliverable_path that carries an EXPLICIT
+# file_write tool (the legacy acyclic web_search->file_write path) still routes to
+# ``_run_file_delivery`` via its authored tool; the scoped block is EMPTY → no body push.
 # --------------------------------------------------------------------------- #
-def _read_written(tmp_path, written: str) -> str:
-    p = tmp_path / written
-    return p.read_text(encoding="utf-8") if not p.is_absolute() else open(written, encoding="utf-8").read()
+def test_part_b_served_write_node_routes_to_file_delivery_by_deliverable_path(tmp_path):
+    sentinel = object()
 
+    async def _puller(self, inputs):
+        self._routed = "puller"
+        return sentinel
 
-def test_section_verify_grounds_or_removes_unbacked_claim_in_the_write_loop(tmp_path):
-    """With verify_lane ON, the section the node wrote is fact-checked against ITS scoped
-    sources INSIDE the loop: an unbacked claim is flagged, a revise turn removes it, and
-    the corrected section is re-persisted — so a long report is grounded per-section even
-    though the whole-doc verify is bypassed past _VERIFY_REVISE_MAX_CHARS."""
-    node = PlanNode(id="s1", task="Write the Military Losses section to report.md",
-                    role="synthesizer", source_ids=(2,))
-    # The writer emits the real Al-Jazeera claim PLUS a fabricated statute claim.
-    section = ("## Military Losses\nEach side reported losses [Al Jazeera]"
-               "(https://aljazeera.com/losses). Under the fictional Pact of 1887 the "
-               "strike was lawful.")
-    grounded = "## Military Losses\nEach side reported losses [Al Jazeera](https://aljazeera.com/losses)."
-    sub = SubAgent(
-        node,
-        # writer: section, <<DONE>>; then per-section verify: flag → revise → re-verify ok
-        transport=FakeTransport([
-            section,
-            "<<DONE>>",
-            '{"verdict":"revise","unbacked":[{"claim":"Pact of 1887","reason":"no source"}]}',
-            grounded,
-            '{"verdict":"ok"}',
-        ]),
-        hook=_hook(tmp_path),
-        chain_sources=_SOURCES,
-        verify_lane=True,
-    )
-    raw, parsed, _v, _r = _run(sub._run_synthesis(None, "Write the report."))
-    written = parsed.get("written_path")
-    assert written is not None
-    text = _read_written(tmp_path, written)
-    assert "Pact of 1887" not in text              # the fabrication was ground-or-removed
-    assert "https://aljazeera.com/losses" in text  # the real grounded content was kept
+    async def _raw(self, inputs):
+        self._routed = "raw"
+        return sentinel
 
+    # WITH a deliverable_path (write-phase delivery-context) → the served writer
+    # (_run_file_delivery). The node is TOOL-LESS (SB-6: no engine file_write stamp); the dead
+    # PULLER is never taken. chain_sources is fed for source resolution, but the ROUTE is on
+    # deliverable_path (d301).
+    node = PlanNode(id="w1", task="write report.html", role="worker", source_ids=(1,))
+    sub = SubAgent(node, transport=FakeTransport([]), hook=_hook(tmp_path),
+                   chain_sources=_SOURCES, deliverable_path=str(tmp_path / "report.html"))
+    sub._run_tool_calling_writer = _puller.__get__(sub)
+    sub._run_file_delivery = _raw.__get__(sub)
+    assert _run(sub.run({})) is sentinel
+    assert sub._routed == "raw"  # served writer (_run_file_delivery), NOT the dead puller
+    # the writer's source feed is the COMPACT INDEX (full_index) — no full-body push.
+    idx = sub._scoped_source_block(full_index=True)
+    assert idx and "june" not in idx.lower()  # ids/urls only, not the source body text
 
-def test_section_verify_is_default_off_byte_identical(tmp_path):
-    """verify_lane OFF (the default) → NO verify turn fires; the section is written
-    verbatim. The extra scripted verify responses are never consumed."""
-    node = PlanNode(id="s1", task="Write the Military Losses section to report.md",
-                    role="synthesizer", source_ids=(2,))
-    section = "## Military Losses\nLosses reported [AJ](https://aljazeera.com/losses). Fictional claim X."
-    sub = SubAgent(
-        node,
-        transport=FakeTransport([section, "<<DONE>>", '{"verdict":"revise"}', "should-not-be-used"]),
-        hook=_hook(tmp_path),
-        chain_sources=_SOURCES,
-        verify_lane=False,
-    )
-    raw, parsed, _v, _r = _run(sub._run_synthesis(None, "Write the report."))
-    text = _read_written(tmp_path, parsed.get("written_path"))
-    assert "Fictional claim X." in text  # untouched: no verify lane ran
+    # A FOLLOW-UP READER carries chain_sources but NO deliverable_path → it must NOT be routed to
+    # the writer (d301 over-broad fix): it falls through to the unified loop (here, the generic
+    # produce path, since FakeTransport emits nothing) — it does NOT write a file.
+    node_r = PlanNode(id="wr", task="answer from prior research", role="worker", source_ids=(1,))
+    sub_r = SubAgent(node_r, transport=FakeTransport([]), hook=_hook(tmp_path),
+                     chain_sources=_SOURCES)  # chain_sources but NO deliverable_path
+    sub_r._run_tool_calling_writer = _puller.__get__(sub_r)
+    sub_r._run_file_delivery = _raw.__get__(sub_r)
+    _run(sub_r.run({}))
+    assert getattr(sub_r, "_routed", None) is None  # NOT routed to any writer loop
+
+    # WITHOUT deliverable_path but WITH an explicit file_write tool (legacy acyclic path) → the raw
+    # loop via the authored tool; scoped block is EMPTY (no push).
+    node2 = PlanNode(id="w2", task="write hello.txt", role="worker", tool="file_write")
+    sub2 = SubAgent(node2, transport=FakeTransport([]), hook=_hook(tmp_path))
+    sub2._run_tool_calling_writer = _puller.__get__(sub2)
+    sub2._run_file_delivery = _raw.__get__(sub2)
+    assert _run(sub2.run({})) is sentinel
+    assert sub2._routed == "raw"
+    assert sub2._scoped_source_block() == ""  # no sources → no body push on the raw path

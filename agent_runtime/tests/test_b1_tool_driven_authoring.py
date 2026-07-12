@@ -78,7 +78,6 @@ def _planner(replies: Sequence[str], tmp_path, **kw) -> IncrementalPlanner:
         tool_names=[t["name"] for t in _TOOL_CATALOG],
         shape_name="linear-plus-modular-parallel",
         shape_description="parallel gather steps, then a sequential combine→deliver chain",
-        default_research_spec=DEEP_RESEARCH_SPEC,
         **kw,
     )
 
@@ -188,11 +187,12 @@ def test_builder_drops_unknown_vocab_but_keeps_depends_on(tmp_path):
 
 
 def test_legacy_role_is_coerced_to_valid_node_role(tmp_path):
-    # d48 (s9/c5): the node-role vocab is bounded to {worker, synthesizer}. A small
-    # model still occasionally emits a RETIRED legacy role (research/critic/.../verify
-    # /synthesis) — the authoring boundary MUST coerce it (research/critic/reviewer/
-    # verify -> worker; synthesis -> synthesizer; unknown -> worker) so a role-slip can
-    # never crash the DAG factory (which rejects an unknown role).
+    # d213/d215: the in-plan node-role vocab is {researcher, worker, reviewer}. A small
+    # model still occasionally emits a deep-research POSITION word or a stage name — the
+    # authoring boundary MUST normalise it to a valid in-plan node role (research ->
+    # researcher; critic/verify/synthesis -> worker; planner -> worker; unknown ->
+    # worker) so a role-slip can never crash the DAG factory (which rejects an unknown
+    # role). The terminal SYNTHESIZER stage is framework-built, never add_step'd.
     b = PlanBuilder(spec_names=[], tool_names=["web_search"], shape_name="linear",
                     max_nodes=12)
     b.dispatch("seed_plan", {})
@@ -201,12 +201,16 @@ def test_legacy_role_is_coerced_to_valid_node_role(tmp_path):
     b.dispatch("add_step", {"task": "deliver", "role": "synthesis", "depends_on": ["n2"]})
     b.dispatch("add_step", {"task": "weird", "role": "made-up", "depends_on": ["n3"]})
     roles = [n["role"] for n in b.nodes]
-    assert roles == ["worker", "worker", "synthesizer", "worker"]
-    # the coerced records build VALID PlanNodes — no PlanError on the retired vocab
-    # (PlanNode.__post_init__ rejects any role outside {worker, synthesizer}).
-    from agent_runtime.factory import PlanNode
+    assert roles == ["researcher", "worker", "worker", "worker"]
+    # the normalised records build VALID PlanNodes — no PlanError on the legacy vocab
+    # (PlanNode.__post_init__ rejects any role outside VALID_ROLES).
+    from agent_runtime.factory import PlanNode, VALID_ROLES
     built = [PlanNode(id=n["id"], task=n["task"], role=n["role"]) for n in b.nodes]
-    assert {n.role for n in built} <= {"worker", "synthesizer"}
+    assert {n.role for n in built} <= VALID_ROLES
+
+    # d213/d215: a first-class reviewer role passes through unchanged (default last step).
+    b.dispatch("add_step", {"task": "review it", "role": "reviewer", "depends_on": ["n4"]})
+    assert b.nodes[-1]["role"] == "reviewer"
 
 
 def test_unknown_tool_call_is_a_soft_observation_not_a_crash(tmp_path):

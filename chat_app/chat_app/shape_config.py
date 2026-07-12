@@ -288,12 +288,18 @@ class ShapeConfigService:
         override: Optional[int],
         depth_override: Optional[int] = None,
     ) -> dict[str, Any]:
-        """One shape's full structure + its overrides + the effective round count."""
+        """One shape's full structure + its overrides + the effective round count.
+
+        NOTE (s16/a3 d247/d248): ``as_dict`` emits ``round_roles``/``final_roles`` as a
+        TRANSITIONAL empty-[] shim only — the shape no longer has a fixed round topology
+        (the planner/grower authors it). The Shapes-screen redesign (d248, deferred to the
+        held UI step s17) drops those keys; until then this view degrades the screen to
+        "non-iterative" gracefully rather than crashing on a missing key."""
         view = spec.as_dict()
         view["max_iter_override"] = override
         # The cap the runtime will actually run: the override clamped to hard_cap
-        # (or, with no override, the shape's own default) — the single number the
-        # s3 deep-research unroll honors.
+        # (or, with no override, the shape's own default) — the depth ceiling the
+        # deep-research grow loop honors.
         view["effective_max_iter"] = spec.effective_max_iter(override)
         # s13/B6: the per-shape research-tree DEPTH override (or None = env baseline).
         # The run_plan_chain consumer clamps it to the hard ceiling at read; the view

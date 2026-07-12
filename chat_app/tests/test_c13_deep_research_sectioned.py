@@ -1,54 +1,24 @@
 """s9/c13 — deep-research → SHARED per-section bounded-SPA write phase (d55/d56/d57).
 
-The acceptance scenario ("detailed HTML report on the 2025 US-Iran conflict … cite
-sources") routes to ``_run_deep_research`` (``wants_file`` extracted False), so the
-SWA fix MUST land on that path. These tests cover the deterministic, transport-free
-seams of that wiring:
+These tests cover the deterministic, transport-free seams of that wiring:
 
-* the ROUTING gate (``_is_report_deliverable``) — a detailed REPORT deliverable is
-  sectioned; a bare 'research X in depth' inline answer and the headlines path are
-  NOT (no regression);
 * ``_research_only_dag`` — the unrolled deep-research DAG minus its terminal
   synthesis/verify (the per-section write phase replaces synthesis), still valid;
 * ``_collect_chain_sources`` — the run's global fetched-source list (the write
   planner's source catalog).
-"""
-from dataclasses import dataclass
 
+s15 ROUTING PURITY (d148/d151): the old ``_is_report_deliverable`` routing-gate
+regex is RETIRED — the deep-research shape now routes by the LLM-SELECTED shape
+(``run_agentic`` → :func:`run_plan_chain`), with no query-content gate on the served
+path. The sectioned-vs-inline sub-branch on the test-only ``_run_deep_research``
+sibling is an explicit ``sectioned`` parameter now, not a query sniff, so there is no
+content-gate left to unit-test here.
+"""
 from agent_runtime.factory import PlanDAG, PlanNode
 from chat_app.agentic import (
     _collect_chain_sources,
-    _is_report_deliverable,
     _research_only_dag,
 )
-
-
-@dataclass
-class _Sel:
-    wants_file: bool = False
-    multi_page: bool = False
-
-
-# --------------------------------------------------------------------------- #
-# routing gate — detailed REPORT deliverable vs inline research / headlines
-# --------------------------------------------------------------------------- #
-def test_report_deliverable_gate_fires_on_a_detailed_report_request():
-    # the acceptance prompt names an HTML report → sectioned (even with wants_file False)
-    assert _is_report_deliverable(
-        "Write a detailed HTML report on the 2025 US-Iran conflict and cite sources",
-        _Sel(wants_file=False),
-    )
-    # a markdown/document deliverable also qualifies
-    assert _is_report_deliverable("a thorough markdown document on solar power", _Sel())
-    # the model's own file/multi-page intent qualifies regardless of wording
-    assert _is_report_deliverable("an exhaustive write-up", _Sel(multi_page=True))
-
-
-def test_report_deliverable_gate_excludes_inline_research_and_headlines():
-    # bare 'research X in depth' with NO report/file cue → inline answer (NOT sectioned)
-    assert not _is_report_deliverable("research the topic in depth", _Sel())
-    # the headlines path is not even detailed; but it also carries no report cue
-    assert not _is_report_deliverable("top news headlines for today", _Sel())
 
 
 # --------------------------------------------------------------------------- #

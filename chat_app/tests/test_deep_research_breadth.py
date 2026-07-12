@@ -35,11 +35,15 @@ def test_breadth_is_env_configurable(monkeypatch):
 
 
 def test_deep_research_sites_wire_the_breadth_knob_not_a_literal():
-    # The INLINE deep-research path still wires the configurable knob directly; the
-    # legacy hard-wired ``read_search_max_fetch=3`` must not appear on it.
+    # d178 (s15 thread-2) — SECTIONED-WRITE UNIFICATION. The inline whole-doc deep-research
+    # runtime was RETIRED with the monolithic ``synthesis.react_file`` fold; ``_run_deep_research``
+    # now UNCONDITIONALLY delegates to the per-section sectioned path. So the breadth knob lives
+    # ONLY on the live (generic / sectioned) research path now — assert it there, and assert the
+    # monolithic fold (an inline AgentRuntime construction + a whole-doc fetch literal) is gone.
     inline_src = inspect.getsource(agentic._run_deep_research)
-    assert "read_search_max_fetch=DEEP_RESEARCH_FETCH_BREADTH" in inline_src
-    assert "read_search_max_fetch=3" not in inline_src
+    assert "_run_deep_research_sectioned(" in inline_src
+    assert "AgentRuntime(" not in inline_src
+    assert "read_search_max_fetch=" not in inline_src
 
     # P2-5c (d135 FLAG-FREE END-STATE) — the SECTIONED (report) path now routes PHASE-1
     # research through the GENERIC declarative-unroll + AgentRuntime growable engine
@@ -87,10 +91,12 @@ def test_research_num_ctx_is_env_configurable(monkeypatch):
 
 
 def test_deep_research_sites_size_num_ctx_off_the_d22_overflow_regime():
-    # The INLINE deep-research runtime runs at the sized num_ctx constant; the bare
-    # ``num_ctx=16384`` literal (the d22 overflow window at breadth=10) is gone.
+    # d178 (s15 thread-2) — the inline deep-research runtime was RETIRED with the monolithic
+    # fold, so the num_ctx knob now lives on the generic research phase (the live PHASE-1
+    # engine). ``_run_deep_research`` just delegates to sectioned; the bare ``num_ctx=16384``
+    # literal (the d22 overflow window at breadth=10) must appear NOWHERE.
     inline_src = inspect.getsource(agentic._run_deep_research)
-    assert '"num_ctx": DEEP_RESEARCH_NUM_CTX' in inline_src
+    assert "AgentRuntime(" not in inline_src
     assert '"num_ctx": 16384' not in inline_src
 
     # P2-5c (d135 FLAG-FREE END-STATE) — the SECTIONED (report) path runs PHASE-1 through

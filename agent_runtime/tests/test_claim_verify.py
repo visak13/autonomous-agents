@@ -1,23 +1,22 @@
-"""s9/N5 (d62/c15 part-e): the REASONING no-fabrication VERIFICATION lane.
+"""s9/N5 (d62/c15 part-e): the REASONING no-fabrication verify surface.
 
-The PRIMARY no-fabrication mechanism: after gather + write, re-check every deliverable
-claim against the FETCHED sources via claim->source PROVENANCE and force the model to
-GROUND or REVISE/REMOVE any unbacked claim (the c13r B2 narrative-fabrication gap, e.g.
-the fabricated ``17 USC 107(5)`` / ``CTEA-1998``). REASONING, NEVER a regex/string
-content-filter (d14/d48): the model judges groundedness AND rewrites; the lane only
-orchestrates the turns. Fully OFFLINE (a fake verifier / scripted transport).
+RP-3c (d330): the flag-gated engine VERIFY-AND-REVISE self-review lane (``verify_and_revise``
+gated on ``verify_lane``) is RETIRED — the model self-review MOVED to the definition-layer
+writer doctrine (``_COHERENT_ARTIFACT_DOCTRINE`` self-review-before-finish). What remains and
+is exercised here is the MODEL-DRIVEN verify surface: ``verify_claims`` (the one reasoning
+claim->source verify turn a node self-selects via the ``cross_verify`` research tool), the
+verdict parse, the source-provenance render, and the ``research_answered_from_memory`` signal
+that powers the DE-FLAGGED (always-on, output-agnostic) no-fab research gather-more gate.
+Fully OFFLINE (a fake verifier / scripted transport).
 
-* UNIT — the pure lane (a fake async verifier): the 0-fetch answered-from-memory
+* UNIT — the pure verify turn (a fake async verifier): the 0-fetch answered-from-memory
   PROVENANCE signal; the provenance render; the verdict parse (ok / revise / fenced /
-  unreadable); ``verify_claims`` (grounded / unbacked / empty doc); ``verify_and_revise``
-  (clean → untouched; unbacked → ground-or-remove rewrite; the retention floor rejects a
-  truncated/over-pruned rewrite; an unreadable verdict surfaces without stripping;
-  prompts are grounded-only).
-* INTEGRATION — the runtime seams with ``verify_lane=True``: (a) a SYNTHESIS deliverable
-  carrying a fabricated claim is re-checked, the model flags it, a revise turn grounds-or-
-  removes it, and the corrected file is re-persisted (OFF default → byte-identical, no
-  verify turn); (b) a RESEARCH node that answers FROM MEMORY (0 fetches) is forced to
-  GATHER-MORE before its findings are accepted (OFF default → the memory answer stands).
+  unreadable); ``verify_claims`` (grounded / unbacked / empty doc).
+* INTEGRATION — the RESEARCH gather-more gate (runtime seam): a research-bundle node that
+  answers FROM MEMORY (0 fetches) is force-gathered to read a real source before its
+  findings are accepted — now DE-FLAGGED (no ``verify_lane`` boolean); a worker that did
+  NOT self-select the research bundle answering from memory is NEVER force-gathered (the
+  SB-RR d293 narrow gate survives the de-flag).
 """
 from __future__ import annotations
 
@@ -26,20 +25,17 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from llm_framework import ChatResult, FakeTransport
+from llm_framework import ChatResult
 
 from agent_runtime.claim_verify import (
     UnbackedClaim,
     parse_verify_verdict,
     render_sources_for_verify,
     research_answered_from_memory,
-    verify_and_revise,
     verify_claims,
 )
-from agent_runtime.factory import PlanDAG, PlanNode
-from agent_runtime.runtime import AgentRuntime, SubAgent
-from agent_runtime.synth_tools import DONE_SENTINEL
-from reactive_tools import EventPlane, ToolHook, register_agentic_tools
+from agent_runtime.factory import PlanNode
+from agent_runtime.runtime import SubAgent
 
 
 def _run(coro):
@@ -155,182 +151,7 @@ def test_verify_claims_flags_unbacked_and_passes_clean():
 
 
 # --------------------------------------------------------------------------- #
-# UNIT — verify_and_revise (the GROUND-or-REVISE/REMOVE checkpoint)
-# --------------------------------------------------------------------------- #
-_REAL = (
-    "On June 14 Iran fired 180 missiles, the UN reported. Twelve people were killed. "
-    "Damage assessments are still ongoing across the affected provinces. "
-)
-_FAB = "Under 17 USC 107(5), enacted by the CTEA of 1998, the strike was deemed lawful. "
-
-
-def test_verify_and_revise_clean_doc_is_untouched():
-    """A grounded deliverable is returned UNCHANGED — never nagged or stripped (the
-    steer's 'do not strip valid content'); the revise turn never fires."""
-    async def _fake(prompt: str) -> str:
-        assert "REPORT TO CORRECT" not in prompt  # no revise on a clean doc
-        return '{"verdict":"ok"}'
-    res = _run(verify_and_revise(_REAL, _SOURCES, verify=_fake))
-    assert res.grounded is True and res.revised is False and res.document == _REAL
-
-
-def test_verify_and_revise_grounds_or_removes_unbacked():
-    """An unbacked claim is flagged, then a revise turn REMOVES it (grounded-only — never
-    invents), and the re-verify confirms grounded. The corrected doc keeps the real
-    content and drops the fabrication."""
-    async def _fake(prompt: str) -> str:
-        if "REPORT TO CORRECT" in prompt:
-            return _REAL  # ground-or-remove → the fabrication is gone, real content kept
-        # verify: flag while the fabrication is present, pass once it's gone
-        if "17 USC 107(5)" in prompt:
-            return '{"verdict":"revise","unbacked":[{"claim":"17 USC 107(5)","reason":"no source"}]}'
-        return '{"verdict":"ok"}'
-
-    res = _run(verify_and_revise(_REAL + _FAB, _SOURCES, verify=_fake, max_passes=2))
-    assert res.revised is True and res.grounded is True
-    assert "17 USC 107(5)" not in res.document and "180 missiles" in res.document
-
-
-def test_verify_and_revise_rejects_truncated_rewrite():
-    """SAFEGUARD: a revise turn that returns a catastrophically SHORT doc (a truncated /
-    over-pruned rewrite) is REJECTED — the original stands, the deliverable is never
-    blanked or gutted (the 'don't blank the deliverable' floor)."""
-    async def _fake(prompt: str) -> str:
-        if "REPORT TO CORRECT" in prompt:
-            return "x."  # a truncated rewrite, far below the retention floor
-        return '{"verdict":"revise","unbacked":[{"claim":"17 USC 107(5)","reason":"no source"}]}'
-
-    res = _run(verify_and_revise(_REAL + _FAB, _SOURCES, verify=_fake, max_passes=1))
-    assert res.revised is False and res.document == _REAL + _FAB  # original retained
-    assert res.trace[-1].get("rejected_short") is True
-
-
-def test_verify_and_revise_unreadable_verdict_surfaces_without_stripping():
-    """An UNREADABLE verify reply surfaces the failure (grounded False) but NEVER strips
-    or rewrites the document on noise."""
-    async def _fake(prompt: str) -> str:
-        assert "REPORT TO CORRECT" not in prompt  # never revise on an unreadable verdict
-        return "honestly it reads fine"
-    res = _run(verify_and_revise(_REAL, _SOURCES, verify=_fake))
-    assert res.grounded is False and res.revised is False and res.document == _REAL
-
-
-def test_revise_prompt_is_grounded_only_anti_fabrication():
-    """The revise turn mandates ground-or-remove and FORBIDS inventing a fact/figure/
-    citation to keep a claim (d60 no-fabrication)."""
-    captured: list[str] = []
-
-    async def _fake(prompt: str) -> str:
-        captured.append(prompt)
-        if "REPORT TO CORRECT" in prompt:
-            return _REAL
-        return ('{"verdict":"revise","unbacked":[{"claim":"17 USC 107(5)","reason":"x"}]}'
-                if "17 USC 107(5)" in prompt else '{"verdict":"ok"}')
-
-    _run(verify_and_revise(_REAL + _FAB, _SOURCES, verify=_fake, max_passes=2))
-    revise_prompt = next(p for p in captured if "REPORT TO CORRECT" in p)
-    assert "may NOT invent" in revise_prompt
-    assert "REMOVING it" in revise_prompt and "GROUNDING it" in revise_prompt
-
-
-# --------------------------------------------------------------------------- #
-# INTEGRATION — the SYNTHESIS deliverable verify lane (runtime seam)
-# --------------------------------------------------------------------------- #
-def _hook(tmp_path) -> ToolHook:
-    hook = ToolHook(EventPlane())
-    register_agentic_tools(hook, file_base=tmp_path, cron_data_dir=tmp_path)
-    return hook
-
-
-_VERIFY_SOURCES = [
-    {"title": "UN News", "url": "https://news.un.org/iran",
-     "source_trust": "secondary", "markdown": "Iran fired 180 missiles on June 14."},
-]
-# A real-content deliverable PLUS a fabricated legal claim no source backs (the B2 gap).
-_REPORT_REAL = (
-    "# Iran-Israel Escalation\n\n"
-    "On June 14 Iran fired 180 missiles, the UN reported. Twelve people were killed in "
-    "the exchange. Damage assessments continue across several provinces, with officials "
-    "warning of further escalation in the days ahead.\n\n"
-)
-_REPORT_FAB = "Legally, under 17 USC 107(5) enacted by the CTEA of 1998, the strike was deemed lawful.\n"
-
-
-def _synth_dag() -> PlanDAG:
-    return PlanDAG(
-        nodes=[PlanNode(id="s1", task="Write a report on the Iran escalation to iran.md.",
-                        role="synthesizer")],
-        goal="Write a report on the Iran escalation.",
-    )
-
-
-def _synth_reply():
-    """A reply fn: write the report (real + fabricated), then serve verify/revise turns.
-
-    The verify turn flags the fabrication WHILE it is present and passes once removed;
-    the revise turn returns the real content with the fabrication dropped."""
-    def reply(messages, **opts):
-        user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-        if "REPORT TO CORRECT" in user:
-            return _REPORT_REAL                 # ground-or-remove → fabrication gone
-        if "REPORT TO FACT-CHECK" in user:
-            if "17 USC 107(5)" in user:
-                return ('{"verdict":"revise","unbacked":[{"claim":"17 USC 107(5)",'
-                        '"reason":"no fetched source backs this statute"}]}')
-            return '{"verdict":"ok"}'
-        # the write loop: one-shot the whole report, then confirm DONE
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        return (_REPORT_REAL + _REPORT_FAB) if n == 0 else DONE_SENTINEL
-    return reply
-
-
-def test_synthesis_verify_lane_on_grounds_or_removes_fabrication(tmp_path):
-    """verify_lane ON: the written deliverable's fabricated claim is flagged, a revise
-    turn removes it, and the CORRECTED file is re-persisted — the real content survives."""
-    transport = FakeTransport([_synth_reply()])
-    rt = AgentRuntime(
-        transport=transport, hook=_hook(tmp_path),
-        subagent_call_opts={"think": True, "temperature": 0},
-        verify_lane=True,
-    )
-    rt.chain_sources = _VERIFY_SOURCES
-    out = _run(rt.run(_synth_dag()))
-
-    assert out.ok
-    doc = out.results["s1"].output or ""
-    # the fabrication is gone, the real content kept, and the REAL FILE matches
-    assert "17 USC 107(5)" not in doc and "180 missiles" in doc
-    on_disk = (tmp_path / "iran.md").read_text(encoding="utf-8")
-    assert on_disk == doc and "CTEA" not in on_disk
-
-
-def test_synthesis_verify_lane_off_by_default_is_byte_identical(tmp_path):
-    """Default (verify_lane=False): NO verify turn fires and the deliverable ships AS
-    WRITTEN (fabrication included) — true no-regression for the standing c13 write side."""
-    seen_users: list[str] = []
-
-    def reply(messages, **opts):
-        user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-        seen_users.append(user)
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        return (_REPORT_REAL + _REPORT_FAB) if n == 0 else DONE_SENTINEL
-
-    transport = FakeTransport([reply])
-    rt = AgentRuntime(
-        transport=transport, hook=_hook(tmp_path),
-        subagent_call_opts={"think": True, "temperature": 0},
-    )
-    rt.chain_sources = _VERIFY_SOURCES
-    out = _run(rt.run(_synth_dag()))
-
-    assert out.ok
-    doc = out.results["s1"].output or ""
-    assert "17 USC 107(5)" in doc  # shipped as written — no verify lane touched it
-    assert not any("FACT-CHECK" in u for u in seen_users)  # the verify turn never fired
-
-
-# --------------------------------------------------------------------------- #
-# INTEGRATION — the RESEARCH gather-more (answered-from-memory) lane
+# INTEGRATION — the RESEARCH gather-more (answered-from-memory) gate
 # --------------------------------------------------------------------------- #
 @dataclass
 class _ToolResult:
@@ -366,12 +187,24 @@ class _MemoryThenGatherTransport:
 
     def __init__(self) -> None:
         self.tool_calls = 0
+        self._loaded = False
 
     def complete(self, messages, **opts) -> str:
         return self.chat(messages, **opts).content
 
     def chat(self, messages, **opts) -> ChatResult:
-        user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        # d242 TRUE self-select: a research node starts TOOL-LESS — load the 'research' bundle
+        # FIRST (its opening move) so web_search/web_fetch become callable.
+        if not self._loaded:
+            self._loaded = True
+            return ChatResult(role="assistant",
+                              content='{"tool": "get_bundles", "args": {"name": "research"}}')
+        # s15/a18 (d189): a fed-back tool RESULT now rides role 'tool' (the search/fetch
+        # observations), while the gather-more nudge stays role 'user' — scan both.
+        user = next(
+            (m["content"] for m in reversed(messages)
+             if m.get("role") in ("user", "tool")), ""
+        )
         if "answered from MEMORY" in user:           # the N5 gather-more nudge → search now
             self.tool_calls += 1
             return ChatResult(role="assistant", content='{"tool":"web_search","args":{"query":"iran strike"}}')
@@ -395,27 +228,12 @@ def _research_node() -> PlanNode:
                     role="worker", tool="web_search", tool_args={"query": "iran"})
 
 
-def test_research_verify_lane_on_forces_gather_more(tmp_path):
-    """verify_lane ON: a research stage that answers FROM MEMORY (0 fetches) is forced to
-    GATHER-MORE — it then searches + reads a real source before its findings are accepted."""
-    hook = _FakeHook("https://news.un.org/iran")
-    transport = _MemoryThenGatherTransport()
-    agent = SubAgent(
-        _research_node(), transport=transport, hook=hook,
-        read_search_max_fetch=5, verify_lane=True,
-        call_opts={"think": False, "temperature": 0},
-    )
-    res = _run(agent.run({}))
-
-    # the memory answer was rejected; the stage actually fetched a real source
-    assert hook.fetches == ["https://news.un.org/iran"]
-    assert res.tool_value is not None and res.tool_value["fetched_count"] == 1
-    assert "180 missiles" in (res.output or "")  # the grounded findings, not the memory one
-
-
-def test_research_verify_lane_off_accepts_memory_answer(tmp_path):
-    """Default (verify_lane=False): the byte-identical path — a memory answer with 0
-    fetches is accepted immediately, no gather-more nudge, no fetch."""
+def test_research_gather_more_deflagged_forces_fetch(tmp_path):
+    """RP-3c (d330): the no-fab gather-more gate is DE-FLAGGED (no ``verify_lane`` boolean).
+    A research-bundle node that answers FROM MEMORY (0 fetches) is STILL force-gathered — it
+    then searches + reads a real source before its findings are accepted. The gate now fires
+    on the output-agnostic signal alone (research bundle self-selected + answered-from-memory
+    + under cap), the correct flag-free always-on end-state."""
     hook = _FakeHook("https://news.un.org/iran")
     transport = _MemoryThenGatherTransport()
     agent = SubAgent(
@@ -425,6 +243,39 @@ def test_research_verify_lane_off_accepts_memory_answer(tmp_path):
     )
     res = _run(agent.run({}))
 
-    assert hook.fetches == []           # never fetched — the memory answer stood
+    # the memory answer was rejected; the stage actually fetched a real source — WITHOUT any
+    # flag being passed (the gate is now the flag-free default).
+    assert hook.fetches == ["https://news.un.org/iran"]
+    assert res.tool_value is not None and res.tool_value["fetched_count"] == 1
+    assert "180 missiles" in (res.output or "")  # the grounded findings, not the memory one
+
+
+class _MemoryNoBundleTransport:
+    """Answers FROM MEMORY on the FIRST turn WITHOUT ever self-selecting the research bundle —
+    a legitimate trivial/follow-up worker (it never loaded the gather tools)."""
+
+    def complete(self, messages, **opts) -> str:
+        return self.chat(messages, **opts).content
+
+    def chat(self, messages, **opts) -> ChatResult:
+        return ChatResult(role="assistant", content=(
+            "FINDINGS: Iran and Israel exchanged strikes through June, escalating "
+            "tensions sharply across the region as diplomatic channels stalled."))
+
+
+def test_research_gather_more_narrow_gate_spares_non_research_worker(tmp_path):
+    """The de-flagged gate stays NARROW (SB-RR d293): a worker that did NOT self-select the
+    research bundle answering from memory is NEVER force-gathered — the always-on de-flag did
+    not widen the gate to non-gathering workers. It answers in one turn, no nudge, no fetch."""
+    hook = _FakeHook("https://news.un.org/iran")
+    transport = _MemoryNoBundleTransport()
+    agent = SubAgent(
+        _research_node(), transport=transport, hook=hook,
+        read_search_max_fetch=5,
+        call_opts={"think": False, "temperature": 0},
+    )
+    res = _run(agent.run({}))
+
+    assert hook.fetches == []           # never fetched — the bundle was never loaded
     assert res.tool_value is None        # no sources gathered
-    assert "escalating tensions" in (res.output or "")  # the from-memory findings
+    assert "escalating tensions" in (res.output or "")  # the from-memory findings stood

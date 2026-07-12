@@ -134,11 +134,17 @@ class _FakeHook:
 
 
 class _ScriptedTransport:
-    """Replays a fixed sequence of agent turns; records the user turn of each call."""
+    """Replays a fixed sequence of agent turns; records the user turn of each call.
 
-    def __init__(self, turns: list[str]) -> None:
-        self._turns = list(turns)
+    d242 TRUE self-select: a research node starts TOOL-LESS, so every script SELF-SELECTS
+    the 'research' bundle first (the model's opening move) before its note-lane gather
+    turns; pass ``self_select=None`` to drive the self-select turns explicitly."""
+
+    def __init__(self, turns: list[str], *, self_select: str | None = "research") -> None:
+        lead = [f'{{"tool": "get_bundles", "args": {{"name": "{self_select}"}}}}'] if self_select else []
+        self._turns = lead + list(turns)
         self.calls: list[str] = []
+        self.last_messages: list[dict] = []
 
     def complete(self, messages, **opts) -> str:
         return self.chat(messages, **opts).content
@@ -149,6 +155,10 @@ class _ScriptedTransport:
             (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
         )
         self.calls.append(user)
+        # s15/a18 (d189): tool RESULTS now ride role 'tool' (not 'user'), so capture the
+        # WHOLE message stream of the latest call — assertions about fed-back observations
+        # must scan the tool channel, not just the user turns.
+        self.last_messages = list(messages)
         content = self._turns[i] if i < len(self._turns) else "FALLBACK FINDINGS."
         return ChatResult(role="assistant", content=content)
 
@@ -159,7 +169,14 @@ def _ws_node(nid: str = "r1_research") -> PlanNode:
 
 
 def _full_convo(t: _ScriptedTransport) -> str:
-    return "\n\n".join(t.calls)
+    # s15/a18 (d189): the agent-facing conversation now carries fed-back tool RESULTS as
+    # role 'tool' (not 'user'); include both so observation content (note acks, refusals,
+    # search/fetch results) is visible to assertions, mirroring what the model actually sees.
+    return "\n\n".join(
+        str(m.get("content", ""))
+        for m in t.last_messages
+        if m.get("role") in ("user", "tool")
+    )
 
 
 def test_note_is_emitted_additively_and_directs_next_search():

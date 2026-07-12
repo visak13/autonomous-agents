@@ -1,20 +1,17 @@
 """P2.2 ORCHESTRATION — fast offline proofs (d129/d132.B, P2-2-orch).
 
-Three build parts + the carry-forward, each proven OFFLINE (FakeTransport, in-process
-EventPlane; no Ollama / network / GPU):
+The event-driven planner + the carry-forward, each proven OFFLINE (FakeTransport,
+in-process EventPlane; no Ollama / network / GPU):
 
 1. EVENT-DRIVEN PLANNER (``PlannerReactor``): the planner SUBSCRIBES to the EventPlane
    and REACTS — a node FAILURE event is decided by the reactor (not a synchronous
    in-call), recovering a PARALLEL node before the join; a worker CLARIFICATION is
    SURFACED while other workers keep being serviced.
-2. FRAMEWORK-INJECTED REVIEW (``inject_reviews`` + ``PlanBuilder(inject_review=True)``):
-   the framework turns each authored WORK step into a ``work -> review`` pair and
-   appends a FINAL review; the planner only authored the work.
-3. SYNTHESIZER FOLD STAYS RAW (P2-2-foldverify constraints): the injected review nodes
-   are plain ``worker`` role with NO verdict/findings schema — the reviewed DAG parses
-   and drives, and the terminal emission is never re-framed as a judgment envelope.
 4. CARRY-FORWARD: ``get_shapes`` / ``get_specs`` are reachable on the SERVED planner
    surface (built by ``chat_app.app.build_wiring``) + in the planner context.
+
+(The framework-injected review parts (2/3) were retired in SF-1/d310/d311 — the model
+authors the whole document; no engine reviewer injection or verdict fold remains.)
 """
 from __future__ import annotations
 
@@ -26,13 +23,7 @@ from agent_runtime.clarification import EVENT_NEEDS_CLARIFICATION
 from agent_runtime.factory import AbstractPlanFactory, PlanDAG, PlanNode
 from agent_runtime.heal_router import EVENT_NODE_FAILURE_DETECTED, HealRouter
 from agent_runtime.planner import HealDecision, Planner
-from agent_runtime.plan_tools import PlanBuilder
 from agent_runtime.reactor import EVENT_NODE_CLARIFICATION, PlannerReactor
-from agent_runtime.review_injection import (
-    FINAL_REVIEW_ID,
-    REVIEW_SUFFIX,
-    inject_reviews,
-)
 from agent_runtime.runtime import AgentRuntime
 from agent_runtime.status import NodeStatus
 from llm_framework import FakeTransport
@@ -208,129 +199,6 @@ def test_reactor_surfaces_clarification_without_blocking_other_work():
     assert route_b.is_retry   # the OTHER worker was still serviced (not blocked)
 
 
-# =========================================================================== #
-# PART 2 — FRAMEWORK-INJECTED REVIEW: work=>work+review, finalize=>final review
-# =========================================================================== #
-def _ids(plan):
-    return [n["id"] for n in plan["nodes"]]
-
-
-def _node(plan, nid):
-    return next(n for n in plan["nodes"] if n["id"] == nid)
-
-
-def test_inject_reviews_linear_chain():
-    # n1 -> n2 -> n3  becomes  n1 -> n1_review -> n2 -> n2_review -> n3 -> n3_review -> final
-    plan = {
-        "rationale": "r",
-        "shape": "linear",
-        "nodes": [
-            {"id": "n1", "task": "a", "spec": None, "specs": [], "depends_on": []},
-            {"id": "n2", "task": "b", "spec": None, "specs": [], "depends_on": ["n1"]},
-            {"id": "n3", "task": "c", "spec": None, "specs": [], "depends_on": ["n2"]},
-        ],
-    }
-    out = inject_reviews(plan)
-    ids = _ids(out)
-    for w in ("n1", "n2", "n3"):
-        assert f"{w}{REVIEW_SUFFIX}" in ids
-    assert FINAL_REVIEW_ID in ids
-    # consumers re-pointed onto the review: n2 now depends on n1_review, not n1.
-    assert _node(out, "n2")["depends_on"] == ["n1_review"]
-    assert _node(out, "n3")["depends_on"] == ["n2_review"]
-    # each review depends on its work node; final review over the terminal review.
-    assert _node(out, "n1_review")["depends_on"] == ["n1"]
-    assert _node(out, FINAL_REVIEW_ID)["depends_on"] == ["n3_review"]
-
-
-def test_inject_reviews_parallel_join():
-    # n1 ∥ n2, n3 joins => (n1->n1_review) ∥ (n2->n2_review) -> n3 -> n3_review -> final
-    plan = {
-        "rationale": "r",
-        "shape": "modular-parallel",
-        "nodes": [
-            {"id": "n1", "task": "a", "spec": None, "specs": [], "depends_on": []},
-            {"id": "n2", "task": "b", "spec": None, "specs": [], "depends_on": []},
-            {"id": "n3", "task": "join", "spec": None, "specs": [], "depends_on": ["n1", "n2"]},
-        ],
-    }
-    out = inject_reviews(plan)
-    # the join re-points onto BOTH reviews.
-    assert set(_node(out, "n3")["depends_on"]) == {"n1_review", "n2_review"}
-    assert _node(out, FINAL_REVIEW_ID)["depends_on"] == ["n3_review"]
-
-
-def test_inject_reviews_is_spec_aware():
-    # the review inherits the work node's specs (applies the SAME ruleset on the fix).
-    plan = {
-        "rationale": "r", "shape": "linear",
-        "nodes": [{"id": "n1", "task": "write html", "spec": "html-writer",
-                   "specs": ["html-writer"], "depends_on": []}],
-    }
-    out = inject_reviews(plan)
-    assert _node(out, "n1_review")["specs"] == ["html-writer"]
-    assert _node(out, FINAL_REVIEW_ID)["specs"] == ["html-writer"]
-
-
-def test_inject_reviews_idempotent():
-    plan = {"rationale": "r", "shape": "linear",
-            "nodes": [{"id": "n1", "task": "a", "spec": None, "specs": [], "depends_on": []}]}
-    once = inject_reviews(plan)
-    twice = inject_reviews(once)
-    assert _ids(once) == _ids(twice)   # re-running adds nothing new
-
-
-def test_plan_builder_inject_review_flag_off_by_default():
-    b = PlanBuilder(shape_name="linear")
-    b.seed_plan({})
-    b.add_step({"task": "do the work"})
-    b.finalize_plan({})
-    assert _ids(b.to_structured()) == ["n1"]   # no review nodes => no regression
-
-
-def test_plan_builder_inject_review_flag_on_adds_reviews():
-    b = PlanBuilder(shape_name="linear", inject_review=True)
-    b.seed_plan({})
-    b.add_step({"task": "do the work"})
-    b.finalize_plan({})
-    ids = _ids(b.to_structured())
-    assert "n1" in ids and "n1_review" in ids and FINAL_REVIEW_ID in ids
-
-
-# =========================================================================== #
-# PART 3 — SYNTHESIZER FOLD STAYS RAW: review nodes are plain workers, no verdict;
-# the reviewed DAG parses + is drivable (foldverify constraints 1 & 2 preserved).
-# =========================================================================== #
-def test_injected_reviews_are_worker_role_not_judgment():
-    plan = {
-        "rationale": "r", "shape": "linear",
-        "nodes": [{"id": "n1", "task": "write the report", "spec": None,
-                   "specs": [], "depends_on": []}],
-    }
-    out = inject_reviews(plan)
-    for nid in ("n1_review", FINAL_REVIEW_ID):
-        n = _node(out, nid)
-        assert n["role"] == "worker"                 # NOT a judgment role
-        # the task directs RAW content, never a verdict/findings envelope.
-        assert "raw content" in n["task"].lower()
-        assert "verdict" in n["task"].lower()        # ("never a verdict ...")
-
-
-def test_reviewed_plan_parses_into_drivable_dag():
-    plan = {
-        "rationale": "r", "shape": "modular-parallel",
-        "nodes": [
-            {"id": "n1", "task": "a", "spec": None, "specs": [], "depends_on": []},
-            {"id": "n2", "task": "b", "spec": None, "specs": [], "depends_on": ["n1"]},
-        ],
-    }
-    factory = AbstractPlanFactory([])
-    dag = factory.parse_dag(inject_reviews(plan))     # raises on a bad/cyclic DAG
-    by_id = dag.by_id
-    assert {"n1", "n1_review", "n2", "n2_review", FINAL_REVIEW_ID} <= set(by_id)
-    # every injected review/terminal node is a worker (role-collapsed; no verdict path)
-    for nid in ("n1_review", "n2_review", FINAL_REVIEW_ID):
-        assert by_id[nid].role in (None, "worker")
 
 
 # =========================================================================== #

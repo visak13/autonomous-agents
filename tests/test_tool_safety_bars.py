@@ -135,11 +135,11 @@ def test_file_write_refusal_surfaces_through_dispatch(tmp_path):
 
 
 def test_file_write_def_is_built_for_the_sandbox_root(tmp_path):
-    """Sanity: the built ToolDef pair is the file_read/file_write growable
-    entries (one registry entry each)."""
+    """Sanity: the built ToolDefs are the generic file tools (file_read / file_write /
+    file_update) — one growable registry entry each."""
     defs = build_filesystem_tools(_sandbox(tmp_path))
     names = {d.name for d in defs}
-    assert names == {"file_read", "file_write"}
+    assert names == {"file_read", "file_write", "file_update"}
 
 
 # =========================================================================== #

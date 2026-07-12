@@ -76,7 +76,6 @@ def _planner(
     replies: Sequence[str],
     *,
     requested_specs: Sequence[str] = (),
-    default_research_spec: str = DEEP_RESEARCH_SPEC,
 ) -> IncrementalPlanner:
     reg = SpecRegistry(tmp_path / "specs")
     seed_canonical_rulesets(reg)  # registers research-analyst + markdown-writer
@@ -88,7 +87,6 @@ def _planner(
         tool_names=[t["name"] for t in _TOOL_CATALOG],
         shape_name="linear",
         shape_description="a straight A→B chain",
-        default_research_spec=default_research_spec,
         requested_specs=requested_specs,
     )
 

@@ -75,14 +75,15 @@ def test_split_done_signal():
 
 
 def test_derive_output_path_is_type_agnostic():
-    # an explicit filename the request names survives verbatim (c3r/d49)
+    # an explicit filename the request names survives verbatim (c3r/d49) — the model's own choice
     assert derive_output_path("write cats.html for me", "deliver", None) == "cats.html"
     assert derive_output_path("a goal", "save it to data.csv", None) == "data.csv"
-    # the bound output-format writer spec dictates the extension when no name given
-    assert derive_output_path("detailed report", "write it", ["html-writer"]).endswith(".html")
+    # RP-1 (d319/d311): format INFERENCE is retired — with NO explicit filename the engine no
+    # longer maps a bound writer spec or a request keyword to a format; the neutral plain-text
+    # .md extension is used (the model picks its own format by naming its file).
+    assert derive_output_path("detailed report", "write it", ["html-writer"]).endswith(".md")
     assert derive_output_path("a report", "write it", ["markdown-writer"]).endswith(".md")
-    # a format keyword in the request, else .md
-    assert derive_output_path("make an HTML page about cats", "write", None).endswith(".html")
+    assert derive_output_path("make an HTML page about cats", "write", None).endswith(".md")
     assert derive_output_path("summarize the news", "write a summary", None).endswith(".md")
     # the stem is a relatable slug, never a generic 'report'/'output'
     assert derive_output_path("US-Iran conflict overview", "write", ["html-writer"]).startswith("us-iran")
@@ -116,8 +117,10 @@ def test_html_close_gap_detects_unclosed_top_level_tags():
 def test_extension_and_filename_helpers():
     assert explicit_filename("please write cats.html") == "cats.html"
     assert explicit_filename("no file here") is None
-    assert deliverable_extension(["html-writer"], "anything") == ".html"
-    assert deliverable_extension(None, "give me CSV data") == ".csv"
+    # RP-1 (d319/d311): format INFERENCE is retired — deliverable_extension no longer maps a
+    # writer spec or a request keyword to a format; it returns the neutral plain-text default.
+    assert deliverable_extension(["html-writer"], "anything") == ".md"
+    assert deliverable_extension(None, "give me CSV data") == ".md"
     assert deliverable_extension(None, "plain prose") == ".md"
     # sanitize keeps a model-chosen extension, borrows the default otherwise
     assert sanitize_write_path("cats.html", "report.md") == "cats.html"
@@ -383,8 +386,10 @@ def test_c8_md_simple_first_turn_done_accepted_in_one_turn(tmp_path):
     syn = out.results["s1"]
     doc = syn.output or ""
     assert "Strike on Iran" in doc
-    # accepted in ONE turn — the completeness gate did NOT fire (no second emit)
-    assert calls["n"] == 1
+    # accepted in ONE WRITE turn — the completeness gate did NOT fire (no second write emit).
+    # d242: call 1 is the raw loop's SELF-SELECT front (the node loads its bundles), call 2 is
+    # the single converged write turn; the gate firing again would show as a 3rd call.
+    assert calls["n"] == 2
     assert syn.parsed.get("converged") is True
 
 

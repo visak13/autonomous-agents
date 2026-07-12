@@ -459,10 +459,11 @@ def make_file_update(root: Path):
     """Build the ``file_update`` handler bound to sandbox ``root`` (s13/P1, FIX-C).
 
     A TARGETED read-modify-write: replace an exact ``old`` snippet with ``new`` in an
-    existing file and write the result back. This is the reviewer's surgical edit
-    primitive — it grounds-or-removes ONE flagged span in place rather than forcing
-    the small model to re-emit the whole document (which it truncates). It reuses the
-    SAME sandbox gate + envelope guard as ``file_write`` (no second safety path)."""
+    existing file and write the result back — a surgical in-place edit that changes ONE
+    named span rather than forcing the small model to re-emit the whole document (which
+    it truncates). The match is EXACT (``str.count``/``str.replace``): a snippet that is
+    not present verbatim raises rather than editing a guessed region. It reuses the SAME
+    sandbox gate + envelope guard as ``file_write`` (no second safety path)."""
 
     def file_update(
         path: str,
@@ -492,8 +493,12 @@ def make_file_update(root: Path):
         text = target.read_bytes().decode(encoding, errors="replace")
         occurrences = text.count(old)
         if occurrences == 0:
+            # EXACT match only — an ``old`` snippet not present verbatim is an honest
+            # "nothing matched", never a silent no-op that masquerades as an applied edit
+            # (and never a guessed region: a wrong structural edit is worse than a no-op).
             raise ToolInputError(
-                f"file_update found no occurrence of the 'old' snippet in {path!r}"
+                f"file_update found no exact occurrence of the 'old' snippet in {path!r} — "
+                "re-read the exact on-disk text (whitespace/newlines included) and resend it"
             )
         n = occurrences if int(count) <= 0 else min(int(count), occurrences)
         updated = text.replace(old, new, n)
@@ -532,7 +537,9 @@ def build_filesystem_tools(root: Optional[Path | str] = None) -> list[ToolDef]:
         description=(
             "Read a UTF-8 text file from the workspace (relative path); supports "
             "offset/length range reads and tail=N for a cheap end-of-file check. "
-            "Sandbox-confined. Returns {path, text, truncated, bytes, offset, size}."
+            "Read a large file in BOUNDED SECTIONS with offset/length (or tail=N) — one "
+            "region at a time, never the whole file as one blob. Sandbox-confined. "
+            "Returns {path, text, truncated, bytes, offset, size}."
         ),
         args_model=FileReadArgs,
         handler=make_file_read(base),
@@ -553,11 +560,11 @@ def build_filesystem_tools(root: Optional[Path | str] = None) -> list[ToolDef]:
         name="file_update",
         description=(
             "Update an EXISTING workspace text file in place: replace an exact 'old' "
-            "snippet with 'new' (empty 'new' deletes it). The reviewer's surgical "
-            "ground-or-remove edit — fix one flagged span without re-emitting the whole "
-            "document. count=0 replaces all occurrences (default 1). Same hard sandbox "
-            "as file_write; a missing 'old' is refused. Returns {path, replaced, bytes, "
-            "size, removed}."
+            "snippet with 'new' (empty 'new' deletes it) — fix one span without "
+            "re-emitting the whole document. The match is EXACT: copy the on-disk text "
+            "verbatim (whitespace and newlines included); a snippet not present is "
+            "refused, not guessed. count=0 replaces all occurrences (default 1). Same "
+            "hard sandbox as file_write. Returns {path, replaced, bytes, size, removed}."
         ),
         args_model=FileUpdateArgs,
         handler=make_file_update(base),

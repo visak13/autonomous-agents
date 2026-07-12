@@ -133,6 +133,32 @@ class ArtifactRef:
 
 
 @dataclass(frozen=True)
+class ResearchBriefRecord:
+    """A per-research BRIEF persisted at the chat-session level (d185 Layer 2).
+
+    One short thesis-level digest of a single research, addressable by
+    ``(chat_id, research_id)`` so multiple researches in one chat coexist and are
+    each looked up by their brief. ``brief`` is the DERIVED projection dict
+    (``research_tree.build_research_brief``); ``topic`` is hoisted out of it for a
+    cheap listing/lookup without re-parsing the JSON."""
+
+    chat_id: str
+    research_id: str
+    topic: str
+    brief: dict[str, Any]
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chat_id": self.chat_id,
+            "research_id": self.research_id,
+            "topic": self.topic,
+            "brief": self.brief,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
 class ChatRecord:
     """A chat session: identity + ordered turns + artifact refs (full history)."""
 
@@ -219,6 +245,24 @@ class ChatStore:
                     ON turns(chat_id, turn_index);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_chat
                     ON artifacts(chat_id);
+                -- d185 NOTES-ARCH Layer 2 — per-research BRIEF, stored at the
+                -- CHAT-SESSION level so MULTIPLE researches in one chat coexist,
+                -- each addressable by (chat_id, research_id). ADDITIVE only
+                -- (CREATE TABLE IF NOT EXISTS): leaves chats/turns/artifacts and
+                -- all existing rows untouched; a17 owns the broader session
+                -- binding + schema-intact verification. ``brief_json`` is the
+                -- DERIVED brief projection (research_tree.build_research_brief),
+                -- stored verbatim; (chat_id, research_id) is the addressable key.
+                CREATE TABLE IF NOT EXISTS research_briefs (
+                    chat_id     TEXT NOT NULL REFERENCES chats(chat_id),
+                    research_id TEXT NOT NULL,
+                    topic       TEXT NOT NULL,
+                    brief_json  TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, research_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_briefs_chat
+                    ON research_briefs(chat_id);
                 """
             )
             self.db.commit()
@@ -452,6 +496,84 @@ class ChatStore:
         if row is None:
             return None
         return (self.data_dir / row["rel_path"]).resolve()
+
+    # ---- per-research brief (d185 NOTES-ARCH Layer 2) ---- #
+    def save_research_brief(
+        self,
+        chat_id: str,
+        research_id: str,
+        brief: dict[str, Any],
+    ) -> ResearchBriefRecord:
+        """Persist one research's BRIEF at the chat-session level (durable on return).
+
+        Keyed by ``(chat_id, research_id)`` so MULTIPLE researches in one chat coexist
+        and are each addressable by their brief; re-saving the SAME key UPSERTS (a
+        re-run of the same research refreshes its digest, never duplicates). The chat
+        row is ensured defensively for the FK so a brief is never silently dropped.
+        ADDITIVE: touches only the ``research_briefs`` table (a17 owns wider keying)."""
+        topic = str((brief or {}).get("topic") or "").strip()
+        created = _now_iso()
+        with self._lock:
+            self._ensure_chat(chat_id, self._derive_title(topic or "Research"))
+            self.db.execute(
+                "INSERT INTO research_briefs(chat_id, research_id, topic, "
+                "brief_json, created_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, research_id) DO UPDATE SET "
+                "topic=excluded.topic, brief_json=excluded.brief_json, "
+                "created_at=excluded.created_at",
+                (chat_id, research_id, topic,
+                 json.dumps(brief or {}, ensure_ascii=False), created),
+            )
+            self.db.commit()
+        return ResearchBriefRecord(
+            chat_id=chat_id,
+            research_id=research_id,
+            topic=topic,
+            brief=dict(brief or {}),
+            created_at=created,
+        )
+
+    def get_research_brief(
+        self, chat_id: str, research_id: str
+    ) -> ResearchBriefRecord | None:
+        """One research's brief by its addressable ``(chat_id, research_id)`` key."""
+        row = self.db.execute(
+            "SELECT chat_id, research_id, topic, brief_json, created_at "
+            "FROM research_briefs WHERE chat_id = ? AND research_id = ?",
+            (chat_id, research_id),
+        ).fetchone()
+        return self._brief_from_row(row)
+
+    def list_research_briefs(self, chat_id: str) -> list[ResearchBriefRecord]:
+        """Every research brief in one chat session, newest first.
+
+        This is the addressable index a chat keeps: each distinct research surfaces
+        as its own brief, so a follow-up can name + look up the one it means."""
+        rows = self.db.execute(
+            "SELECT chat_id, research_id, topic, brief_json, created_at "
+            "FROM research_briefs WHERE chat_id = ? "
+            "ORDER BY created_at DESC, research_id DESC",
+            (chat_id,),
+        ).fetchall()
+        return [r for r in (self._brief_from_row(row) for row in rows) if r is not None]
+
+    @staticmethod
+    def _brief_from_row(row: sqlite3.Row | None) -> ResearchBriefRecord | None:
+        if row is None:
+            return None
+        try:
+            brief = json.loads(row["brief_json"])
+        except (ValueError, TypeError):
+            brief = {}
+        if not isinstance(brief, dict):
+            brief = {}
+        return ResearchBriefRecord(
+            chat_id=row["chat_id"],
+            research_id=row["research_id"],
+            topic=row["topic"],
+            brief=brief,
+            created_at=row["created_at"],
+        )
 
     # ---- misc ---- #
     @staticmethod

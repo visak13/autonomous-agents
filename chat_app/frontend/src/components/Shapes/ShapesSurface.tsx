@@ -9,16 +9,16 @@
  *
  *  - the spec chat is a TRANSCRIPT + draft-preview conversation that AUTHORS a
  *    ruleset; this is a MASTER-DETAIL CATALOG that READS the text-file-defined
- *    plan shapes and surfaces each shape's REAL structure — the execution
- *    discipline (sequential / concurrent) and, for the bounded cyclic
- *    deep-research shape, the round_roles/final_roles UNROLL.
+ *    plan shapes and surfaces what a shape REALLY is (s17 redesign, d247/d248):
+ *    an execution DISCIPLINE + DOCTRINE. A shape declares NO fixed node topology
+ *    — the PLANNER/GROWER AUTHORS the topology at runtime by reasoning — so the
+ *    old round-by-round unroll preview is RETIRED; the detail pane renders the
+ *    discipline, the declared phase flow, the doctrine text and (for
+ *    deep-research) the growth safety bounds instead.
  *  - the only thing the user EDITS here is a shape's per-shape MAX_ITER override
  *    (d5), saved through the a4 backend (PUT /shapes/{name}/max_iter) so it
- *    persists to the shared SQLite and is honored by the s3 deep-research unroll.
- *    For an iterative shape the structure preview reflects the EFFECTIVE round
- *    count live; for a dispatch-discipline shape the editor is shown (the mandate
- *    is per-shape) with an honest note that the ceiling applies to iterative
- *    unrolls.
+ *    persists to the shared SQLite — the deep-research grow loop's depth CEILING
+ *    (a non-deciding safety net, d240: the model's stop_research decides).
  *
  * Server state (the shape catalog, a shape's view) is the Query cache; the only
  * local state is which shape is selected and the editor's working value. The
@@ -28,13 +28,15 @@
  */
 import { useState } from "react";
 import {
-  useAuthorShape,
+  useApproveShapeChat,
   useDeleteShape,
-  useRefineShape,
+  useDenyShapeChat,
+  useOpenShapeChat,
+  useSendShapeChatMessage,
   useSetShapeMaxIter,
   useShapes,
 } from "../../api/queries";
-import type { ShapeExecution, ShapeView } from "../../api/types";
+import type { ShapeChatView, ShapeExecution, ShapeView } from "../../api/types";
 import "./ShapesSurface.css";
 
 interface ShapesSurfaceProps {
@@ -66,6 +68,10 @@ const BUILTIN_SHAPES: ReadonlySet<string> = new Set([
 export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
   const shapes = useShapes();
   const [selected, setSelected] = useState<string | null>(null);
+  // s17 (d18a parity): which shape a CONVERSATIONAL refine session targets (null =
+  // the chat panel drafts a NEW shape). Keyed into the panel so switching target
+  // cleanly restarts the conversation.
+  const [refineTarget, setRefineTarget] = useState<string | null>(null);
 
   // Auto-select the first shape once the catalog loads so the detail pane is
   // never empty on entry (derived from server data, not mirrored into an effect).
@@ -90,10 +96,19 @@ export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
           ← Back to tasks
         </button>
       </header>
+      <hr className="orn-divider orn-divider-feather" aria-hidden="true" />
 
       <div className="shapes-body">
         <div className="shapes-sidebar">
-          <ShapeAuthorForm onAuthored={(name) => setSelected(name)} />
+          <ShapeChatPanel
+            key={refineTarget ?? "«create»"}
+            refineOf={refineTarget}
+            onAuthored={(name) => {
+              setSelected(name);
+              setRefineTarget(null);
+            }}
+            onCancelRefine={() => setRefineTarget(null)}
+          />
           <nav className="shapes-list" aria-label="Plan shapes">
           {shapes.isLoading && <p className="shapes-hint">Loading shapes…</p>}
           {shapes.isError && (
@@ -125,7 +140,11 @@ export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
 
         <div className="shapes-detail">
           {active ? (
-            <ShapeDetail key={active.name} shape={active} />
+            <ShapeDetail
+              key={active.name}
+              shape={active}
+              onRefineInChat={() => setRefineTarget(active.name)}
+            />
           ) : (
             !shapes.isLoading && (
               <p className="shapes-hint shapes-detail-empty">
@@ -140,67 +159,157 @@ export function ShapesSurface({ onClose }: ShapesSurfaceProps) {
 }
 
 // =========================================================================== //
-// describe-a-shape: the user DESCRIBES a shape and the live Gemma model authors
-// the declarative file (s9/b1, d14(2)). Mirrors the spec screen's describe→author
-// UX (a plain-language box + an author button), but it is the GENUINE one-shot
-// shapes flow — a shape is a single small structured decision, not a multi-turn
-// ruleset conversation. On success the catalog refreshes and the new shape is
-// auto-selected so the user immediately sees its authored structure.
+// SHAPE CHAT (s17, d18a/d249 parity): the CONVERSATIONAL shape-authoring panel —
+// the same free-flowing iterative flow the spec chat gives rulesets. Each message
+// drives one live authoring turn over an IN-SESSION DRAFT (nothing touches disk
+// mid-conversation); the draft preview updates every turn; Approve persists it
+// through the backend's round-trip guard, Discard throws it away. Opened plain it
+// DRAFTS A NEW shape; opened with `refineOf` it edits that shape conversationally
+// (seeded from its real on-disk definition).
 // =========================================================================== //
-function ShapeAuthorForm({ onAuthored }: { onAuthored: (name: string) => void }) {
-  const [description, setDescription] = useState("");
-  const author = useAuthorShape();
+function ShapeChatPanel({
+  refineOf,
+  onAuthored,
+  onCancelRefine,
+}: {
+  refineOf: string | null;
+  onAuthored: (name: string) => void;
+  onCancelRefine: () => void;
+}) {
+  const [message, setMessage] = useState("");
+  // The session view is DRIVE output (every route returns the fresh view), held as
+  // local state keyed by the panel's `key` — not a cached server query, because an
+  // open draft is ephemeral by design (deny/restart drops it).
+  const [view, setView] = useState<ShapeChatView | null>(null);
+  const open = useOpenShapeChat();
+  const send = useSendShapeChatMessage();
+  const approve = useApproveShapeChat();
+  const deny = useDenyShapeChat();
+  const busy = open.isPending || send.isPending || approve.isPending;
 
-  const submit = () => {
-    const trimmed = description.trim();
-    if (!trimmed || author.isPending) return;
-    author.mutate(
-      { description: trimmed },
+  const submit = async () => {
+    const text = message.trim();
+    if (!text || busy) return;
+    try {
+      let sid = view?.session_id;
+      if (!sid) {
+        const opened = await open.mutateAsync({ refineOf: refineOf ?? undefined });
+        sid = opened.session_id;
+        setView(opened);
+      }
+      const next = await send.mutateAsync({ sessionId: sid, message: text });
+      setView(next);
+      setMessage("");
+    } catch {
+      // the mutation's own isError/error render below — nothing else to do
+    }
+  };
+
+  const onApprove = () => {
+    if (!view || busy) return;
+    approve.mutate(
+      { sessionId: view.session_id },
       {
-        onSuccess: (shape) => {
-          setDescription("");
-          onAuthored(shape.name);
+        onSuccess: (res) => {
+          setView(null);
+          onAuthored(res.shape.name);
         },
       },
     );
   };
 
+  const onDiscard = () => {
+    if (view) deny.mutate({ sessionId: view.session_id });
+    setView(null);
+    setMessage("");
+    if (refineOf) onCancelRefine();
+  };
+
+  const err = send.error ?? open.error ?? approve.error;
+
   return (
-    <form
-      className="shapes-author"
-      onSubmit={(e) => {
-        e.preventDefault();
-        submit();
-      }}
-    >
-      <h2 className="shapes-author-title">Describe a new shape</h2>
+    <section className="shapes-author" aria-label="Shape chat">
+      <h2 className="shapes-author-title">
+        {refineOf ? `Refine “${refineOf}” in chat` : "Draft a new shape in chat"}
+      </h2>
       <p className="shapes-author-hint">
-        Describe the execution posture in plain language — the local model authors
-        the declarative shape file. You never hand-write shapes.
+        Talk the shape into existence — each message revises the draft below,
+        building on the previous version. Nothing is saved until you approve.
       </p>
+
+      {view && view.turns.length > 0 && (
+        <ol className="shapes-chat-transcript" aria-label="Shape chat transcript">
+          {view.turns.map((t, i) => (
+            <li key={i} className={`shapes-chat-turn shapes-chat-${t.role}`}>
+              {t.text}
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {view?.draft && (
+        <div className="shapes-doctrine" aria-label="Current draft">
+          <strong>Draft:</strong> {view.draft.name}{" "}
+          <ExecutionBadge execution={view.draft.execution} /> —{" "}
+          {view.draft.description}
+        </div>
+      )}
+
       <label className="shapes-field">
-        <span className="shapes-field-label">Description</span>
+        <span className="shapes-field-label">
+          {view?.draft ? "Revise the draft" : "Describe the shape"}
+        </span>
         <textarea
           className="shapes-field-input shapes-author-input"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="e.g. iteratively research a topic in depth, a critic checking each round, then synthesize and verify"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder={
+            view?.draft
+              ? "e.g. run the second phase in parallel instead of in sequence"
+              : "e.g. a foundation phase, then independent avenues explored in parallel, then combine"
+          }
           maxLength={4000}
           rows={3}
-          aria-label="Describe the shape to author"
+          aria-label="Shape chat message"
         />
       </label>
-      {author.isError && (
-        <p className="shapes-error" role="alert">{author.error.message}</p>
-      )}
-      <button
-        type="submit"
-        className="shapes-primary"
-        disabled={author.isPending || description.trim() === ""}
-      >
-        {author.isPending ? "Authoring…" : "Author shape"}
-      </button>
-    </form>
+      {err && <p className="shapes-error" role="alert">{err.message}</p>}
+      <div className="shapes-chat-actions">
+        <button
+          type="button"
+          className="shapes-primary"
+          onClick={() => void submit()}
+          disabled={busy || message.trim() === ""}
+        >
+          {send.isPending || open.isPending ? "Drafting…" : "Send"}
+        </button>
+        {view?.draft && (
+          <>
+            <button
+              type="button"
+              className="shapes-primary"
+              onClick={onApprove}
+              disabled={busy}
+            >
+              {approve.isPending ? "Saving…" : "Approve & save"}
+            </button>
+            <button
+              type="button"
+              className="shapes-row-delete"
+              onClick={onDiscard}
+              disabled={busy}
+            >
+              Discard
+            </button>
+          </>
+        )}
+        {refineOf && !view?.draft && (
+          <button type="button" className="shapes-row-delete" onClick={onDiscard}>
+            Cancel
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -244,27 +353,34 @@ function ShapeDeleteButton({ name }: { name: string }) {
   );
 }
 
-/** A short "ceiling" summary for the list row (genuine: only iterative shapes
- * iterate, so others read as single-pass). */
+/** A short "ceiling" summary for the list row (genuine: only the deep-research
+ * discipline consumes max_iter — as its grow-loop DEPTH ceiling). */
 function iterSummary(shape: ShapeView): string {
   if (!isIterative(shape)) return "single pass";
   const over = shape.max_iter_override;
   return over != null && over !== shape.max_iter
-    ? `${shape.effective_max_iter} rounds (set)`
-    : `${shape.effective_max_iter} rounds`;
+    ? `depth ≤ ${shape.effective_max_iter} (set)`
+    : `depth ≤ ${shape.effective_max_iter}`;
 }
 
-/** A shape iterates (consumes max_iter) iff it declares per-round roles — only the
- * deep-research bounded-unroll shape does. The dispatch-discipline shapes
- * (sequential/concurrent) run their nodes once under a launch discipline. */
+/** A shape iterates (consumes max_iter) iff its discipline is deep-research —
+ * the grow loop honors max_iter as its depth ceiling. The dispatch-discipline
+ * shapes (sequential/concurrent) run their authored nodes once. (s17: keyed off
+ * the execution discipline — the retired round_roles topology no longer exists.) */
 function isIterative(shape: ShapeView): boolean {
-  return shape.round_roles.length > 0;
+  return shape.execution === "deep-research";
 }
 
 // =========================================================================== //
 // detail: the shape's real structure + the max_iter editor
 // =========================================================================== //
-function ShapeDetail({ shape }: { shape: ShapeView }) {
+function ShapeDetail({
+  shape,
+  onRefineInChat,
+}: {
+  shape: ShapeView;
+  onRefineInChat: () => void;
+}) {
   return (
     <article className="shapes-card">
       <header className="shapes-card-head">
@@ -283,77 +399,28 @@ function ShapeDetail({ shape }: { shape: ShapeView }) {
 
       <ShapeStructure shape={shape} />
 
-      <ShapeRefineForm shape={shape} />
+      {/* s17 (d18a parity): refinement is CONVERSATIONAL — this hands the shape to
+          the chat panel, which seeds a draft from its on-disk definition and only
+          persists on approve (the one-shot rewrite-the-file form is retired). */}
+      <section className="shapes-refine" aria-label="Refine this shape">
+        <h3 className="shapes-struct-title">Refine this shape</h3>
+        <p className="shapes-struct-note">
+          Evolve it conversationally — each turn builds on the draft, and nothing is
+          saved until you approve.
+        </p>
+        <button type="button" className="shapes-primary" onClick={onRefineInChat}>
+          Refine in chat
+        </button>
+      </section>
 
       <MaxIterEditor shape={shape} />
     </article>
   );
 }
 
-// =========================================================================== //
-// refine-a-shape: the user EDITS the selected shape in plain language and the live
-// Gemma model authors the next version BUILDING ON the current one (s8/b6, d18a).
-// This is the free-flow ITERATIVE authoring the describe→create box can't do —
-// describe creates a NEW shape; this refines an EXISTING one in place (the file is
-// overwritten). On success the per-shape cache + catalog row update, so an edit
-// that flips the posture (e.g. a collapsed sequential "linear plus modular
-// parallel" → concurrent) is reflected live. Mirrors the author box's UX.
-// =========================================================================== //
-function ShapeRefineForm({ shape }: { shape: ShapeView }) {
-  // Re-mounted per shape via the parent's `key={active.name}`, so the working text
-  // resets cleanly when the user switches shapes (no server→state mirroring).
-  const [instruction, setInstruction] = useState("");
-  const refine = useRefineShape();
-
-  const submit = () => {
-    const trimmed = instruction.trim();
-    if (!trimmed || refine.isPending) return;
-    refine.mutate(
-      { name: shape.name, instruction: trimmed },
-      { onSuccess: () => setInstruction("") },
-    );
-  };
-
-  return (
-    <form
-      className="shapes-refine"
-      onSubmit={(e) => {
-        e.preventDefault();
-        submit();
-      }}
-    >
-      <h3 className="shapes-struct-title">Refine this shape</h3>
-      <p className="shapes-struct-note">
-        Describe a change in plain language — the local model rewrites this shape,
-        building on its current definition. Use this to evolve a shape (e.g. “run the
-        second phase in parallel instead of in sequence”); it edits this shape in
-        place, it does not create a new one.
-      </p>
-      <label className="shapes-field">
-        <span className="shapes-field-label">Refinement</span>
-        <textarea
-          className="shapes-field-input shapes-author-input"
-          value={instruction}
-          onChange={(e) => setInstruction(e.target.value)}
-          placeholder="e.g. add a modular parallel phase after the linear foundation, then combine the results"
-          maxLength={4000}
-          rows={3}
-          aria-label={`Refine the shape ${shape.name}`}
-        />
-      </label>
-      {refine.isError && (
-        <p className="shapes-error" role="alert">{refine.error.message}</p>
-      )}
-      <button
-        type="submit"
-        className="shapes-primary"
-        disabled={refine.isPending || instruction.trim() === ""}
-      >
-        {refine.isPending ? "Refining…" : "Refine shape"}
-      </button>
-    </form>
-  );
-}
+// s17 (d18a parity): the ONE-SHOT refine form is RETIRED — refinement now runs
+// through the conversational ShapeChatPanel (draft turns + approve gate). The
+// backend /shapes/{name}/refine one-shot route remains for API callers.
 
 // --------------------------------------------------------------------------- //
 // structure — GENUINE per execution discipline (the heart of "not a copy-pasta")
@@ -373,86 +440,41 @@ function ShapeStructure({ shape }: { shape: ShapeView }) {
   }
 }
 
-/** The bounded cyclic unroll, rendered round-by-round to the EFFECTIVE round count
- * the runtime will actually run (override clamped to hard_cap). Non-final rounds
- * emit `round_roles` ({research, critic}); the single final round emits
- * `final_roles` ({research, synthesis, verify}). Each round depends on the prior
- * round's tail → growing visibility into every earlier layer. */
+/** Deep-research = discipline + doctrine (s17 redesign, d247/d248). There is NO
+ * fixed round topology to preview — the planner/grower AUTHORS the research
+ * topology at runtime by reasoning (decompose into facets, deepen on note gaps,
+ * prune settled leads, stop when every concern is settled). What the shape
+ * genuinely declares is its doctrine text + the growth SAFETY bounds, so that is
+ * what this pane renders. */
 function DeepResearchStructure({ shape }: { shape: ShapeView }) {
-  const total = shape.effective_max_iter;
-  // Render every round when the count is small; otherwise show the first two
-  // non-final rounds, an elision for the middle, and ALWAYS the distinct final
-  // round so both the {research+critic} pattern and the final
-  // {research+synthesis+verify} round are visible without a huge list.
-  const ELIDE_OVER = 6;
-  const nonFinalCount = Math.max(0, total - 1); // rounds 1..total-1 use round_roles
-  const elide = total > ELIDE_OVER;
-  const headCount = elide ? 2 : nonFinalCount;
-
-  // Build an explicit render list so the elision is its OWN item between the head
-  // rounds and the final round — never standing in for a real round.
-  type RoundItem =
-    | { kind: "round"; index: number; final: boolean; roles: string[] }
-    | { kind: "elide"; from: number; to: number };
-
-  const items: RoundItem[] = [];
-  for (let n = 1; n <= headCount; n++) {
-    items.push({ kind: "round", index: n, final: false, roles: shape.round_roles });
-  }
-  if (elide && nonFinalCount > headCount) {
-    items.push({ kind: "elide", from: headCount + 1, to: nonFinalCount });
-  }
-  if (total >= 1) {
-    items.push({ kind: "round", index: total, final: true, roles: shape.final_roles });
-  }
-
   return (
-    <section className="shapes-struct" aria-label="Deep-research structure">
-      <h3 className="shapes-struct-title">Bounded unroll</h3>
+    <section className="shapes-struct" aria-label="Deep-research discipline">
+      <h3 className="shapes-struct-title">Discipline &amp; doctrine</h3>
       <p className="shapes-struct-note">
-        The same specialization runs every round — only the node <em>role</em>
-        differs. {nonFinalCount} {nonFinalCount === 1 ? "round" : "rounds"} of{" "}
-        {roleList(shape.round_roles)}, then 1 final round of{" "}
-        {roleList(shape.final_roles)}. Each round sees all prior researched layers.
+        Iterative deepening research. The shape declares <em>no fixed topology</em>{" "}
+        — the planner authors the research tree at runtime by reasoning: decompose
+        the goal into facets, gather and take notes, expand on the gaps the notes
+        leave, prune settled leads, and stop when every concern is settled. The
+        model&apos;s own stop decision is primary; the bounds below are safety
+        ceilings, not the plan.
       </p>
 
-      <ol className="shapes-rounds">
-        {items.map((item) =>
-          item.kind === "elide" ? (
-            <li
-              key="elide"
-              className="shapes-round shapes-round-elide"
-              aria-hidden="true"
-            >
-              <span className="shapes-round-label">⋮</span>
-              <span className="shapes-round-elide-text">
-                rounds {item.from}–{item.to} · {roleList(shape.round_roles)}
-              </span>
-            </li>
-          ) : (
-            <li
-              key={item.index}
-              className={`shapes-round${item.final ? " shapes-round-final" : ""}`}
-            >
-              <span className="shapes-round-label">
-                {item.final ? "final round" : `round ${item.index}`}
-              </span>
-              <span className="shapes-role-chain">
-                {item.roles.map((role, j) => (
-                  <span key={role} className="shapes-role-chain-item">
-                    {j > 0 && <span className="shapes-arrow" aria-hidden="true">→</span>}
-                    <RoleChip role={role} />
-                  </span>
-                ))}
-              </span>
-            </li>
-          ),
-        )}
-      </ol>
+      <PhaseFlow phases={shape.phases} />
+
+      {shape.decompose_methodology && (
+        <p className="shapes-doctrine">
+          <strong>Decompose:</strong> {shape.decompose_methodology}
+        </p>
+      )}
+      {shape.completeness_stop && (
+        <p className="shapes-doctrine">
+          <strong>Stop when:</strong> {shape.completeness_stop}
+        </p>
+      )}
 
       <dl className="shapes-meta">
         <div className="shapes-meta-row">
-          <dt>Effective rounds</dt>
+          <dt>Depth ceiling</dt>
           <dd>{shape.effective_max_iter}</dd>
         </div>
         <div className="shapes-meta-row">
@@ -463,8 +485,48 @@ function DeepResearchStructure({ shape }: { shape: ShapeView }) {
           <dt>Hard cap</dt>
           <dd>{shape.hard_cap}</dd>
         </div>
+        {shape.fan_out > 0 && (
+          <div className="shapes-meta-row">
+            <dt>Fan-out / layer</dt>
+            <dd>{shape.fan_out}</dd>
+          </div>
+        )}
+        {shape.max_layers > 0 && (
+          <div className="shapes-meta-row">
+            <dt>Max layers</dt>
+            <dd>{shape.max_layers}</dd>
+          </div>
+        )}
+        {shape.max_sources > 0 && (
+          <div className="shapes-meta-row">
+            <dt>Max sources</dt>
+            <dd>{shape.max_sources}</dd>
+          </div>
+        )}
       </dl>
     </section>
+  );
+}
+
+/** The shape's declared PHASE flow (research → write → …), when present — the
+ * follow-up-plan vocabulary the planner reasons over, NOT a node graph. */
+function PhaseFlow({ phases }: { phases: ShapeView["phases"] }) {
+  if (!phases || phases.length === 0) return null;
+  return (
+    <div
+      className="shapes-flow shapes-flow-seq"
+      role="img"
+      aria-label={`phase flow: ${phases.map((p) => p.kind).join(", then ")}`}
+    >
+      {phases.map((p, i) => (
+        <span key={`${p.kind}-${i}`} className="shapes-role-chain-item">
+          {i > 0 && <span className="shapes-arrow" aria-hidden="true">→</span>}
+          <RoleChip role={p.kind} />
+        </span>
+      ))}
+      <span className="shapes-arrow" aria-hidden="true">→</span>
+      <span className="shapes-flow-node">done</span>
+    </div>
   );
 }
 
@@ -635,12 +697,6 @@ function ExecutionBadge({ execution }: { execution: ShapeExecution }) {
 
 function RoleChip({ role }: { role: string }) {
   return <span className={`shapes-role-chip shapes-role-${role}`}>{role}</span>;
-}
-
-function roleList(roles: string[]): string {
-  if (roles.length === 0) return "no roles";
-  if (roles.length === 1) return `{${roles[0]}}`;
-  return `{${roles.join(" + ")}}`;
 }
 
 /** The shape's basename for the source code reference, tolerating either path

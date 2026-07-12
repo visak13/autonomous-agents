@@ -13,11 +13,13 @@ import {
   type UseQueryResult,
 } from "@tanstack/react-query";
 import {
+  approveShapeChat,
   approveSpecChat,
   authorShape,
   createChat,
   deleteRegisteredSpec,
   deleteShape,
+  denyShapeChat,
   denySpecChat,
   getChat,
   getLambdaSubscriptions,
@@ -28,10 +30,12 @@ import {
   listChats,
   listRegisteredSpecs,
   listShapes,
+  openShapeChat,
   openSpecChat,
   refineShape,
   reopenSpecChat,
   resumeRun,
+  sendShapeChatMessage,
   sendSpecChatMessage,
   setShapeMaxIter,
   startRun,
@@ -48,6 +52,8 @@ import type {
   RegisteredSpecRow,
   ResumeRequest,
   RunRecord,
+  ApproveShapeChatResponse,
+  ShapeChatView,
   ShapeView,
   SpecChatMessageResponse,
   SpecChatView,
@@ -353,5 +359,39 @@ export function useRefineShape() {
       );
       void qc.invalidateQueries({ queryKey: queryKeys.shapes });
     },
+  });
+}
+
+// --------------------------------------------------------------------------- //
+// (s17, d18a/d249 parity) SHAPE CHAT — the conversational draft-based authoring
+// hooks. The session view is returned by every drive, so the panel holds it as
+// mutation state; approve lands the new/updated shape in the catalog caches.
+// --------------------------------------------------------------------------- //
+export function useOpenShapeChat() {
+  return useMutation<ShapeChatView, Error, { refineOf?: string | undefined }>({
+    mutationFn: ({ refineOf }) => openShapeChat(refineOf),
+  });
+}
+
+export function useSendShapeChatMessage() {
+  return useMutation<ShapeChatView, Error, { sessionId: string; message: string }>({
+    mutationFn: ({ sessionId, message }) => sendShapeChatMessage(sessionId, message),
+  });
+}
+
+export function useApproveShapeChat() {
+  const qc = useQueryClient();
+  return useMutation<ApproveShapeChatResponse, Error, { sessionId: string }>({
+    mutationFn: ({ sessionId }) => approveShapeChat(sessionId),
+    onSuccess: (res) => {
+      qc.setQueryData(queryKeys.shape(res.shape.name), res.shape);
+      void qc.invalidateQueries({ queryKey: queryKeys.shapes });
+    },
+  });
+}
+
+export function useDenyShapeChat() {
+  return useMutation<{ denied: boolean }, Error, { sessionId: string }>({
+    mutationFn: ({ sessionId }) => denyShapeChat(sessionId),
   });
 }

@@ -1,0 +1,20 @@
+# =============================================================================
+# WRITE-FILE shape (RP-6a / d359/d361) — the sectioned single-document WRITE shape.
+# =============================================================================
+# RELOCATED from a HARDCODED in-engine constant (agentic.py:_WRITE_FILE_SHAPE) to a
+# DECLARATIVE DISK SHAPE FILE, per the d341/d319 charter (behavior lives in SHAPES on
+# disk, NOT baked in engine code) — mirroring schedule-leg.toml / codebase-summary.toml.
+# BEHAVIOR-PRESERVING move: the name/description/execution are byte-identical to the
+# former constant; the engine now LOADS this shape from disk via the same load_shape
+# mechanism the other shapes use. NO new engine conditional, no flow/format branch.
+#
+# The write path drives the SEQUENTIAL execution discipline (one write node in flight at
+# a time, section by section). Each write node is a TOOL-LESS worker that SELF-SELECTS its
+# file-authoring tools from its spec — the shape fixes only the topology, never the tool.
+
+name = "write-file"
+
+description = "A WRITE-FILE plan: the document is decomposed into the sections it needs, ONE write node PER section, CHAINED so each node continues the previous one (section 2 depends_on section 1, …). EVERY section is written to the SAME single output document; the sections are appended in order. Use this shape's sequential chain to fill a large/multi-section document one part at a time. (Each write node is a tool-less worker — it SELF-SELECTS its file-authoring tools from its spec; the shape only fixes the topology, never the tool.)"
+
+# One write node in flight at a time — sections are written/appended in order.
+execution = "sequential"

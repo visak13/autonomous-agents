@@ -10,18 +10,19 @@ transport differs):
    temp 0, raised num_predict, and NO constrained `format` schema (the schema is
    the documented contract, not a wire constraint, so a reasoned posture is never
    schema-dropped);
-2. a 'deep-research'-style description -> a bounded research+critic unroll shape
-   (round_roles + final_roles + max_iter), which the runtime's generic unroll
-   expands into the correct role-tagged DAG;
+2. a 'deep-research'-style description -> a deep-research FAMILY shape (execution
+   token + max_iter depth ceiling + the growable marker); its research topology is
+   AUTHORED at runtime by the grower, NOT a declared round/final node graph
+   (s16/a3 d239/d247 — round_roles/final_roles are RETIRED);
 3. a 'parallel gather + email' description -> a 'concurrent' DISCIPLINE shape
-   (no per-node roles — its DAG is authored at plan time by the incremental
+   (no per-node topology — its DAG is authored at plan time by the incremental
    planner);
 4. a COMPOSITIONAL 'linear plus modular parallel' description does NOT collapse to
    a flat 'sequential' shape (b6/d18a — upgraded to 'concurrent');
 5. the free-flow ITERATIVE REFINE builds on an existing shape (edit in place,
    keeps the name, overwrites the file);
 6. the authored/refined file ROUND-TRIPS the real on-disk loader (load_shape) and
-   is selectable + unrollable from disk.
+   is selectable from disk.
 """
 from __future__ import annotations
 
@@ -30,30 +31,27 @@ import json
 
 from llm_framework import FakeTransport
 
-from agent_runtime.shapes import VALID_POSITIONS
 from agent_runtime.shape_author import (
     ShapeAuthor,
     build_shape_schema,
-    shape_to_toml,
     write_shape,
 )
 from agent_runtime.shapes import (
     ShapeSpec,
     VALID_EXECUTION,
     load_shape,
-    unroll_shape,
 )
 
 
 def _deep_research_reply() -> str:
+    # s16/a3: a deep-research shape is fully described by {name, description, execution,
+    # max_iter} — it declares NO per-round node positions (round_roles/final_roles retired).
     return json.dumps(
         {
             "name": "Deep Dive",
             "description": "iterative depth-first research with a critic each round",
             "execution": "deep-research",
             "max_iter": 9,
-            "round_roles": ["research", "critic"],
-            "final_roles": ["research", "synthesis", "verify"],
         }
     )
 
@@ -65,8 +63,6 @@ def _parallel_reply() -> str:
             "description": "gather several sources at once then email the digest",
             "execution": "concurrent",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
@@ -78,12 +74,10 @@ def test_schema_is_enum_constrained_and_all_keys_required():
     schema = build_shape_schema()
     props = schema["properties"]
     assert set(props["execution"]["enum"]) == set(VALID_EXECUTION)
-    assert set(props["round_roles"]["items"]["enum"]) == set(VALID_POSITIONS)
-    assert set(props["final_roles"]["items"]["enum"]) == set(VALID_POSITIONS)
-    # EVERY field is required (the small model omits OPTIONAL signals).
-    assert set(schema["required"]) == {
-        "name", "description", "execution", "max_iter", "round_roles", "final_roles",
-    }
+    # s16/a3 (d239/d247): round_roles/final_roles are RETIRED from the authoring schema —
+    # a shape declares NO per-node topology. EVERY remaining field is required.
+    assert "round_roles" not in props and "final_roles" not in props
+    assert set(schema["required"]) == {"name", "description", "execution", "max_iter"}
 
 
 def test_author_uses_prompt_json_reasoning_options_no_format_schema():
@@ -107,9 +101,9 @@ def test_author_uses_prompt_json_reasoning_options_no_format_schema():
 
 
 # --------------------------------------------------------------------------- #
-# 2) deep-research description -> bounded research+critic unroll shape
+# 2) deep-research description -> deep-research FAMILY shape (topology reasoned at runtime)
 # --------------------------------------------------------------------------- #
-def test_deep_research_description_authors_unrollable_shape(tmp_path):
+def test_deep_research_description_authors_deep_research_shape(tmp_path):
     author = ShapeAuthor(FakeTransport([_deep_research_reply()]))
     spec, path = asyncio.run(
         author.author_and_write(
@@ -118,25 +112,19 @@ def test_deep_research_description_authors_unrollable_shape(tmp_path):
         )
     )
     assert spec.execution == "deep-research"
-    assert spec.is_unrollable
-    assert spec.round_roles == ("research", "critic")
-    assert spec.final_roles == ("research", "synthesis", "verify")
+    assert spec.is_deep_research
+    # s16/a3: NO declared round/final positions — the dataclass dropped those fields; the
+    # research topology is authored at runtime by the grower from a tool-less growable seed.
+    assert not hasattr(spec, "round_roles")
+    assert not hasattr(spec, "final_roles")
+    # the deep-research shape is GROWABLE (the engine builds a growable seed) + carries the
+    # max_iter depth ceiling and the safety hard_cap.
+    assert spec.expand_on_gaps
     assert spec.max_iter == 9 and spec.hard_cap >= 24
-
-    # the runtime's GENERIC unroll expands it into the correct bounded DAG; d48 maps
-    # the positions onto worker/synthesizer node roles (synthesis → synthesizer).
-    dag = unroll_shape(load_shape(spec.name, shapes_dir=tmp_path), "g", max_iter_override=3)
-    assert [n.role for n in dag.nodes] == [
-        "worker", "worker", "worker", "worker", "worker", "synthesizer", "worker",
-    ]
-    assert [n.id for n in dag.nodes] == [
-        "r1_research", "r1_critic", "r2_research", "r2_critic",
-        "r3_research", "r3_synthesis", "r3_verify",
-    ]
 
 
 # --------------------------------------------------------------------------- #
-# 3) parallel description -> concurrent DISCIPLINE shape (no per-node roles)
+# 3) parallel description -> concurrent DISCIPLINE shape (no per-node topology)
 # --------------------------------------------------------------------------- #
 def test_parallel_description_authors_concurrent_discipline_shape(tmp_path):
     author = ShapeAuthor(FakeTransport([_parallel_reply()]))
@@ -148,9 +136,9 @@ def test_parallel_description_authors_concurrent_discipline_shape(tmp_path):
     )
     assert spec.execution == "concurrent"
     # a discipline shape carries NO topology — the incremental planner authors its
-    # DAG at plan time; the file must never look unrollable.
-    assert not spec.is_unrollable
-    assert spec.round_roles == () and spec.final_roles == () and spec.max_iter == 1
+    # DAG at plan time; it is NOT the deep-research family.
+    assert not spec.is_deep_research
+    assert spec.max_iter == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -161,31 +149,35 @@ def test_authored_file_round_trips_loader_and_is_clean_toml(tmp_path):
     spec, path = asyncio.run(
         author.author_and_write("deep iterative research", shapes_dir=tmp_path)
     )
-    # the file the runtime loads is exactly what load_shape parses.
+    # the file the runtime loads is exactly what load_shape parses. s16/a3: a deep-research
+    # file carries the growable marker (expand_on_gaps), NOT round_roles/final_roles.
     text = path.read_text(encoding="utf-8")
-    assert "round_roles" in text and "AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION" in text
+    assert "expand_on_gaps" in text and "AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION" in text
+    assert "round_roles" not in text and "final_roles" not in text
     reloaded = load_shape(spec.name, shapes_dir=tmp_path)
     assert reloaded.execution == spec.execution
-    assert reloaded.round_roles == spec.round_roles
+    assert reloaded.is_deep_research and reloaded.expand_on_gaps
 
 
-def test_discipline_shape_omits_roles_in_toml(tmp_path):
-    # even if a model leaks roles onto a concurrent shape, the coercion strips them
+def test_discipline_shape_omits_topology_in_toml(tmp_path):
+    # even if a model leaks round/final keys onto a concurrent shape, the coercion IGNORES
+    # them (the retired fields are not read) and the written file carries no topology.
     leaky = json.dumps(
         {
             "name": "leaky-parallel",
             "description": "parallel gather",
             "execution": "concurrent",
             "max_iter": 5,
-            "round_roles": ["research", "critic"],  # must be dropped
+            "round_roles": ["research", "critic"],  # ignored — not read by coercion
             "final_roles": ["synthesis"],
         }
     )
     author = ShapeAuthor(FakeTransport([leaky]))
     spec, path = asyncio.run(author.author_and_write("parallel gather", shapes_dir=tmp_path))
-    assert spec.round_roles == () and spec.final_roles == ()
-    assert "round_roles" not in path.read_text(encoding="utf-8")
-    assert not load_shape(spec.name, shapes_dir=tmp_path).is_unrollable
+    assert not spec.is_deep_research and spec.max_iter == 1
+    text = path.read_text(encoding="utf-8")
+    assert "round_roles" not in text and "final_roles" not in text
+    assert not load_shape(spec.name, shapes_dir=tmp_path).is_deep_research
 
 
 # --------------------------------------------------------------------------- #
@@ -205,8 +197,6 @@ def _collapsed_compositional_reply() -> str:
             ),
             "execution": "sequential",  # the collapse this action must prevent
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
@@ -220,10 +210,9 @@ def test_compositional_description_does_not_collapse_to_sequential(tmp_path):
         )
     )
     # The model emitted 'sequential' but the safety-net upgraded it to 'concurrent'
-    # so the parallel phase is not flattened. Still a discipline shape (no roles).
+    # so the parallel phase is not flattened. Still a discipline shape (not deep-research).
     assert spec.execution == "concurrent"
-    assert not spec.is_unrollable
-    assert spec.round_roles == () and spec.final_roles == ()
+    assert not spec.is_deep_research
     # round-trips the real loader as concurrent.
     assert load_shape(spec.name, shapes_dir=tmp_path).execution == "concurrent"
 
@@ -236,8 +225,6 @@ def test_pure_sequential_request_stays_sequential(tmp_path):
             "description": "run the steps strictly one after another, never overlapping",
             "execution": "sequential",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
     author = ShapeAuthor(FakeTransport([seq]))
@@ -268,8 +255,6 @@ def test_refine_builds_on_prior_and_keeps_name():
             "description": "gather several sources at once then email the digest",
             "execution": "concurrent",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
     transport = FakeTransport([refined_reply])
@@ -307,8 +292,6 @@ def test_refine_compositional_upgrade_sequential_to_concurrent(tmp_path):
             ),
             "execution": "sequential",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
     author = ShapeAuthor(FakeTransport([reply]), shapes_dir=tmp_path)

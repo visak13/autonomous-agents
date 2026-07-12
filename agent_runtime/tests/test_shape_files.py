@@ -41,9 +41,11 @@ def test_modular_parallel_shape_declares_concurrent_execution():
 def test_deep_research_shape_declares_its_own_discipline():
     shape = load_shapes()["deep-research"]
     assert shape.execution == "deep-research"
-    # its cyclic mechanics are untouched.
-    assert shape.round_roles == ("research", "critic")
-    assert shape.final_roles == ("research", "synthesis", "verify")
+    # s16/a3 (d239/d247): the shape declares NO per-round node positions (round_roles/
+    # final_roles RETIRED). Its identity is the execution token; the research topology is
+    # AUTHORED at runtime by the grower from an engine-owned tool-less growable seed.
+    assert shape.is_deep_research
+    assert shape.expand_on_gaps  # growable marker → the engine builds a growable seed
 
 
 # --------------------------------------------------------------------------- #

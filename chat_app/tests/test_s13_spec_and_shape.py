@@ -2,9 +2,11 @@
 
 These FAST tests (no web, no live inference) prove the FX-spec deliverable:
 
-(a) THE SEEDED DEEP-RESEARCH SPEC carries the INVESTIGATIVE methodology + STOP
-    criteria (d107(1)): deep research = IDENTIFY the what/when/why/how → FIND →
-    VERIFY → STOP-when-sufficiently-answered-and-verified, DISTINCT from Q&A.
+(a) d235 SPEC-VS-ROLE DE-BLUR — THE SEEDED DEEP-RESEARCH SPEC carries ONLY the
+    OUTPUT-QUALITY STANDARD (concrete/grounded/traceable/deeper). The investigative
+    METHODOLOGY (identify/find/verify/stop) that d107(1) had put in the spec is DROPPED:
+    how to drive the work is the researcher ROLE + the RUNTIME research loop, so the
+    methodology now lives in the RESEARCH BUNDLE doctrine, not the output-shaping spec.
 
 (b) THE DEEP-RESEARCH SHAPE FILE carries the iteration/depth count (d107(2)): the
     report path reads the shape FILE's depth into the plan (reaching the served-route
@@ -64,8 +66,6 @@ def _deep_research_shape() -> ShapeSpec:
         max_iter=2,
         hard_cap=4,
         execution="deep-research",
-        round_roles=["research", "critic"],
-        final_roles=["research", "synthesis", "verify"],
         completeness_stop="Fill ALL the blanks before stopping.",
     )
 
@@ -128,36 +128,41 @@ def _run_chain(tmp_path, *, research_depth=None, registry=None, run_id="s13-fx",
 
 
 # --------------------------------------------------------------------------- #
-# (a1) the SEEDED deep-research spec TEXT carries the identify/find/verify/stop
-#      investigative methodology, distinct from Q&A
+# (a1) d235 SPEC-VS-ROLE DE-BLUR: the SEEDED deep-research spec carries ONLY the
+#      OUTPUT-QUALITY STANDARD (concrete/grounded/traceable/deeper). The investigative
+#      METHODOLOGY (identify/find/verify/stop) was DROPPED from the spec — how to drive
+#      the work is the researcher ROLE + the RUNTIME research loop, not an output-shaping
+#      ruleset. The methodology now lives in the RESEARCH BUNDLE doctrine (asserted below).
 # --------------------------------------------------------------------------- #
-def test_s13_seed_spec_carries_investigative_methodology():
-    """The seeded DEEP_RESEARCH_SPEC's body encodes the investigative model
-    (identify → find → verify → stop-when-sufficient) and marks it DISTINCT from a
-    shallow question-answer."""
+def test_s13_seed_spec_is_quality_only_not_methodology():
+    """d235: the deep-research spec shapes the FORM/RIGOR of the answer only; it no longer
+    dictates the task METHODOLOGY (that blurred spec with role/runtime)."""
     # DEEP_RESEARCH_SPEC names the canonical spec the deep-research route reuses.
     assert DEEP_RESEARCH_SPEC in CANONICAL_RULESETS
     body = CANONICAL_RULESETS[DEEP_RESEARCH_SPEC][1]
     low = body.lower()
 
-    # The four methodology stages are all present.
-    assert "identify" in low
-    assert "find" in low
-    assert "verify" in low
-    assert "stop" in low
+    # The OUTPUT-QUALITY STANDARD is present: concrete, grounded by reading sources,
+    # traceable, gaps flagged, deeper than prior layers.
+    assert "concrete" in low
+    assert "traceable" in low or "attribute each" in low
+    assert "reading the sources" in low
+    assert "deeper" in low
 
-    # The investigative decomposition (what/when/why/how) is named.
-    for facet in ("what", "when", "why", "how"):
-        assert facet in low
+    # The d107 IDENTIFY/FIND/VERIFY/STOP methodology is GONE from the spec (de-blur): the
+    # spec no longer names the staged loop or owns the stop_research criterion.
+    assert "stop_research" not in low
+    assert "deep-research methodology" not in low
+    assert "identify → find → verify" not in low
 
-    # Stop = sufficiently answered AND verified, and it is the criterion reasoned over
-    # to call stop_research (not a hard-coded count).
-    assert "sufficiently answered" in low or ("sufficiently" in low and "verified" in low)
-    assert "stop_research" in low
+    # The methodology lives in the RESEARCH BUNDLE doctrine now (decompose-first, grow out,
+    # search/read/note/expand/prune/stop) — the role/runtime, not the spec.
+    from agent_runtime.bundles.research import ResearchBundle
 
-    # Explicitly distinguished from a question-answer (Q&A).
-    assert "investigation" in low or "investigative" in low
-    assert "q&a" in low or "question-answer" in low or "question answer" in low
+    doctrine = ResearchBundle().own_doctrine.lower()
+    assert "decompose-first" in doctrine
+    assert "expand" in doctrine and "prune" in doctrine
+    assert "stop only when" in doctrine
 
 
 # --------------------------------------------------------------------------- #
@@ -208,8 +213,9 @@ class _NoOverrideConfig:
 
 def test_s13_shape_file_depth_read_into_plan(monkeypatch, tmp_path):
     """With NO store depth override, run_agentic reads the DEEP-RESEARCH SHAPE FILE's
-    iteration count and hands it to run_plan_chain as research_depth — so the shape
-    FILE alone drives the planned depth."""
+    iteration count and hands it to the GENERIC loop's research seed as research_depth (as1/
+    d239: run_plan_chain is a thin research-seed shim; run_agentic now seeds the one loop) —
+    so the shape FILE alone drives the planned depth."""
     plane = EventPlane()
     hook = build_default_hook(plane)
     register_agentic_tools(hook, file_base=tmp_path, cron_data_dir=tmp_path)
@@ -223,11 +229,12 @@ def test_s13_shape_file_depth_read_into_plan(monkeypatch, tmp_path):
 
     captured = {}
 
-    async def fake_chain(query, sel, **kw):
+    async def fake_loop(query, sel, *, first_plan_kind, **kw):
+        captured["first_plan_kind"] = first_plan_kind
         captured["research_depth"] = kw.get("research_depth")
         return AgenticResult(rationale="chained", ok=True, final_response="CHAINED")
 
-    monkeypatch.setattr(agentic, "run_plan_chain", fake_chain)
+    monkeypatch.setattr(agentic, "_run_generic_loop", fake_loop)
 
     res = asyncio.run(run_agentic(
         "write me a big multi-page report and save it as report.md",
@@ -237,7 +244,8 @@ def test_s13_shape_file_depth_read_into_plan(monkeypatch, tmp_path):
         shape_config=_NoOverrideConfig(),
     ))
     assert res.final_response == "CHAINED"
-    # The deep-research shape FILE's declared iteration count reached run_plan_chain.
+    assert captured["first_plan_kind"] == "research"  # deep-research → the research seed
+    # The deep-research shape FILE's declared iteration count reached the generic loop.
     expected = int(load_shape("deep-research").max_iter)
     assert captured["research_depth"] == expected
     assert expected <= N4_TREE_DEPTH_CEILING  # the file default sits within the hard cap

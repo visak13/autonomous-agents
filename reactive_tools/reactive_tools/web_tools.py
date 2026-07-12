@@ -82,6 +82,13 @@ _USER_AGENT = "ReactiveAgents/0.1 (+in-process; httpx)"
 # rate-limit self-heals instead of failing the node.
 DEFAULT_SEARCH_TTL_SECONDS = 300.0   # 5 min — long enough to dedupe a research run
 DEFAULT_CACHE_MAX_ENTRIES = 256
+# web_fetch cache (d221): a fetched page's clean markdown is stable for a day, so a
+# ~1-day TTL lets the deep-research loop re-read the SAME source across rounds /
+# across the research+write+review phases for ONE live HTTP round-trip instead of
+# re-fetching every time (web_fetch had NO cache before). Bounded so a long run's
+# many distinct pages don't grow the map unboundedly (oldest evicted).
+DEFAULT_FETCH_TTL_SECONDS = 86400.0  # 1 day
+DEFAULT_FETCH_CACHE_MAX_ENTRIES = 128
 DEFAULT_MAX_RETRIES = 4              # 1 try + up to 4 backoff retries
 DEFAULT_BACKOFF_BASE = 1.0          # seconds; doubles per retry (1,2,4,8)
 DEFAULT_SEARCH_REGION = "us-en"
@@ -484,6 +491,7 @@ def make_web_fetch(*, timeout: float = 20.0,
                    backoff_base: float = DEFAULT_BACKOFF_BASE,
                    sleep: Callable[[float], None] = time.sleep,
                    deny_domains: Any = DEFAULT_DENY_DOMAINS,
+                   cache: Optional[ResultCache] = None,
                    ) -> Callable[..., dict[str, Any]]:
     """Build the ``web_fetch`` handler (httpx retrieval + Trafilatura markdown).
 
@@ -493,15 +501,26 @@ def make_web_fetch(*, timeout: float = 20.0,
     ``error_kind`` so the agent moves to an alternate source. ``deny_domains`` is
     the always-on baseline source deny-list (default Wikipedia) — a denied URL is
     NEVER fetched. ``sleep`` is injectable so tests exercise backoff without real
-    waits."""
+    waits.
+
+    ``cache`` (d221): a shared :class:`ResultCache` so the SAME url fetched again
+    within the TTL is served WITHOUT a live HTTP round-trip — the deep-research loop
+    re-reads a source across rounds / across research+write+review for one fetch.
+    One is created (1-day TTL) if not given. Only SUCCESSFUL fetches are cached; a
+    failure is never pinned (a transient 503 / timeout must be re-tried later, and a
+    404 is cheap to re-confirm). Cache key includes ``max_bytes`` so a larger
+    re-fetch isn't served a truncated cached body."""
     _deny = _normalise_deny(deny_domains)
+    _cache = cache if cache is not None else ResultCache(
+        ttl=DEFAULT_FETCH_TTL_SECONDS, max_entries=DEFAULT_FETCH_CACHE_MAX_ENTRIES)
 
     def web_fetch(url: str, max_bytes: int = DEFAULT_FETCH_MAX_BYTES,
                   max_redirects: int = DEFAULT_MAX_REDIRECTS) -> dict[str, Any]:
         """Fetch a public URL and extract clean content as MARKDOWN (Trafilatura).
 
         On SUCCESS returns ``{"ok": True, "url", "final_url", "status",
-        "content_type", "title", "markdown", "extracted", "truncated", "bytes"}``;
+        "content_type", "title", "markdown", "extracted", "truncated", "bytes",
+        "cached"}`` (``cached`` True when served from the ~1-day TTL cache);
         ``markdown`` preserves headings/lists/links; ``extracted`` is True when
         Trafilatura produced article markdown, False on a plain-text fallback.
         On FAILURE returns ``{"ok": False, "error_kind", "error", "status", ...}``
@@ -518,6 +537,14 @@ def make_web_fetch(*, timeout: float = 20.0,
                 error=(f"{_host_of(url)} is on the source deny-list and must not "
                        "be fetched or cited; use a different primary source."),
                 attempts=0)
+
+        # Cache (d221): serve a same-url re-fetch within the TTL without a live HTTP
+        # round-trip. Keyed by (url, max_bytes, max_redirects) so a larger re-fetch
+        # is not served a truncated cached body. Returns a COPY flagged cached=True.
+        cache_key = (url, int(max_bytes), int(max_redirects))
+        hit = _cache.get(cache_key)
+        if hit is not None:
+            return {**hit, "cached": True}
 
         last_kind = "network_error"
         last_err = ""
@@ -599,7 +626,7 @@ def make_web_fetch(*, timeout: float = 20.0,
             else:
                 markdown = body  # already plain text (e.g. text/plain, json)
 
-            return {
+            result = {
                 "ok": True,
                 "url": url,
                 "final_url": final_url,
@@ -610,7 +637,12 @@ def make_web_fetch(*, timeout: float = 20.0,
                 "extracted": extracted,
                 "truncated": truncated,
                 "bytes": len(raw),
+                "cached": False,
             }
+            # Cache the SUCCESS only (never a failure — a transient error must be
+            # re-tried, not pinned for a day). Store the live (cached=False) copy.
+            _cache.put(cache_key, result)
+            return result
 
         # Loop exhausted on a transient error (all retries failed).
         return _fetch_failure(url, status=last_status, error_kind=last_kind,
@@ -628,7 +660,9 @@ _WEB_FETCH_DESC = (
     "timeout / network_error / denied_domain / blocked) so you can tell a dead "
     "link from a blocked one and try an ALTERNATE source instead of retrying. "
     "Transient errors are retried with backoff; deny-listed domains (Wikipedia) "
-    "are never fetched.")
+    "are never fetched. A long page is structured markdown you read in BOUNDED "
+    "SECTIONS (work a section at a time / via the on-demand source index), so you "
+    "never have to treat the whole body as one oversized blob.")
 
 
 WEB_FETCH_TOOL = ToolDef(
@@ -645,7 +679,8 @@ WEB_FETCH_TOOL = ToolDef(
 
 
 def register_web_tools(registry: Any, *, search_backend: Optional[SearchBackend] = None,
-                       cache: Optional[ResultCache] = None, timeout: float = 20.0,
+                       cache: Optional[ResultCache] = None,
+                       fetch_cache: Optional[ResultCache] = None, timeout: float = 20.0,
                        deny_domains: Any = DEFAULT_DENY_DOMAINS) -> Any:
     """Add ``web_search`` + ``web_fetch`` to a :class:`GrowableToolRegistry`.
 
@@ -666,7 +701,8 @@ def register_web_tools(registry: Any, *, search_backend: Optional[SearchBackend]
         name="web_fetch",
         description=WEB_FETCH_TOOL.description,
         args_model=WebFetchArgs,
-        handler=make_web_fetch(timeout=timeout, deny_domains=deny_domains),
+        handler=make_web_fetch(timeout=timeout, deny_domains=deny_domains,
+                               cache=fetch_cache),
     ))
     return registry
 
@@ -683,6 +719,7 @@ __all__ = [
     "WEB_FETCH_TOOL",
     "register_web_tools",
     "DEFAULT_SEARCH_TTL_SECONDS",
+    "DEFAULT_FETCH_TTL_SECONDS",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_DENY_DOMAINS",
 ]

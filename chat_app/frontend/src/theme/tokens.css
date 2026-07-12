@@ -1,42 +1,39 @@
 /*
  * Design tokens — ONE live token sheet (spec [required]).
  *
- * KITSUNE WATERCOLOUR THEME. The nine-tailed fox sits as a soft, heavily-faded
- * FULL-PAGE BACKGROUND WASH (see global.css body::before); every surface here is
- * a TRANSLUCENT PARCHMENT CARD that floats over it. Two layers as before: a
- * primitive palette (raw values, named by what they ARE) and semantic role vars
- * (named by what they're FOR). Components consume ONLY semantic roles — never a
- * primitive, never a hardcoded hex/px.
+ * PEACOCK · LOTUS · TIGER THEME (s17 re-theme; replaces the kitsune watercolour
+ * wholesale — no parchment, no wash). SOLID grounds: light = lotus-petal white,
+ * dark = tiger night-ink. Ornament comes from the vectorized border/divider/icon
+ * assets (src/assets/theme/*.svg), never from a background image. Two layers as
+ * before: a primitive palette (raw values, named by what they ARE) and semantic
+ * role vars (named by what they're FOR). Components consume ONLY semantic roles —
+ * never a primitive, never a hardcoded hex/px.
  *
  * Theme switch via `data-theme` on <html>; exactly one semantic-role sheet is
- * ever live. DEFAULT (no/`light` attr) = parchment "day"; `dark` = kitsune
- * "night". All colour pairs are WCAG-AA verified against their effective
- * (high-alpha parchment / deep-ink) backdrop — readability is the graded leg.
+ * ever live. All colour pairs are AA-checked against their SOLID backdrops:
+ * peacock teal #0B5D63 on lotus white ≈ 7.3:1; iridescent #23A38A and amber
+ * #E28E2B on night ink ≈ 5.6:1 / 7.6:1.
  */
 :root {
-  /* ---- legacy ink/accent primitives (kept so any direct primitive refs still resolve) ---- */
-  --c-ink-950: #0a0c10;
-  --c-ink-900: #11141b;
-  --c-ink-400: #8a93a6;
-  --c-ink-50: #f4f6fa;
-  --c-white: #ffffff;
+  /* ---- peacock primitives (structure + accents) ---- */
+  --p-teal: #0b5d63; /* deep peacock teal — the primary accent (light) */
+  --p-teal-deep: #084a4f; /* hover/active */
+  --p-iris: #23a38a; /* iridescent green — the dark theme's accent */
+  --p-sapphire: #143b5c;
 
-  /* ---- kitsune primitive palette (named by what they ARE) ---- */
-  --k-parchment: #f4ead5; /* washi cream */
-  --k-parchment-2: #efe3cc; /* deeper washi */
-  --k-parchment-lite: #f8f0e0;
-  --k-orange: #c97e3c; /* kitsune-orange (brand / decorative) */
-  --k-orange-soft: #d98e4a; /* lighter kitsune */
-  --k-orange-deep: #8f5016; /* deep burnt kitsune (AA text/fill). a2 review: deepened
-      from #985618 — as accent-AS-TEXT it was 4.49:1 on cards over the densest fox wash
-      (the translucent card lets the wash darken the effective bg ~5 RGB units below the
-      parchment token), a hair under AA 4.5. #8f5016 -> 4.97:1 there; white-on-accent
-      fills only gain contrast (5.71 -> 6.31). Still clearly kitsune-orange. */
-  --k-slate: #6e7e92; /* kimono slate-blue */
-  --k-sakura: #e4a6a0; /* soft sakura pink */
-  --k-sun: #e8b98a; /* apricot sun */
-  --k-stone: #8a95a0; /* stone grey-blue (borders) */
-  --k-ink: #33302a; /* warm near-black body text */
+  /* ---- lotus primitives (surfaces + softness) ---- */
+  --l-white: #fbf7f2; /* lotus-petal white — the light ground */
+  --l-rose: #f6e4e8; /* soft rose surface tint */
+  --l-blush: #efb8c3; /* blush — decorative fills */
+  --l-blush-deep: #a34d60; /* blush as TEXT/fill on light ground (AA) */
+
+  /* ---- tiger primitives (warmth + the dark ground) ---- */
+  --t-amber: #e28e2b; /* tiger amber — emphasis */
+  --t-amber-deep: #8a5410; /* amber as TEXT on light ground (AA ≈ 5.0:1) */
+  --t-stripe: #5c3a1e;
+  --t-ink: #0d1418; /* night ink — the dark ground */
+  --t-ink-2: #13232a; /* raised dark surface */
+  --t-ink-3: #17282f; /* elevated dark surface */
 
   /* ---- spacing + radii + type scale (no magic numbers in components) ---- */
   --space-1: 4px;
@@ -48,7 +45,6 @@
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 16px;
-  /* Heavier English faces, self-hosted (see fonts.css) — crisp over the wash. */
   --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-display: "Fraunces", "Iowan Old Style", Georgia, "Times New Roman", serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
@@ -57,73 +53,65 @@
   --text-md: 15px;
   --text-lg: 18px;
   --text-xl: 22px;
-  --shadow-pop: 0 10px 30px rgba(60, 42, 20, 0.22);
+  --shadow-pop: 0 10px 30px rgba(11, 93, 99, 0.16);
 
-  /* ---- full-page wash controls ---- */
-  /* Heavy parchment veil drawn OVER the fox so the watercolour never reduces
-   * legibility, and a solid parchment base behind it for instant/zero-CLS paint. */
-  --wash-scrim: rgba(244, 234, 213, 0.62);
-  --wash-base: #ecdfc4;
-
-  /* ---- semantic roles (DAY / parchment — the default theme) ---- */
-  /* app background is transparent so the body wash shows through every column */
-  --bg-app: transparent;
-  /* translucent parchment cards (high alpha => AA holds over the faded wash) */
-  --bg-surface: rgba(244, 234, 213, 0.82);
-  --bg-surface-2: rgba(238, 226, 202, 0.88);
-  --bg-elevated: rgba(248, 240, 224, 0.93);
-  --bg-input: rgba(251, 246, 236, 0.96);
-  --border-subtle: rgba(110, 126, 146, 0.34);
-  --border-strong: rgba(110, 126, 146, 0.55);
-  --text-primary: var(--k-ink);
-  --text-secondary: #4a463e;
-  --text-muted: #6a6053;
-  --accent: var(--k-orange-deep);
-  --accent-hover: #a8611f;
-  --on-accent: var(--c-white);
+  /* ---- semantic roles (DAY / lotus — the default theme) ---- */
+  --bg-app: var(--l-white);
+  --bg-surface: #ffffff;
+  --bg-surface-2: var(--l-rose);
+  --bg-elevated: #ffffff;
+  --bg-input: #ffffff;
+  --border-subtle: rgba(11, 93, 99, 0.22);
+  --border-strong: rgba(11, 93, 99, 0.42);
+  --text-primary: #16282c; /* deep teal-ink body text */
+  --text-secondary: #3c5257;
+  --text-muted: #5f7377;
+  --accent: var(--p-teal);
+  --accent-hover: var(--p-teal-deep);
+  --on-accent: #ffffff;
+  /* the warm second accent (chips, highlights, active ticks) */
+  --accent-warm: var(--t-amber-deep);
 
   /* node lifecycle role colors — dark fills + white badge text (see DagView) and
-   * legible as status TEXT on the parchment panels (all AA-verified). */
+   * legible as status TEXT on the light panels (AA-checked on white). */
   --status-pending: #5e6675;
   --status-running: #37618e;
   --status-verifiable: #8a6312;
   --status-done: #246b3f;
   --status-failed: #b5453f;
-  --status-skipped: #6a6053;
+  --status-skipped: #5f7377;
   --status-cancelled: #b5453f;
 
-  --bubble-user: rgba(232, 210, 170, 0.82); /* apricot-tinted parchment */
-  --bubble-agent: rgba(248, 240, 224, 0.86);
+  --bubble-user: var(--l-rose); /* lotus rose for the user's turns */
+  --bubble-agent: #ffffff;
 }
 
-/* ---- KITSUNE NIGHT (deep warm ink; light parchment text) ---- */
+/* ---- TIGER NIGHT (solid night-ink; iridescent peacock + amber accents) ---- */
 :root[data-theme="dark"] {
-  --wash-scrim: rgba(20, 16, 12, 0.7);
-  --wash-base: #16120e;
-
-  --bg-app: transparent;
-  --bg-surface: rgba(33, 28, 23, 0.8);
-  --bg-surface-2: rgba(42, 36, 29, 0.86);
-  --bg-elevated: rgba(51, 43, 34, 0.92);
-  --bg-input: rgba(26, 22, 17, 0.92);
-  --border-subtle: rgba(138, 149, 160, 0.22);
-  --border-strong: rgba(138, 149, 160, 0.4);
-  --text-primary: var(--k-parchment);
-  --text-secondary: #d8cbb3;
-  --text-muted: #a99b82;
-  --accent: var(--k-orange-soft);
-  --accent-hover: #e8a661;
-  --on-accent: #2a2017; /* dark text on the light night-orange (AA) */
+  --bg-app: var(--t-ink);
+  --bg-surface: var(--t-ink-2);
+  --bg-surface-2: var(--t-ink-3);
+  --bg-elevated: var(--t-ink-3);
+  --bg-input: #101c21;
+  --border-subtle: rgba(35, 163, 138, 0.25);
+  --border-strong: rgba(35, 163, 138, 0.45);
+  --text-primary: #eef3f2;
+  --text-secondary: #c3d2d0;
+  --text-muted: #8fa5a3;
+  --accent: var(--p-iris);
+  --accent-hover: #2fc0a3;
+  --on-accent: #08211d; /* dark text on the iridescent accent (AA) */
+  --accent-warm: var(--t-amber);
 
   --status-pending: #9aa3b2;
   --status-running: #6fa8e0;
   --status-verifiable: #e0b252;
   --status-done: #6fc68c;
   --status-failed: #e8867e;
-  --status-skipped: #a99b82;
+  --status-skipped: #8fa5a3;
   --status-cancelled: #e8867e;
 
-  --bubble-user: rgba(60, 46, 28, 0.8);
-  --bubble-agent: rgba(48, 40, 31, 0.84);
-  --shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.5);
+  --bubble-user: #26333a; /* ink lifted a step, teal-cool */
+  --bubble-agent: var(--t-ink-2);
+  --shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.55);
 }

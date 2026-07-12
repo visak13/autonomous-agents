@@ -35,11 +35,15 @@ from .factory import (
     PlanNode,
 )
 from .planner import (
+    FOLLOWUP_PLANS,
     HEAL_ACTIONS,
     AmbiguityDecision,
+    FollowupDecision,
     HealDecision,
+    NodeFinalization,
     Planner,
     PlanResult,
+    ResearchReviewStatus,
 )
 from .incremental import (
     DEFAULT_MAX_NODES,
@@ -63,11 +67,6 @@ from .reactor import (
     EVENT_NODE_CLARIFICATION,
     REACTOR_KINDS,
     PlannerReactor,
-)
-from .review_injection import (
-    FINAL_REVIEW_ID,
-    REVIEW_SUFFIX,
-    inject_reviews,
 )
 from .runtime import (
     EVENT_NODE_CANCELLED,
@@ -149,7 +148,6 @@ from .shapes import (
     load_shape,
     load_shapes,
     shape_names,
-    unroll_shape,
 )
 from .scheduler import (
     Dispatch,
@@ -190,12 +188,31 @@ from .research_tree import (
     DecisionResult,
     LeafResult,
     N4_TREE_DEPTH_CEILING,
+    NEW_MEMORY,
+    ResearchMemoryStore,
     ResearchState,
     Tree,
     TreeConfig,
     TREE_TOOLS,
+    build_research_brief,
+    compose_research_narrative,
+    get_research_memory_store,
+    resolve_brief_memory,
+    NEW_MEMORY_SENTINEL,
+    normalize_brief_memory_index,
     parse_tree_call,
+    render_scoped_source_index,
+    render_verbatim_source_index,
+    resolve_chunk,
     run_decision_node,
+)
+from .source_tools import (
+    LoadSourceArgs,
+    make_load_source,
+    make_load_source_tool,
+    ReadNotesArgs,
+    make_read_notes,
+    make_read_notes_tool,
 )
 from .discovery_tools import (
     GET_SHAPES_TOOL,
@@ -205,6 +222,23 @@ from .discovery_tools import (
     make_get_shapes,
     make_get_specs,
     register_discovery_tools,
+)
+from .bundles import (
+    BUNDLE_FILE,
+    BUNDLE_OBJECT,
+    BUNDLE_PLANNING,
+    BUNDLE_RESEARCH,
+    BUNDLE_RESEARCH_READ,
+    FileBundle,
+    ObjectBundle,
+    PlanningBundle,
+    ResearchBundle,
+    ResearchReadBundle,
+    UnknownBundleError,
+    bundle_names,
+    compose_doctrine,
+    compose_tool_specs,
+    get_bundle,
 )
 from . import stub
 
@@ -238,7 +272,6 @@ __all__ = [
     "DEEP_RESEARCH",
     "VALID_EXECUTION",
     "VALID_POSITIONS",
-    "unroll_shape",
     "load_shape",
     "load_shapes",
     "shape_names",
@@ -265,6 +298,10 @@ __all__ = [
     "PlanResult",
     "HealDecision",
     "HEAL_ACTIONS",
+    "FollowupDecision",
+    "FOLLOWUP_PLANS",
+    "ResearchReviewStatus",
+    "NodeFinalization",
     # incremental seed-then-fill authoring (the eda-base3 port, d3)
     "IncrementalPlanner",
     "DEFAULT_MAX_NODES",
@@ -280,10 +317,6 @@ __all__ = [
     "PlannerReactor",
     "EVENT_NODE_CLARIFICATION",
     "REACTOR_KINDS",
-    # framework-injected review (P2.2, d129.3)
-    "inject_reviews",
-    "REVIEW_SUFFIX",
-    "FINAL_REVIEW_ID",
     # runtime
     "AgentRuntime",
     "RuntimeResult",
@@ -364,12 +397,30 @@ __all__ = [
     "DecisionResult",
     "LeafResult",
     "N4_TREE_DEPTH_CEILING",
+    "NEW_MEMORY",
+    "ResearchMemoryStore",
     "ResearchState",
     "Tree",
     "TreeConfig",
     "TREE_TOOLS",
+    "build_research_brief",
+    "compose_research_narrative",
+    "get_research_memory_store",
+    "resolve_brief_memory",
+    "NEW_MEMORY_SENTINEL",
+    "normalize_brief_memory_index",
     "parse_tree_call",
+    "render_scoped_source_index",
+    "render_verbatim_source_index",
+    "resolve_chunk",
     "run_decision_node",
+    # s14/P3A item 3 — capped load-on-demand source retrieval tool
+    "LoadSourceArgs",
+    "make_load_source",
+    "make_load_source_tool",
+    "ReadNotesArgs",
+    "make_read_notes",
+    "make_read_notes_tool",
     # discovery tools (get_shapes / get_specs) — queryable shape/spec catalog
     "GET_SHAPES_TOOL",
     "GET_SPECS_TOOL",
@@ -378,4 +429,21 @@ __all__ = [
     "make_get_shapes",
     "make_get_specs",
     "register_discovery_tools",
+    # OO tool-bundle architecture (d190-d194 + d212 capability-domain redraw):
+    # get_bundle(name) -> {tools + doctrine}; a node COMPOSES a SET of bundles.
+    "ObjectBundle",
+    "PlanningBundle",
+    "ResearchBundle",
+    "ResearchReadBundle",
+    "FileBundle",
+    "UnknownBundleError",
+    "get_bundle",
+    "compose_doctrine",
+    "compose_tool_specs",
+    "bundle_names",
+    "BUNDLE_OBJECT",
+    "BUNDLE_PLANNING",
+    "BUNDLE_RESEARCH",
+    "BUNDLE_RESEARCH_READ",
+    "BUNDLE_FILE",
 ]

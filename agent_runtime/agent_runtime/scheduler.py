@@ -21,11 +21,11 @@ turn:
 
 It consumes ONLY the :class:`~agent_runtime.factory.PlanDAG` + the done / running
 id sets — no transport, no I/O, no model — so it is deterministic and fully
-testable offline. The ``deep-research`` (cyclic) shape is UNROLLED into a bounded
-acyclic role-tagged DAG by :func:`~agent_runtime.shapes.unroll_shape` and then
-dispatched through THIS same scheduler like any other DAG (a3 re-architecture —
-there is no per-shape executor); the unroll's growing-visibility edges make every
-round depend on the prior ones, so the rounds run in order under either mode.
+testable offline. The ``deep-research`` shape's research TOPOLOGY is AUTHORED at runtime by
+the :class:`~agent_runtime.research_tree.DagGrower` (decompose-first → grow on note gaps) from
+an engine-owned tool-less growable SEED — there is NO deterministic unroll (s16/a3 d239/d247)
+and no per-shape executor. The grown nodes carry growing-visibility edges so each layer depends
+on the prior ones, and the whole DAG dispatches through THIS same scheduler like any other DAG.
 """
 from __future__ import annotations
 

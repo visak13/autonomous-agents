@@ -273,16 +273,56 @@ class ShapeSelector:
         *,
         shapes_dir: Optional[Any] = None,
         spec_names: Optional[Sequence[str]] = None,
+        spec_catalog: Optional[Sequence[Mapping[str, Any]]] = None,
+        tool_catalog: Optional[Sequence[Mapping[str, Any]]] = None,
         max_repair_attempts: int = 2,
         call_opts: Optional[Mapping[str, Any]] = None,
+        exposed_shapes: Optional[Sequence[str]] = None,
+        exposed_specs: Optional[Sequence[str]] = None,
     ) -> None:
         self.transport = transport
         self.shapes_dir = shapes_dir
+        # d230 REGISTRY SCOPING: optional allow-lists narrowing which shapes the
+        # selector OFFERS (the enum + the advertised catalog in the prompt) and which
+        # specs it advertises, so a small model picks from the curated required-now
+        # set instead of a flat, fully-exposed registry (the a3 divert, d228). ``None``
+        # exposes the full on-disk catalog (the generic default; tests rely on it). The
+        # raw ``load_shapes`` loader is untouched — a curated-OUT shape still exists.
+        self._exposed_shapes = set(exposed_shapes) if exposed_shapes is not None else None
+        # ``exposed_specs`` curates only the ADVERTISED spec catalog (what the system
+        # can DELIVER — narrows the default routing surface). It deliberately does NOT
+        # curate ``spec_names`` (the requested_specs enum + the missing-specialist
+        # classification): a user who EXPLICITLY names a REGISTERED spec must still be
+        # recognised even if that spec is outside the curated default set (user-wins).
+        _allow_specs = set(exposed_specs) if exposed_specs is not None else None
         # F5: the registered specialization names the model may recognise as
         # USER-REQUESTED (the ``requested_specs`` enum + the prompt's advertised
         # list). Empty when the caller supplies none — then named-spec extraction is
         # simply unconstrained/unused, identical to the pre-F5 behaviour.
         self.spec_names = [str(s) for s in (spec_names or []) if str(s).strip()]
+        # s15 ROUTING PURITY (d148/d151): the model picks the shape by REASONING over
+        # the shape / spec / TOOL descriptions — no boolean code-switch downstream. So
+        # the selector prompt now advertises the SPEC one-liners (what each
+        # specialization DELIVERS — html report file, chat answer, email — which is
+        # what determines a request's output, d161) and the TOOL one-liners (what
+        # capabilities a plan can call) alongside the shapes. Both are optional
+        # ``[{name, description}]`` listings; when absent the prompt degrades to the
+        # pre-s15 shape+spec-names form (no regression). ``spec_catalog`` supersedes
+        # the bare ``spec_names`` listing when supplied (it carries descriptions); the
+        # ``requested_specs`` enum still derives from ``spec_names``.
+        self.spec_catalog = [
+            {"name": str(e.get("name", "")).strip(),
+             "description": " ".join(str(e.get("description", "") or "").split())}
+            for e in (spec_catalog or [])
+            if str(e.get("name", "")).strip()
+            and (_allow_specs is None or str(e.get("name", "")).strip() in _allow_specs)
+        ]
+        self.tool_catalog = [
+            {"name": str(e.get("name", "")).strip(),
+             "description": " ".join(str(e.get("description", "") or "").split())}
+            for e in (tool_catalog or [])
+            if str(e.get("name", "")).strip()
+        ]
         self.max_repair_attempts = max_repair_attempts
         self._call_opts = {**_SELECT_OPTS, **dict(call_opts or {})}
         # Captured each call for the behavioural proof (the exact enum advertised +
@@ -291,8 +331,15 @@ class ShapeSelector:
         self.last_selection: Optional[ShapeSelection] = None
 
     def catalog(self) -> dict[str, ShapeSpec]:
-        """The on-disk shape catalog harvested for this selection (name → spec)."""
-        return load_shapes(self.shapes_dir)
+        """The shape catalog OFFERED for this selection (name → spec).
+
+        Harvested fresh from disk each call; when ``exposed_shapes`` was supplied it
+        is narrowed to that curated allow-list (d230) so the enum + advertised list
+        offer only the required-now shapes. ``None`` exposes the full catalog."""
+        catalog = load_shapes(self.shapes_dir)
+        if self._exposed_shapes is None:
+            return catalog
+        return {n: s for n, s in catalog.items() if n in self._exposed_shapes}
 
     def _system_prompt(self, catalog: Mapping[str, ShapeSpec]) -> str:
         """Describe the available shapes (name + one-line description) + the rule.
@@ -302,11 +349,19 @@ class ShapeSelector:
         query, or :data:`ESCALATE` when unsure — never to invent a shape."""
         lines = [
             "You are a plan-shape SELECTOR. Given a user GOAL, choose the SINGLE "
-            "plan shape that best fits how the work should be executed. Choose ONLY "
-            "from the shapes listed below — do not invent one. If you are NOT "
-            f"confident any shape fits, choose '{ESCALATE}'.",
+            "plan shape that best fits how the work should be executed. A SHAPE is "
+            "the execution DISCIPLINE the whole plan runs under (e.g. a straight "
+            "sequential chain, or an exhaustive multi-round investigation). The "
+            "'shape' field's ONLY legal values are the shape names in AVAILABLE "
+            f"SHAPES below (or '{ESCALATE}'). A SPECIALIZATION or a TOOL name is "
+            "NEVER a legal shape — those are a DIFFERENT KIND (capabilities the "
+            "plan's individual NODES carry INSIDE the chosen shape), listed only so "
+            "you understand what the plan can deliver and do. Choose ONLY from the "
+            "AVAILABLE SHAPES — do not invent one, and never answer with a "
+            f"specialization or tool name. If you are NOT confident any shape fits, "
+            f"choose '{ESCALATE}'.",
             "",
-            "AVAILABLE SHAPES:",
+            "AVAILABLE SHAPES (the ONLY legal values for the 'shape' field):",
         ]
         for name in sorted(catalog):
             desc = " ".join(str(catalog[name].description or "").split())
@@ -314,6 +369,46 @@ class ShapeSelector:
         lines.append(
             f"  - {ESCALATE}: none of the above clearly fits; defer the choice."
         )
+        # s15 ROUTING PURITY (d148/d151/d161): give the model the SPEC + TOOL
+        # descriptions so the shape choice is REASONED over what the system can
+        # actually DELIVER and DO — not a downstream boolean code-switch. The SPEC a
+        # request implies (a report → an HTML-writer that saves a styled file; a chat
+        # answer → an SSE responder; an email → a mailer) is what determines the
+        # OUTPUT, so naming the specs here lets the model see that a "detailed report"
+        # is a deep, file-producing shape, while a quick answer is not. The TOOLS show
+        # the capabilities a plan can call (web search/fetch, file write, mail) so the
+        # model can tell a web-research request from a knowledge-only one.
+        if self.spec_catalog:
+            lines.append(
+                "\nSPECIALIZATIONS — a DIFFERENT KIND, these are NOT shapes. Each is "
+                "a capability / output-format / tone that the plan's individual NODES "
+                "carry INSIDE the chosen shape (what the system can DELIVER). They are "
+                "listed so you can see a request's likely output — but a specialization "
+                "name is NEVER a valid 'shape' value; never put one in the shape field:"
+            )
+            for e in sorted(self.spec_catalog, key=lambda x: x["name"]):
+                d = e["description"] or "(no description)"
+                lines.append(f"  - {e['name']}: {d}")
+            # The observed misroute (RP-0: E4B emitted the SPEC 'web-research' into the
+            # shape slot → membership reject → the deep-research report diverted). A
+            # research-flavoured SPEC name reads like the deep-research SHAPE; teach the
+            # KIND boundary explicitly so the model never conflates them.
+            lines.append(
+                "IMPORTANT: a research-flavoured specialization (e.g. 'web-research', "
+                "'research-methodology', 'research-analyst') is a gather NODE's research "
+                "CAPABILITY, NOT a shape. An investigation is the 'deep-research' SHAPE, "
+                "which then carries such research specializations on its gather nodes — "
+                "so a deep web report is shape='deep-research' (never shape='web-research')."
+            )
+        if self.tool_catalog:
+            lines.append(
+                "\nTOOLS — also a DIFFERENT KIND, NOT shapes. These are the "
+                "capabilities a plan's nodes can CALL (web search/fetch, file write, "
+                "mail); a tool name is never a valid 'shape' value either:"
+            )
+            for e in sorted(self.tool_catalog, key=lambda x: x["name"]):
+                d = e["description"] or "(no description)"
+                lines.append(f"  - {e['name']}: {d}")
         # F5: choose the shape for the request's ACTUAL INTENT, not its phrasing —
         # the same informational need asked as a question, a 'describe…', or an
         # imperative is the SAME work and should route the same way. Pick the shape
@@ -329,6 +424,45 @@ class ShapeSelector:
             "an exhaustive multi-round survey of ONE topic = a deep-research shape. "
             "Do not over-escalate a simple informational request to a heavy "
             "multi-round shape just because it is phrased as a question."
+        )
+        # s15 (d151) — the SHARP boundary that fixes the observed misroute (traces
+        # 0aecf6c3 / 7511ff6e): a DETAILED / in-depth / exhaustive report on ONE
+        # subject (even one with several internal dimensions — a timeline, the costs,
+        # the causes, the impact of the SAME event) is the DEEP-RESEARCH shape: it
+        # digs deep, round after round, into that ONE topic. It is NOT a
+        # multi-topic-gather shape. Reserve a concurrent multi-topic gather for when
+        # the user genuinely asks about SEVERAL SEPARATE, UNRELATED subjects at once
+        # ("summarize the latest on AI chips, the housing market, AND the World Cup").
+        # Internal sections of one report are NOT separate topics. When in doubt
+        # between a deep single-topic report and a multi-topic gather, a "detailed
+        # report on <one subject>" is deep-research.
+        lines.append(
+            "\nONE topic in depth (a detailed/in-depth/exhaustive report on a single "
+            "subject — its timeline, costs, causes, impact are all facets of that ONE "
+            "subject) = the deep-research shape, NEVER a multi-topic gather. A "
+            "multi-topic gather is ONLY for several SEPARATE, UNRELATED subjects "
+            "requested together. Do not mistake one report's internal sections for "
+            "separate topics."
+        )
+        # RP-4 (d322/d332) SCHEDULE-ONLY: a purely RECURRING / SCHEDULED request SCHEDULES
+        # the WHOLE task to run AT THE SCHEDULED TIME — nothing runs now. The scheduled unit
+        # is the whole composed DAG, which RE-RUNS FRESH at each fire (the research/report
+        # work happens AT FIRE, when the stored task re-composes its own whole DAG). So the
+        # plan is a single SCHEDULE LEG (one cron_add node storing the whole task), NOT a
+        # research-now plan: do NOT pick 'deep-research' (or any run-now shape) for a
+        # purely-recurring request. This SUPERSEDES the RP-0 'schedule is a leg wrapped
+        # around the [run-now] plan' doctrine, which assumed run-now+schedule.
+        lines.append(
+            "\nSCHEDULE-THIS vs DO-THIS-NOW are two DIFFERENT intents — separate them. A "
+            "RECURRING / SCHEDULED request ('every morning …', 'daily at 8am …', "
+            "'schedule a weekly …') is SCHEDULE-ONLY: it SCHEDULES the whole task to run "
+            "at the cadence and runs NOTHING now (the whole task re-runs FRESH at each "
+            "fire). Pick the 'schedule-leg' shape so the plan authors ONE "
+            "cron_add node storing the whole task — NEVER 'deep-research' or any run-now "
+            "research shape. A one-off 'do this NOW' request is the opposite: run-now "
+            "nodes and no cron_add. Only when the user EXPLICITLY asks for BOTH now AND "
+            "recurring (e.g. 'do it now AND every morning') author both; the default "
+            "'every morning' / 'daily' / 'weekly' request is schedule-only."
         )
         # F5 SIGNAL 1 — no-search constraint. The model JUDGES whether the request
         # forbids the web (intent, across any phrasing), not a keyword match.

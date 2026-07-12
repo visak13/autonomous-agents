@@ -14,20 +14,21 @@ consume it unchanged).
 Why the s8 declarative format is clean enough for a small model to generate
 ---------------------------------------------------------------------------
 A shape is fully described by a handful of fields
-(``name, description, execution, max_iter, round_roles, final_roles`` — see
+(``name, description, execution, max_iter`` — see
 :class:`~agent_runtime.shapes.ShapeSpec`), so authoring it is a SINGLE small
-structured decision, not the whole-DAG one-shot a 4.6B model struggles with. Two
-plug-n-play families, one schema:
+structured decision, not the whole-DAG one-shot a 4.6B model struggles with. s16/a3
+(d239/d247): a shape declares NO per-node topology in ANY family — round_roles/final_roles
+are RETIRED. Two plug-n-play families, one schema:
 
 * a DISCIPLINE shape (``execution`` = ``sequential`` / ``concurrent``) carries NO
   per-node topology — its DAG is authored node-by-node at plan time by the
   :class:`~agent_runtime.incremental.IncrementalPlanner`; the shape only declares
-  the dispatch posture. So ``round_roles`` / ``final_roles`` are forced ``[]`` and
-  ``max_iter`` is 1.
-* the bounded-cyclic family (``execution`` = ``deep-research``) DOES carry topology
-  declaratively: ``round_roles`` (each non-final round) + ``final_roles`` (the
-  final round) + ``max_iter`` (the round ceiling), which
-  :func:`~agent_runtime.shapes.unroll_shape` expands into the role-tagged DAG.
+  the dispatch posture (``max_iter`` is 1).
+* the deep-research family (``execution`` = ``deep-research``) ALSO carries no fixed
+  topology: its research DAG is AUTHORED at runtime by the
+  :class:`~agent_runtime.research_tree.DagGrower` (decompose-first → grow on note gaps) from
+  an engine-owned tool-less growable seed. The shape carries only the ``max_iter`` depth
+  ceiling + the ``expand_on_gaps`` growable marker (+ doctrine in the canonical file).
 
 The call uses the PROMPT-JSON reasoning path (the SAME one
 :class:`~agent_runtime.incremental.IncrementalPlanner` uses for tool-call
@@ -64,10 +65,10 @@ from .selfheal import MalformedOutputError
 from .shapes import (
     SHAPES_DIR,
     VALID_EXECUTION,
-    VALID_POSITIONS,
     ShapeError,
     ShapeSpec,
     load_shape,
+    load_shapes,
 )
 from .tracing import get_tracer, run_blocking_in_span
 
@@ -95,13 +96,12 @@ _UNROLLABLE = "deep-research"
 def build_shape_schema() -> dict[str, Any]:
     """The native ``format`` schema for ONE authored shape (enum + required keys).
 
-    ``execution`` is enum-constrained to :data:`~agent_runtime.shapes.VALID_EXECUTION`
-    and the two position arrays to :data:`~agent_runtime.shapes.VALID_POSITIONS` (d48:
-    deep-research round POSITIONS, decoupled from node roles), so Gemma can only emit a
-    legal discipline / position vocabulary. EVERY field is ``required`` — the small
-    model reliably fills a fully-specified object but omits OPTIONAL ones, so a
-    discipline shape emits EMPTY position arrays + ``max_iter`` 1 rather than unset."""
-    roles = sorted(VALID_POSITIONS)
+    ``execution`` is enum-constrained to :data:`~agent_runtime.shapes.VALID_EXECUTION` so
+    Gemma can only emit a legal discipline vocabulary. EVERY field is ``required`` — the
+    small model reliably fills a fully-specified object but omits OPTIONAL ones. s16/a3
+    (d239/d247): a shape NO LONGER declares per-round node positions (round_roles/final_roles
+    RETIRED) — the deep-research research topology is AUTHORED at runtime by reasoning, so a
+    shape is fully described by { name, description, execution, max_iter }."""
     return {
         "type": "object",
         "properties": {
@@ -126,32 +126,15 @@ def build_shape_schema() -> dict[str, Any]:
                     "the dispatch posture: 'sequential' = a strict one-after-another "
                     "chain; 'concurrent' = independent sub-tasks run at the same time "
                     "then combine (modular-parallel); 'deep-research' = bounded "
-                    "iterative rounds that each go deeper, a critic checking each "
-                    "round, ending in synthesis+verify"
+                    "iterative research that decomposes the topic then deepens "
+                    "round-by-round, ending in synthesis+verify"
                 ),
             },
             "max_iter": {
                 "type": "integer",
                 "description": (
-                    "round ceiling — ONLY meaningful for 'deep-research' (e.g. 10); "
+                    "round/depth ceiling — ONLY meaningful for 'deep-research' (e.g. 10); "
                     "use 1 for 'sequential'/'concurrent'"
-                ),
-            },
-            "round_roles": {
-                "type": "array",
-                "items": {"type": "string", "enum": roles},
-                "description": (
-                    "node roles emitted EACH non-final round — ONLY for "
-                    "'deep-research' (use [\"research\",\"critic\"]); [] otherwise"
-                ),
-            },
-            "final_roles": {
-                "type": "array",
-                "items": {"type": "string", "enum": roles},
-                "description": (
-                    "node roles emitted in the FINAL round — ONLY for "
-                    "'deep-research' (use [\"research\",\"synthesis\",\"verify\"]); "
-                    "[] otherwise"
                 ),
             },
         },
@@ -160,8 +143,6 @@ def build_shape_schema() -> dict[str, Any]:
             "description",
             "execution",
             "max_iter",
-            "round_roles",
-            "final_roles",
         ],
     }
 
@@ -182,18 +163,16 @@ def _authoring_guidance() -> str:
         "actionable guidance the planner can apply directly, NOT a verbose essay. "
         "Every field MUST be SHORT and PRECISE — the planner loads this on every plan. "
         "Emit STRICT JSON for ONE shape with keys: "
-        '{"name", "description", "execution", "max_iter", "round_roles", '
-        '"final_roles"}.\n\n'
+        '{"name", "description", "execution", "max_iter"}.\n\n'
         "Choose 'execution' to fit the description:\n"
-        "- 'deep-research': ITERATIVE, DEEPENING research — repeated rounds each "
-        "building on the last, a critic checking each, ending in synthesis + verify. "
-        "Set round_roles=[\"research\",\"critic\"], "
-        "final_roles=[\"research\",\"synthesis\",\"verify\"], max_iter = rounds "
-        "(~10 if unspecified).\n"
+        "- 'deep-research': ITERATIVE, DEEPENING research — decompose the topic into facets, "
+        "gather, then deepen round-by-round, ending in synthesis + verify. Set max_iter = the "
+        "round/depth ceiling (~10 if unspecified). (The research topology is authored at "
+        "runtime — you do NOT declare per-round node roles.)\n"
         "- 'concurrent': INDEPENDENT sub-tasks run AT THE SAME TIME then "
-        "combine/deliver. Set round_roles=[], final_roles=[], max_iter=1.\n"
+        "combine/deliver. Set max_iter=1.\n"
         "- 'sequential': steps run STRICTLY one after another, never overlapping. "
-        "Set round_roles=[], final_roles=[], max_iter=1.\n\n"
+        "Set max_iter=1.\n\n"
         "COMPOSITIONAL / MULTI-PATTERN intent (IMPORTANT): when a description "
         "combines a SEQUENTIAL/linear phase WITH a parallel/modular phase — e.g. "
         "'linear plus modular parallel', or 'a foundation phase, THEN independent "
@@ -207,10 +186,10 @@ def _authoring_guidance() -> str:
         "sequential foundation phase, THEN the parallel fan-out, THEN how the results "
         "combine) so the planner authors the real mix, not a flat line.\n\n"
         "RULES:\n"
-        "- round_roles/final_roles are ONLY for 'deep-research'; for "
-        "'concurrent'/'sequential' they MUST be [] (those steps are authored later, "
-        "per-task — the shape only sets the dispatch posture).\n"
-        "- roles may ONLY be: research, critic, synthesis, verify, worker, reviewer.\n"
+        "- A shape NEVER declares per-node topology: for EVERY posture the steps/rounds are "
+        "authored later (per-task at plan time, or — for 'deep-research' — by the research "
+        "engine reasoning at runtime). The shape only sets the dispatch posture + (for "
+        "deep-research) the max_iter depth ceiling.\n"
         "- 'name' is a short kebab-case id.\n"
         "- 'description' is SELECTION-CRITICAL — it is the ONLY text the shape "
         "SELECTOR reads to choose this shape over the others. Write a STRONG, "
@@ -218,6 +197,32 @@ def _authoring_guidance() -> str:
         "WHEN to pick it OVER the other shapes (for a compositional shape, name BOTH "
         "phases). A bare restatement of the name or the bare posture word is NOT "
         "acceptable — it makes the shape unselectable.\n"
+    )
+
+
+def _catalog_context(shapes_dir: Optional[Path] = None, *, limit: int = 12) -> str:
+    """A compact EXISTING-SHAPES block for the author/refine prompts (s17, d249).
+
+    Context-aware generation: the model sees the catalog its new shape will be
+    selected AGAINST (each shape's name + discipline + selection description), so
+    it authors a shape that is genuinely DISTINCT and selectable — not a duplicate
+    of an existing posture under a new name. Bounded to ``limit`` entries (the
+    catalog is small; the block must stay cheap on the 32k window). Empty string
+    when the catalog cannot be read — authoring must never fail on catalog IO."""
+    try:
+        catalog = load_shapes(shapes_dir)
+    except Exception:
+        return ""
+    if not catalog:
+        return ""
+    lines = [
+        f"- {spec.name} [{spec.execution}]: {spec.description}"
+        for _, spec in sorted(catalog.items())[:limit]
+    ]
+    return (
+        "\n\nEXISTING SHAPES (the catalog the planner already selects from — these are "
+        "CONCRETE EXAMPLES of the form, and your shape must be DISTINCT from all of "
+        "them in name AND selection-description):\n" + "\n".join(lines)
     )
 
 
@@ -257,8 +262,6 @@ def _refine_user(prior: ShapeSpec, instruction: str) -> str:
             "description": prior.description,
             "execution": prior.execution,
             "max_iter": int(prior.max_iter),
-            "round_roles": list(prior.round_roles),
-            "final_roles": list(prior.final_roles),
         },
         indent=2,
     )
@@ -371,46 +374,37 @@ def _coerce_spec(
     ):
         execution = "concurrent"
 
-    # Keep only legal POSITIONS (d48; the enum should already guarantee this, but a
-    # repair reply could slip a stray token through the parser).
-    round_roles = tuple(
-        r for r in (parsed.get("round_roles") or []) if str(r) in VALID_POSITIONS
-    )
-    final_roles = tuple(
-        r for r in (parsed.get("final_roles") or []) if str(r) in VALID_POSITIONS
-    )
     try:
         max_iter = int(parsed.get("max_iter") or 1)
     except (TypeError, ValueError):
         max_iter = 1
 
+    # s16/a3 (d239/d247): a shape carries NO per-node topology in ANY posture — round_roles/
+    # final_roles are RETIRED. A 'deep-research' shape is identified by the execution token
+    # alone (ShapeSpec.is_deep_research) and its research topology is AUTHORED at runtime by
+    # the grower; it only carries the max_iter depth ceiling (+ doctrine in the canonical file).
+    # Every other posture is a discipline shape whose DAG the incremental planner authors at
+    # plan time, so it pins a single round.
     if execution == _UNROLLABLE:
-        if not round_roles and not final_roles:
-            raise MalformedOutputError(
-                "authored a deep-research shape with NO round_roles/final_roles — "
-                "an inert cyclic shape; re-author with the round + final roles"
-            )
         max_iter = max(max_iter, 2)
         hard_cap = max(max_iter, DEFAULT_DEEP_RESEARCH_HARD_CAP)
+        # Mark the authored deep-research shape growable so the engine builds a growable seed
+        # (the canonical shipped shape sets this too); the research topology stays reasoned.
+        expand_on_gaps = True
     else:
-        # A discipline shape carries no per-node topology (the incremental planner
-        # authors its DAG at plan time); force the roles empty + a single round so
-        # the file can never be mistaken for an unrollable shape.
-        round_roles = ()
-        final_roles = ()
         max_iter = 1
         hard_cap = 1
+        expand_on_gaps = False
 
-    # ShapeSpec.__post_init__ re-validates execution + roles + bounds, so a coerced
-    # spec is structurally guaranteed before it is ever written.
+    # ShapeSpec.__post_init__ re-validates execution + bounds, so a coerced spec is
+    # structurally guaranteed before it is ever written.
     return ShapeSpec(
         name=name,
         description=description,
         max_iter=max_iter,
         hard_cap=hard_cap,
-        round_roles=round_roles,
-        final_roles=final_roles,
         execution=execution,
+        expand_on_gaps=expand_on_gaps,
         source="<gemma-authored>",
     )
 
@@ -419,9 +413,12 @@ def shape_to_toml(spec: ShapeSpec) -> str:
     """Serialise a :class:`ShapeSpec` to a clean TOML document (round-trippable).
 
     Emits only the fields the loader reads, in a stable order, with a provenance
-    header marking it Gemma-authored. String/array values go through
-    :func:`json.dumps` whose escaping is a safe subset of TOML basic-string syntax,
-    so a description with quotes/newlines round-trips through ``tomllib``."""
+    header marking it Gemma-authored. String values go through :func:`json.dumps`
+    whose escaping is a safe subset of TOML basic-string syntax, so a description
+    with quotes/newlines round-trips through ``tomllib``. s16/a3 (d239/d247): a shape
+    declares NO per-node topology — a 'deep-research' shape carries only the execution
+    token + the max_iter depth ceiling (+ the growable marker); its research topology
+    is authored at runtime by the grower."""
     lines = [
         "# =============================================================================",
         f"# {spec.name} shape — AUTHORED FROM A NATURAL-LANGUAGE DESCRIPTION by the",
@@ -432,11 +429,12 @@ def shape_to_toml(spec: ShapeSpec) -> str:
         f"description = {json.dumps(spec.description)}",
         f"execution = {json.dumps(spec.execution)}",
     ]
-    if spec.is_unrollable:
+    if spec.is_deep_research:
         lines.append(f"max_iter = {int(spec.max_iter)}")
         lines.append(f"hard_cap = {int(spec.hard_cap)}")
-        lines.append(f"round_roles = {json.dumps(list(spec.round_roles))}")
-        lines.append(f"final_roles = {json.dumps(list(spec.final_roles))}")
+        # The growable marker: the engine builds a tool-less self-selecting research seed and
+        # the DagGrower authors the topology by reasoning (no deterministic unroll).
+        lines.append(f"expand_on_gaps = {json.dumps(bool(spec.expand_on_gaps))}")
     return "\n".join(lines) + "\n"
 
 
@@ -551,7 +549,13 @@ class ShapeAuthor:
         )
         ctx = Context(
             system=_system_prompt(),
-            user=f"DESCRIPTION:\n{str(description).strip()}\n\nReturn ONLY the shape JSON.",
+            # s17 (d249): the existing catalog rides the user turn as usage-context —
+            # concrete examples of the form + the set the new shape must be distinct from.
+            user=(
+                f"DESCRIPTION:\n{str(description).strip()}"
+                + _catalog_context(self.shapes_dir)
+                + "\n\nReturn ONLY the shape JSON."
+            ),
             transport=self.transport,
         )
         tracer = get_tracer("agent_runtime.shape_author")
@@ -571,10 +575,12 @@ class ShapeAuthor:
             self.last_spec = spec
             span.set_attribute("author.shape_name", spec.name)
             span.set_attribute("author.execution", spec.execution)
-            span.set_attribute("author.unrollable", spec.is_unrollable)
+            span.set_attribute("author.deep_research", spec.is_deep_research)
             return spec
 
-    async def refine(self, prior: ShapeSpec, instruction: str) -> ShapeSpec:
+    async def refine(
+        self, prior: ShapeSpec, instruction: str, *, keep_name: bool = True
+    ) -> ShapeSpec:
         """Author the NEXT version of ``prior`` from a plain-language ``instruction``.
 
         The free-flow ITERATIVE half of b6 (d18a): an EDIT that BUILDS ON the
@@ -601,7 +607,9 @@ class ShapeAuthor:
         )
         ctx = Context(
             system=_refine_system_prompt(),
-            user=_refine_user(prior, instruction),
+            # s17 (d249): the catalog rides the refine turn too — the updated shape's
+            # description must stay discriminative against its siblings.
+            user=_refine_user(prior, instruction) + _catalog_context(self.shapes_dir),
             transport=self.transport,
         )
         tracer = get_tracer("agent_runtime.shape_author")
@@ -623,13 +631,15 @@ class ShapeAuthor:
                 name_hint=prior.name,
                 request_text=f"{prior.description} {instruction}",
             )
-            # An edit edits IN PLACE: force the prior name regardless of what the
-            # model emitted (dataclasses.replace re-runs __post_init__ to re-validate).
-            if spec.name != prior.name:
+            # An edit of an ON-DISK shape edits IN PLACE: force the prior name so the
+            # model can never rename-and-orphan the file. A caller refining an
+            # UNPERSISTED draft (the s17 shape chat's create mode — no file exists)
+            # passes keep_name=False so a requested rename is honored.
+            if keep_name and spec.name != prior.name:
                 spec = replace(spec, name=prior.name)
             self.last_spec = spec
             span.set_attribute("refine.execution", spec.execution)
-            span.set_attribute("refine.unrollable", spec.is_unrollable)
+            span.set_attribute("refine.deep_research", spec.is_deep_research)
             return spec
 
     async def author_and_write(
@@ -654,7 +664,7 @@ class ShapeAuthor:
         path = write_shape(spec, shapes_dir=target_dir)
         # Round-trip guard: the runtime loads from disk, so prove THIS write parses.
         reloaded = load_shape(spec.name, shapes_dir=target_dir)
-        if reloaded.execution != spec.execution or reloaded.is_unrollable != spec.is_unrollable:
+        if reloaded.execution != spec.execution or reloaded.is_deep_research != spec.is_deep_research:
             raise ShapeError(
                 f"authored shape {spec.name!r} did not round-trip the loader "
                 f"(wrote execution={spec.execution!r}, read {reloaded.execution!r})"
@@ -686,7 +696,7 @@ class ShapeAuthor:
         spec = await self.refine(prior, instruction)
         path = write_shape(spec, shapes_dir=target_dir)
         reloaded = load_shape(spec.name, shapes_dir=target_dir)
-        if reloaded.execution != spec.execution or reloaded.is_unrollable != spec.is_unrollable:
+        if reloaded.execution != spec.execution or reloaded.is_deep_research != spec.is_deep_research:
             raise ShapeError(
                 f"refined shape {spec.name!r} did not round-trip the loader "
                 f"(wrote execution={spec.execution!r}, read {reloaded.execution!r})"

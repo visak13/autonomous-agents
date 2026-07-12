@@ -86,6 +86,7 @@ export function SpecChatSurface({ onClose }: SpecChatSurfaceProps) {
           {mode.kind === "landing" ? "← Back to tasks" : "← All specializations"}
         </button>
       </header>
+      <hr className="orn-divider orn-divider-lotus" aria-hidden="true" />
 
       {mode.kind === "landing" && (
         <SpecLanding

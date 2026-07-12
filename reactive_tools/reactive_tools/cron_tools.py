@@ -71,8 +71,9 @@ class CronAddArgs(BaseModel):
         ...,
         min_length=1,
         description=(
-            "The plan/prompt to run when the schedule fires (the agent task, e.g. "
-            "'research today's AI news and email me a summary')."
+            "The WHOLE self-contained task to run each time the schedule fires (the "
+            "full user request minus the cadence, which goes in 'schedule') — re-run "
+            "fresh from scratch on every fire. Never a sub-step, placeholder or empty."
         ),
     )
     name: str = Field(
@@ -168,10 +169,11 @@ def build_cron_tools(db_path: str | os.PathLike[str] | None = None,
     add_def = ToolDef(
         name=CRON_ADD_NAME,
         description=(
-            "Schedule a recurring task: store a 5-field cron expression (e.g. "
-            "'0 9 * * *') plus the plan/prompt to run when it fires. Returns the "
-            "new job's id. Does not run the job now — a background scheduler fires "
-            "it on schedule."
+            "Schedule a task to run on a recurring schedule (for any 'every morning / "
+            "daily / weekly / schedule …' request). 'schedule' = a 5-field cron "
+            "expression for the cadence (e.g. '0 9 * * *'); 'prompt' = the WHOLE "
+            "self-contained task, re-run FRESH each fire — so it is NOT run now, "
+            "scheduling it IS doing it. Returns the job id."
         ),
         args_model=CronAddArgs,
         handler=make_cron_add(path),

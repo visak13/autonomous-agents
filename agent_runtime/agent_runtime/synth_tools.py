@@ -46,7 +46,7 @@ import os
 import re
 from collections.abc import Callable, Iterable, Mapping
 from html.parser import HTMLParser
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from .chunked_read import split_chunks
@@ -66,6 +66,22 @@ DEFAULT_WRITER_SOURCE_BUDGET = 12000
 _RELEVANCE_CHUNK_CHARS = 1200
 # Word tokens for the cheap lexical overlap rank (no extra model call).
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# d163 — CONCRETE-FIGURE signal for the write-phase LEAD selection: currency, percentages,
+# numbers-with-a-unit, and dated events. A chunk carrying these is exactly the
+# figure/date-bearing material a substantive report must quote verbatim, so the lead
+# selector PREFERS such chunks (so the writer is PUSHED the figures, never starved). Cheap
+# regex, no model call; selection stays VERBATIM (c13/d50.1 RAW).
+_FIGURE_RE = re.compile(
+    r"\$\s?\d[\d,\.]*"
+    r"|\b\d[\d,\.]*\s?%"
+    r"|\b\d[\d,\.]*\s?(?:billion|million|trillion|bn|killed|dead|deaths|casualties|"
+    r"wounded|injured|troops|soldiers|missiles|drones|barrels|tonnes|tons|km|miles|"
+    r"aircraft|ships)\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}\b"
+    r"|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE,
+)
 # Common function words dropped from the relevance rank so they don't dominate the
 # score (a topic like "casualties and damage" must not rank a chunk by its "and"s).
 # Short CONTENT words (war/oil/gas/un) are kept — length alone is too blunt a filter.
@@ -94,7 +110,9 @@ def resolve_writer_source_budget(default: int = DEFAULT_WRITER_SOURCE_BUDGET) ->
         return max(120, int(default))
 
 
-def select_relevant_excerpt(markdown: str, section_topic: str, budget: int) -> str:
+def select_relevant_excerpt(
+    markdown: str, section_topic: str, budget: int, *, prefer_figures: bool = False
+) -> str:
     """Up to ``budget`` chars of ``markdown`` most RELEVANT to ``section_topic`` (MSF/d89-a).
 
     Replaces the d87 flat ``markdown[:budget]`` slice (which only ever showed a long
@@ -104,20 +122,25 @@ def select_relevant_excerpt(markdown: str, section_topic: str, budget: int) -> s
     original DOCUMENT order — up to ``budget``. Excerpts stay VERBATIM raw slices (c13
     verbatim-citation + d50.1 RAW). No extra model call. Falls back to ``markdown[:budget]``
     when there is no topic / no lexical signal / no chunks, and returns a short source
-    whole."""
+    whole.
+
+    ``prefer_figures`` (d163, the write-phase LEAD): ADD a concrete-figure bonus to each
+    chunk's score (currency / percentages / numbers-with-units / dated events) so the lead
+    PUSHED to the writer carries the figures and dates a substantive sourced report must
+    quote verbatim — instead of an off-figure lede. With ``prefer_figures`` a chunk that
+    matched no topic term but DOES carry figures still ranks (so the writer is never starved
+    of figures); selection stays bounded by ``budget`` and verbatim."""
     md = (markdown or "").strip()
     budget = max(120, int(budget))
     if len(md) <= budget:
         return md
     topic = (section_topic or "").strip()
-    if not topic:
-        return md[:budget]
     terms = {
         w.lower()
         for w in _WORD_RE.findall(topic)
         if len(w) > 1 and w.lower() not in _STOPWORDS
     }
-    if not terms:
+    if not terms and not prefer_figures:
         return md[:budget]
     # Granularity ≤ budget so a small budget still selects RELEVANT chunks instead of
     # truncating one oversized chunk down to its (possibly off-topic) lede.
@@ -125,12 +148,19 @@ def select_relevant_excerpt(markdown: str, section_topic: str, budget: int) -> s
     chunks = split_chunks(md, chunk_size)
     if not chunks:
         return md[:budget]
+    # Score = topic-term overlap + (d163) a concrete-figure bonus when prefer_figures, so a
+    # figure/date-dense chunk is pulled into the lead even if it is topic-light.
     scored = [
-        (sum(ch.lower().count(t) for t in terms), idx, ch)
+        (
+            sum(ch.lower().count(t) for t in terms)
+            + (len(_FIGURE_RE.findall(ch)) if prefer_figures else 0),
+            idx,
+            ch,
+        )
         for idx, ch in enumerate(chunks)
     ]
     if not any(score for score, _, _ in scored):
-        return md[:budget]  # nothing matched the topic — keep the lede deterministically
+        return md[:budget]  # nothing matched topic/figures — keep the lede deterministically
     picked: list[tuple[int, str]] = []
     used = 0
     for score, idx, ch in sorted(scored, key=lambda x: (-x[0], x[1])):
@@ -357,116 +387,101 @@ def is_detailed_task(text: str) -> bool:
     return bool(_DETAILED_INTENT_RE.search(text or ""))
 
 
-def strip_wrapper_closers(content: str) -> str:
-    """Remove document-wrapper closing tags from a NON-FINAL chain page's content (c1b).
-
-    A multi-page HTML deliverable opens the ``<html>``/``<body>`` wrapper on the first
-    page and closes it EXACTLY ONCE on the terminal page (the deferred-close contract).
-    But the small model habitually writes ``</body></html>`` into EVERY page it
-    finishes — so a non-final page leaves an interior ``</body></html>`` mid-document,
-    yielding the structurally invalid duplicate-wrapper file the c1br review flagged
-    (``</html><section …>`` appearing mid-file). Since a non-final page must NEVER
-    close the wrapper, strip every ``</body>``/``</html>`` it emitted (the same
-    ``_HTML_CONTAINER_TAGS`` the close-gap gate balances); the terminal page (plus the
-    :func:`html_close_gap` gate) supplies the single trailing pair. Only the document
-    wrapper closers are removed — ``</head>``, ``</section>`` and all body content are
-    untouched — and only on non-final HTML pages, so the single-file and markdown paths
-    are byte-identical. Trailing whitespace left by the removal is tidied."""
-    out = content or ""
-    for tag in _HTML_CONTAINER_TAGS:
-        out = re.sub(rf"</{tag}\s*>", "", out, flags=re.IGNORECASE)
-    return out.rstrip()
-
-
 # --------------------------------------------------------------------------- #
-# SINGLE-DOCUMENT well-formedness (c10 #2) — the full-document analogue of the
-# c1b wrapper-dedup (:func:`strip_wrapper_closers`).
+# RP-AUDIT F3 (d319/d341/d330) — the DEAD HTML-format-pinned output helpers are
+# REMOVED. Deleted here: the output-MODIFIERS ``strip_wrapper_closers``,
+# ``strip_wrapper_openers`` and ``dedupe_html_documents`` (they stripped/deduped/
+# rewrote the model's bytes) and the HTML-pinned read-only PREDICATES
+# ``top_level_html_doc_count`` and ``begins_html_document`` (plus their now-orphaned
+# ``_HTML_DOC_CLOSE_RE`` / ``_HTML_DOCTYPE_RE`` / ``_HTML_*_OPEN_RE`` /
+# ``_HTML_HEAD_BLOCK_RE`` / ``_HTML_BODY_CLOSE_RE`` regexes). Their live call sites
+# were already retired (runtime.py; RP-3c/d330 replaced the HTML-pinned re-emission
+# guard with the FORMAT-NEUTRAL ``document_restart`` / ``section_reemission`` /
+# ``html_close_gap`` trio, which STAYS). Retaining these behind exports + unit tests
+# left format-baked, output-MODIFYING code "one import away" from being re-wired — a
+# latent violation of the anti-fab charter (the engine authors/fixes/modifies
+# NOTHING). ``test_sf1_reactive_coherence_retired`` now FAILS if any is re-DEFINED or
+# re-EXPORTED, closing that gap. (``_HTML_CONTAINER_TAGS`` is KEPT — the surviving
+# ``html_close_gap`` completeness gate reads it.)
 # --------------------------------------------------------------------------- #
-# A small model asked to "continue" a deliverable that is ALREADY a complete,
-# closed HTML document re-emits a FRESH ``<!DOCTYPE>…</html>`` document, so the
-# appended file ends up holding TWO complete documents concatenated (the browser
-# renders only the first; the rest trails after the first ``</html>``). Tag-BALANCE
-# passes this (2 opens + 2 closes look "balanced"), so single-document-ness must be
-# asserted SEPARATELY — count the top-level ``</html>`` closes (one per complete
-# document) and, when there is more than one, keep only the first.
-_HTML_DOC_CLOSE_RE = re.compile(r"</html\s*>", re.IGNORECASE)
 
 
-def top_level_html_doc_count(doc: str) -> int:
-    """How many COMPLETE top-level HTML documents ``doc`` contains.
-
-    Counts ``</html>`` closes — each complete document ends with exactly one. A bare
-    HTML fragment (no wrapper) or a markdown/text/csv file returns 0, so only a
-    genuine multi-document concatenation (``> 1``) is ever flagged (c10 #2)."""
-    return len(_HTML_DOC_CLOSE_RE.findall(doc or ""))
-
-
-def dedupe_html_documents(doc: str) -> str:
-    """Reduce a multi-document HTML concatenation to its FIRST complete document.
-
-    When ``doc`` holds more than one top-level ``</html>`` (the c10 #2
-    duplicate-document defect — the model re-emitted a fresh full document as its
-    "next section"), keep everything up to and INCLUDING the first ``</html>`` and
-    drop the trailing duplicate document(s): the browser renders only the first, and
-    the first is the substantive (sourced) one the run built. A single document — or
-    a fragment / non-HTML file (``<= 1`` close) — is returned unchanged. Reads the
-    real bytes, never the model's memory (d48-clean)."""
-    s = doc or ""
-    matches = list(_HTML_DOC_CLOSE_RE.finditer(s))
-    if len(matches) <= 1:
-        return doc
-    return s[: matches[0].end()].rstrip()
-
-
-def begins_html_document(content: str) -> bool:
-    """True when ``content`` STARTS a fresh top-level HTML document.
-
-    Recognises a re-emission (a chunk that opens with ``<!DOCTYPE>`` or a top-level
-    ``<html>``) so the orchestration can STOP rather than append a SECOND document on
-    top of an already-complete one (c10 #2)."""
-    s = (content or "").lstrip().lower()
-    return s.startswith("<!doctype") or s.startswith("<html")
-
-
-# --------------------------------------------------------------------------- #
-# STRICT single-document well-formedness (c12 #2b) — strip SIBLING structural
-# OPENS, not only count ``</html>`` CLOSES.
-# --------------------------------------------------------------------------- #
-# On the LONG concurrent-multi-node path each node emits a full ``<!DOCTYPE>…`` doc,
-# so the section-by-section append leaves stray inline ``<html>``/``<body>`` OPEN tags
-# at section boundaries (and a doubled ``</body></html>`` tail) — a structure
-# tag-BALANCE and the ``</html>``-close dedup both miss. ``strip_wrapper_openers``
-# removes the document-wrapper OPEN tags from an APPENDED (non-first) section so it
-# contributes body content only; ``enforce_single_html_document`` is the final
-# normaliser that guarantees exactly one top-level ``<!DOCTYPE>``/``<html>``/
-# ``<head>``/``<body>`` … ``</body></html>`` on the assembled bytes (the c1b
-# :func:`strip_wrapper_closers` is its CLOSE-tag analogue).
-_HTML_DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
-_HTML_HTML_OPEN_RE = re.compile(r"<html(?:\s[^>]*)?>", re.IGNORECASE)
-_HTML_BODY_OPEN_RE = re.compile(r"<body(?:\s[^>]*)?>", re.IGNORECASE)
-_HTML_HEAD_BLOCK_RE = re.compile(r"<head(?:\s[^>]*)?>.*?</head\s*>", re.IGNORECASE | re.DOTALL)
-_HTML_BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE)
+# s14/a8 (d149) — internal CONTEXT-ASSEMBLY scaffolding that must NEVER reach the rendered
+# deliverable. The raw-content write loop folds these headers into the model's USER turn (the
+# overall goal, prior-step findings, the across-parts continuation note, a tool-output path,
+# a read-back file slice); a small writer intermittently ECHOES one back as if it were content,
+# and the loop would then WRITE that scaffolding into the file. These exact internal phrases do
+# not occur in a genuine report, so a line that begins with (or embeds) one is internal
+# scaffolding and is dropped/cut.
+_SCAFFOLDING_MARKERS: tuple[str, ...] = (
+    "SOURCES & FINDINGS FROM PRIOR STEP",
+    "TOOL OUTPUT (",
+    "INPUTS FROM PRIOR STEPS:",
+    "OVERALL GOAL (the user's full request",
+    "PRIOR CONVERSATION (the user is continuing",
+    "CURRENT TASK:",
+    "A document is being written ACROSS PARTS",
+    "The deliverable is ALREADY written to the file",
+    "FETCHED SOURCE CONTENT",
+    "FILE SLICE (offset",
+    "SOURCE BUDGET REACHED",
+)
+# Literal tool-call invocation text a confused model may emit as prose; the write loop must
+# never persist it as document content (the a7 leak: ``file_update(old=…, new=…)`` written
+# verbatim). The reviewer/research tool names followed by ``(`` are the call signature.
+_TOOLCALL_TOKENS: tuple[str, ...] = (
+    "file_update(", "file_read(", "file_write(", "load_source(",
+    "web_search(", "web_fetch(",
+)
+# An ORPHAN tool-call ARGUMENT line — the continuation of a multi-line call whose opener
+# was already cut. A line starting ``old=`` / ``new=`` / ``path=`` / ``offset=`` / … is never
+# legitimate report content (HTML/markdown/prose never opens a line with a bare ``key=``).
+_TOOLCALL_ARG_RE = re.compile(
+    r"^(old|new|path|offset|length|tail|sid|count|chunk|query|url|args|arguments)\s*=",
+    re.IGNORECASE,
+)
 
 
-def strip_wrapper_openers(content: str) -> str:
-    """Remove document-wrapper OPEN tags from a NON-FIRST appended section (c12 #2b).
+def strip_internal_scaffolding(content: str) -> str:
+    """Remove internal context-assembly scaffolding / tool-call text from a raw emission.
 
-    A multi-section HTML deliverable opens the ``<!DOCTYPE>``/``<html>``/``<body>``
-    wrapper on the FIRST write; every later section must contribute body content only.
-    But the small model habitually re-emits a fresh ``<!DOCTYPE><html>…<body>`` at the
-    start of each section it writes, so an APPEND leaves a stray inline ``<html>``/
-    ``<body>`` open mid-document (the c12 #2b residual). Strip the ``<!DOCTYPE>``, the
-    top-level ``<html>``/``<body>`` opens AND any re-emitted ``<head>…</head>`` block
-    from the appended chunk — leaving its real section content. Only the document
-    wrapper is removed; ``<section>``/``<h2>`` and all body content are untouched. Pair
-    with :func:`strip_wrapper_closers` (the CLOSE-tag analogue) on each append so the
-    single close-gap gate supplies the one trailing ``</body></html>``."""
-    out = content or ""
-    out = _HTML_DOCTYPE_RE.sub("", out)
-    out = _HTML_HEAD_BLOCK_RE.sub("", out)
-    out = _HTML_HTML_OPEN_RE.sub("", out)
-    out = _HTML_BODY_OPEN_RE.sub("", out)
-    return out.strip()
+    A small writer model intermittently ECHOES the headers the loop folded into its USER
+    turn (overall-goal / prior-step findings / across-parts / tool-output-path / file-slice
+    scaffolding) or emits a literal tool-call (``file_update(...)``) as if it were content.
+    Without this, the shared raw-content file loop would WRITE that scaffolding into the
+    deliverable (the s14/a8 d149 leak). Each line is checked: a line that BEGINS with an
+    internal marker or a tool-call token is dropped entirely; a line that EMBEDS one mid-text
+    is CUT at the earliest such point (keeping any real content before it); a bare
+    ``{'path': …}`` dict left behind by a folded TOOL OUTPUT block is dropped. Everything else
+    is kept verbatim, so legitimate report content is untouched."""
+    if not content:
+        return content
+    cut_markers = _SCAFFOLDING_MARKERS + _TOOLCALL_TOKENS
+    out: list[str] = []
+    for line in content.splitlines():
+        s = line.strip()
+        if any(s.startswith(m) for m in cut_markers):
+            continue
+        # a path-only dict left by a folded TOOL OUTPUT block (never legit content).
+        if s.startswith("{'path'") or s.startswith('{"path"'):
+            continue
+        # an ORPHAN tool-call argument line (the continuation of a multi-line call whose
+        # opener was already cut, e.g. ``old="…", new="…")``) — never a legit content line.
+        if _TOOLCALL_ARG_RE.match(s) or s == ")":
+            continue
+        # mid-line: cut at the earliest embedded internal marker / tool-call token.
+        cut = len(line)
+        for m in cut_markers:
+            j = line.find(m)
+            if j != -1 and j < cut:
+                cut = j
+        if cut < len(line):
+            head = line[:cut].rstrip()
+            if head:
+                out.append(head)
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _keep_first(text: str, pattern: "re.Pattern[str]") -> str:
@@ -489,59 +504,36 @@ def _keep_last(text: str, pattern: "re.Pattern[str]") -> str:
     return text
 
 
-def has_duplicate_html_structure(doc: str) -> bool:
-    """True when ``doc`` carries duplicate top-level HTML structure (c12 #2b).
-
-    Flags more than one ``<!DOCTYPE>``, top-level ``<html>`` open, ``<body>`` open, or
-    ``</html>`` close — the stray-sibling-tag malformation the long multi-node append
-    leaves. A single well-formed document (or a fragment / non-HTML file) returns
-    False, so :func:`enforce_single_html_document` only fires on a genuine defect."""
-    return (
-        len(_HTML_DOCTYPE_RE.findall(doc or "")) > 1
-        or len(_HTML_HTML_OPEN_RE.findall(doc or "")) > 1
-        or len(_HTML_BODY_OPEN_RE.findall(doc or "")) > 1
-        or len(_HTML_DOC_CLOSE_RE.findall(doc or "")) > 1
-    )
+# RP-1 (d319/d311): repair_table_cells (the d168 cell-close surgery) RETIRED — engine no longer fixes/authors the model's output.
 
 
-def enforce_single_html_document(doc: str) -> str:
-    """Normalise ``doc`` to STRICTLY ONE top-level HTML document (c12 #2b).
+# RP-1 (d319/d311): has_duplicate_html_structure / enforce_single_html_document RETIRED — engine no longer fixes/authors the model's output.
 
-    Two distinct malformations are reduced WITHOUT ever truncating real content:
 
-    * **Duplicate DOCUMENT** — more than one document OPENER (``<!DOCTYPE>``/top-level
-      ``<html>``), i.e. the model crammed two complete ``<!DOCTYPE>…</html>`` documents
-      into one emission (or two writers targeted one file). The later copies are a
-      re-emission of the same report, so keep the FIRST complete document and drop the
-      rest (the :func:`dedupe_html_documents` semantics the c10 #2 gate established),
-      then tidy any stray sibling opens/closes inside it.
-    * **Stray sibling CLOSES** — exactly one document opener but several
-      ``</body>``/``</html>`` closes (the doubled-tail from section appends that each
-      carried ``</body></html>`` after the per-append opener-strip removed their opens).
-      Here the body content between the closes is REAL and distinct, so removing the
-      closes and re-appending exactly one ``</body></html>`` preserves every section.
+# d171 — a per-section writer's shell template carries a scaffold PLACEHOLDER COMMENT
+# (``<!-- Subsequent sections will be added here -->``) between the page shell and the
+# appended sections; the comment is a write-time scaffold, never report content, but it
+# survives every structural pass (the dedup/wrapper passes only touch tags, not comments)
+# and leaks into the served document. This strips those scaffold/placeholder comments —
+# matched by their scaffold WORDING so a genuine authored comment is never removed — as a
+# cosmetic output cleanup. Idempotent; content-preserving (only comment nodes are touched).
+_SCAFFOLD_COMMENT_RE = re.compile(
+    r"[ \t]*<!--\s*(?:subsequent\s+sections?|sections?\s+(?:will\s+be|to\s+be)\s+added|"
+    r"(?:more|additional|further|other)\s+sections?|insert\s+.*?\s+here|"
+    r"placeholder|content\s+(?:goes|will\s+go)\s+here|add\s+(?:more|sections?)\b)"
+    r".*?-->[ \t]*\n?",
+    re.IGNORECASE | re.DOTALL,
+)
 
-    The result is exactly one ``<!DOCTYPE>``/``<html>``/``<head>``/``<body>`` …
-    ``</body></html>``. Reads the real bytes, never the model's memory (d48-clean). A
-    single well-formed document or a fragment / non-HTML file is returned unchanged."""
-    s = doc or ""
-    # Duplicate-DOCUMENT case: keep the FIRST complete document (drop re-emitted copies).
-    if len(_HTML_HTML_OPEN_RE.findall(s)) > 1 or len(_HTML_DOCTYPE_RE.findall(s)) > 1:
-        s = dedupe_html_documents(s)
-        s = _keep_first(s, _HTML_DOCTYPE_RE)
-        s = _keep_first(s, _HTML_HTML_OPEN_RE)
-        s = _keep_first(s, _HTML_HEAD_BLOCK_RE)
-        s = _keep_first(s, _HTML_BODY_OPEN_RE)
-        s = _keep_last(s, _HTML_BODY_CLOSE_RE)
-        s = _keep_last(s, _HTML_DOC_CLOSE_RE)
-        return s.strip()
-    # Stray-sibling-CLOSES case: one opener but several closes — the inter-close content
-    # is real, so strip ALL wrapper closes and re-append exactly one (no truncation).
-    if _HTML_HTML_OPEN_RE.search(s) or _HTML_BODY_OPEN_RE.search(s):
-        s = _HTML_BODY_CLOSE_RE.sub("", s)
-        s = _HTML_DOC_CLOSE_RE.sub("", s)
-        s = s.rstrip() + "</body></html>"
-    return s.strip()
+
+def _html_escape_text(s: str) -> str:
+    """Minimal HTML text escape (``&``/``<``/``>``) for verbatim source titles."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _html_escape_attr(s: str) -> str:
+    """Minimal HTML attribute escape (``&``/``"``) for verbatim source URLs."""
+    return str(s).replace("&", "&amp;").replace('"', "&quot;")
 
 
 # --------------------------------------------------------------------------- #
@@ -597,356 +589,27 @@ def collect_fetched_sources(
 # model-authored ``<h1>/<h2>`` headings (anchors injected where missing). Section
 # content + headings stay 100% the model's; only navigation + the wrapper are assembled.
 _HTML_HEADING_RE = re.compile(r"<(h[12])(\s[^>]*)?>(.*?)</\1\s*>", re.IGNORECASE | re.DOTALL)
-_HTML_ID_ATTR_RE = re.compile(r'\bid\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+# RP-3c (d330): OUTPUT-AGNOSTIC section detection. The re-emission guard must work for
+# ANY output format, not just HTML, so a MARKDOWN top-level heading (a line opening with
+# one or two ``#`` ATX markers) is recognised as a section landmark alongside the HTML
+# ``<h1>/<h2>``. An HTML document has no line-start ``# `` marker and a Markdown document
+# has no ``<h1>`` tag, so each format matches only its own idiom (no cross-format noise).
+_MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,2}[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
+# RP-1 (d319/d311): _HTML_ID_ATTR_RE / _heading_slug RETIRED — engine no longer fixes/authors the model's output.
 
 
-def _heading_slug(text: str, used: set[str], idx: int) -> str:
-    """A stable kebab-case anchor id from a heading's visible text (deduped)."""
-    bare = re.sub(r"<[^>]+>", "", text or "")
-    slug = re.sub(r"[^a-z0-9]+", "-", bare.lower()).strip("-")[:48].strip("-")
-    slug = slug or f"section-{idx}"
-    base, n = slug, 2
-    while slug in used:
-        slug = f"{base}-{n}"
-        n += 1
-    used.add(slug)
-    return slug
-
-
-def assemble_html_spa(doc: str, *, title: str = "Report") -> str:
-    """Assemble a per-section HTML fragment into ONE navigable single-page document (c13).
-
-    Idempotent + structural (d48-clean — reads real bytes, fabricates no content):
-
-    * ensures every top-level ``<h1>/<h2>`` heading has an ``id`` anchor (slugged from
-      its own visible text) so the nav can link to it;
-    * builds a ``<nav>`` table-of-contents of those headings (the model's own section
-      titles) and places it at the top of the body;
-    * wraps the body in exactly one ``<!DOCTYPE>/<html>/<head>/<body>`` when the
-      fragment has no document wrapper; if a wrapper is already present (the c1b
-      path), only the nav is injected after ``<body>`` (no second wrapper).
-
-    A non-HTML string, or a doc that already carries a ``<nav>``, is returned
-    essentially unchanged (the nav is not duplicated). Never truncates real content."""
-    s = doc or ""
-    if not s.strip() or "<h1" not in s.lower() and "<h2" not in s.lower():
-        return doc  # nothing to navigate (not an HTML report fragment)
-
-    # 1) ensure an id on every h1/h2 (keep an existing id; else slug from its text).
-    used: set[str] = set()
-    for m in _HTML_ID_ATTR_RE.finditer(s):
-        used.add(m.group(1))
-    toc: list[tuple[str, str, str]] = []  # (level, id, visible-text)
-    idx = 0
-
-    def _stamp(m: "re.Match[str]") -> str:
-        nonlocal idx
-        idx += 1
-        level, attrs, inner = m.group(1), (m.group(2) or ""), m.group(3)
-        bare = re.sub(r"<[^>]+>", "", inner).strip()
-        id_m = _HTML_ID_ATTR_RE.search(attrs)
-        if id_m:
-            hid = id_m.group(1)
-        else:
-            hid = _heading_slug(bare, used, idx)
-            attrs = f'{attrs} id="{hid}"'
-        toc.append((level.lower(), hid, bare))
-        return f"<{level}{attrs}>{inner}</{level}>"
-
-    body = _HTML_HEADING_RE.sub(_stamp, s)
-    if not toc:
-        return doc
-
-    # 2) build the nav TOC from the model's own headings (skip if a nav already exists).
-    if "<nav" not in body.lower():
-        items = "\n".join(
-            f'    <li class="toc-{lvl}"><a href="#{hid}">{txt}</a></li>'
-            for lvl, hid, txt in toc
-        )
-        nav = f'<nav class="spa-nav">\n  <ul>\n{items}\n  </ul>\n</nav>\n'
-    else:
-        nav = ""
-
-    # 3) wrap the fragment in one document, or inject the nav after an existing <body>.
-    if "<html" in body.lower():
-        if nav:
-            body = re.sub(r"(<body(?:\s[^>]*)?>)", r"\1\n" + nav, body, count=1,
-                          flags=re.IGNORECASE)
-        return body
-    head = (
-        "<head>\n<meta charset=\"utf-8\">\n"
-        f"<title>{re.sub(r'<[^>]+>', '', title) or 'Report'}</title>\n"
-        "<style>body{max-width:900px;margin:0 auto;padding:1.5rem;font-family:system-ui,"
-        "Arial,sans-serif;line-height:1.5}nav.spa-nav{border:1px solid #ccc;padding:.75rem "
-        "1rem;margin-bottom:1.5rem;background:#fafafa}nav.spa-nav ul{list-style:none;"
-        "padding-left:0;margin:0}nav.spa-nav li.toc-h2{padding-left:1.25rem}"
-        "table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.4rem}"
-        "tr:nth-child(even){background:#f6f6f6}.sources{font-size:.9em;color:#555}</style>\n"
-        "</head>"
-    )
-    return (
-        "<!DOCTYPE html>\n<html lang=\"en\">\n" + head + "\n<body>\n"
-        + nav + body + "\n</body>\n</html>"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# DOC-STRUCTURE INTEGRITY BACKSTOP (s13/B5, design §4B) — a FINAL reconcile pass
-# over the fully-assembled HTML, run ONCE as a safety net AFTER every other
-# structural pass (assemble_html_spa / collapse_duplicate_sections / …).
-# --------------------------------------------------------------------------- #
-# The upstream passes are REGEX-scoped and each fires while the document is still
-# being built: assemble_html_spa derives the nav from the h1/h2 headings PRESENT
-# WHEN IT RUNS, so a section appended AFTER it (the late-section path, d93) is in
-# the body but MISSING from the ToC; concurrent multi-node appends can also leave
-# two elements sharing one ``id`` (a duplicate-anchor defect a regex heading-stamp
-# never reconciles), or a wrapper left unbalanced by a truncated emission. This
-# pass closes those gaps with a REAL stdlib parser (``html.parser.HTMLParser`` — no
-# new dependency): it parses the ACTUAL assembled bytes to learn the true h1..h3
-# set, every ``id`` in document order, and the wrapper/list balance, then applies
-# only deterministic, content-preserving REPAIRS. Like its siblings it is d48/d60-
-# clean — it reads the real bytes and fabricates NO content (it only RE-DERIVES
-# navigation, RENAMES collided ids, and BALANCES the wrapper). It is idempotent:
-# a well-formed document with a complete ToC and unique ids is returned unchanged.
-_HTML_HEADING123_RE = re.compile(r"<(h[123])(\s[^>]*)?>(.*?)</\1\s*>", re.IGNORECASE | re.DOTALL)
-_SPA_NAV_RE = re.compile(
-    r"[ \t]*<nav\s+class=[\"']spa-nav[\"'][^>]*>.*?</nav\s*>\n?", re.IGNORECASE | re.DOTALL
-)
+# RP-1 (d319/d311): _HTML_HEADING123_RE / _SPA_NAV_RE RETIRED — engine no longer fixes/authors the model's output.
 _TAG_TOKEN_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:\s[^>]*)?)(/?)>")
 _LIST_CONTAINER_TAGS: frozenset[str] = frozenset({"ul", "ol"})
 
 
-class _DocStructureParser(HTMLParser):
-    """Read-only structural scan of assembled HTML via the stdlib parser (s13/B5).
-
-    Records the true ``id`` multiset (to find collisions), whether a ``spa-nav``
-    ToC is present, and whether any ``<li>`` sits OUTSIDE a ``<ul>``/``<ol>`` (an
-    orphan list item). Used only to DECIDE which deterministic repairs to apply —
-    the edits themselves are made on the original bytes, so the parser never
-    re-serializes (and therefore never drops) real content."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.id_counts: dict[str, int] = {}
-        self.has_spa_nav = False
-        self.orphan_li = False
-        self._list_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: "list[tuple[str, Optional[str]]]") -> None:
-        d = {k.lower(): (v or "") for k, v in attrs}
-        hid = d.get("id", "").strip()
-        if hid:
-            self.id_counts[hid] = self.id_counts.get(hid, 0) + 1
-        if tag == "nav" and "spa-nav" in d.get("class", ""):
-            self.has_spa_nav = True
-        if tag in _LIST_CONTAINER_TAGS:
-            self._list_depth += 1
-        elif tag == "li" and self._list_depth == 0:
-            self.orphan_li = True
-
-    def handle_startendtag(self, tag: str, attrs: "list[tuple[str, Optional[str]]]") -> None:
-        # self-closing (e.g. <ul/>) opens no scope — only count its id.
-        d = {k.lower(): (v or "") for k, v in attrs}
-        hid = d.get("id", "").strip()
-        if hid:
-            self.id_counts[hid] = self.id_counts.get(hid, 0) + 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in _LIST_CONTAINER_TAGS and self._list_depth > 0:
-            self._list_depth -= 1
+# RP-1 (d319/d311): _DocStructureParser RETIRED — engine no longer fixes/authors the model's output.
 
 
-def _dedupe_element_ids(doc: str, duplicated: "frozenset[str]") -> str:
-    """Rename the 2nd+ occurrence of each collided ``id`` value to ``<id>-2``, ``-3``….
-
-    Keeps the FIRST occurrence's id intact (so existing inbound anchors to it still
-    resolve) and makes every later collision unique. Operates only on the ``id="…"``
-    attribute text, so no surrounding markup or content is touched."""
-    if not duplicated:
-        return doc
-    counts: dict[str, int] = {}
-
-    def _repl(m: "re.Match[str]") -> str:
-        val = m.group(1)
-        if val not in duplicated:
-            return m.group(0)
-        counts[val] = counts.get(val, 0) + 1
-        if counts[val] == 1:
-            return m.group(0)  # keep the first occurrence as-is
-        new_val = f"{val}-{counts[val]}"
-        return m.group(0).replace(val, new_val, 1)
-
-    return _HTML_ID_ATTR_RE.sub(_repl, doc)
+# RP-1 (d319/d311): _dedupe_element_ids / _wrap_orphan_list_items RETIRED — engine no longer fixes/authors the model's output.
 
 
-def _wrap_orphan_list_items(doc: str) -> str:
-    """Wrap each run of top-level (orphan) ``<li>…</li>`` siblings in one ``<ul>``.
-
-    A ``<li>`` outside any ``<ul>``/``<ol>`` is invalid; the conservative repair
-    wraps a maximal run of CONSECUTIVE orphan items (only whitespace between them)
-    in a single ``<ul>``. Items already inside a list are left untouched, so a
-    well-formed list — and the rebuilt ``spa-nav`` ToC — is never re-wrapped."""
-    spans: list[tuple[int, int]] = []          # (start, end) of each orphan <li>…</li>
-    list_depth = 0
-    open_li: list[Optional[int]] = []          # stack of orphan-li start offsets (None = inside a list)
-    for m in _TAG_TOKEN_RE.finditer(doc):
-        closing, name, self_close = m.group(1), m.group(2).lower(), m.group(4)
-        if name in _LIST_CONTAINER_TAGS:
-            if closing:
-                list_depth = max(0, list_depth - 1)
-            elif not self_close:
-                list_depth += 1
-        elif name == "li" and not self_close:
-            if closing:
-                if open_li:
-                    start = open_li.pop()
-                    if start is not None:
-                        spans.append((start, m.end()))
-            else:
-                open_li.append(m.start() if list_depth == 0 else None)
-    if not spans:
-        return doc
-    # group consecutive orphan spans separated only by whitespace into runs.
-    runs: list[tuple[int, int]] = []
-    cur_s, cur_e = spans[0]
-    for s, e in spans[1:]:
-        if doc[cur_e:s].strip() == "":
-            cur_e = e
-        else:
-            runs.append((cur_s, cur_e))
-            cur_s, cur_e = s, e
-    runs.append((cur_s, cur_e))
-    for s, e in reversed(runs):  # apply right-to-left so earlier offsets stay valid
-        doc = doc[:s] + "<ul>\n" + doc[s:e] + "\n</ul>" + doc[e:]
-    return doc
-
-
-def reconcile_doc_structure(doc: str, *, title: str = "Report", single_title: bool = False) -> str:
-    """FINAL doc-structure integrity backstop over assembled HTML (s13/B5, design §4B).
-
-    Runs ONCE, last, as a safety net only — it generates NO content (d48/d60-clean:
-    reads the real bytes, repairs structure deterministically). Three repairs, driven
-    by a real ``html.parser`` scan of the ACTUAL assembled document:
-
-    * **(i) ToC re-derivation** — when the document ALREADY carries a ``spa-nav`` table
-      of contents (i.e. :func:`assemble_html_spa` ran), rebuilds it from the FULL set of
-      ``<h1>``/``<h2>``/``<h3>`` headings present after every section is appended, so a
-      late-appended section (d93) the build-time nav missed now appears. Every heading
-      is given a stable slug ``id`` if it lacks one, and the nav links to those ids. A
-      document that was never given a nav (a plain single-file report) is left with NO
-      nav — the backstop COMPLETES an existing ToC, it does not fabricate one.
-    * **(ii) duplicate-id rename** — any ``id`` value carried by more than one element
-      (a collision the regex passes never reconcile) has its 2nd+ occurrences renamed
-      ``<id>-2``, ``<id>-3``…; the first keeps the original so inbound anchors resolve.
-    * **(iii) wrapper / list well-formedness** — collapses a stray duplicate wrapper
-      (:func:`enforce_single_html_document`), wraps any orphan ``<li>`` in a ``<ul>``,
-      and appends any missing ``</body>``/``</html>`` (:func:`html_close_gap`) so the
-      document is balanced.
-
-    A non-HTML string, or a document with no headings and no wrapper, is returned
-    unchanged. Idempotent — a well-formed, complete-ToC, unique-id document is a
-    fixed point."""
-    s = doc or ""
-    low = s.lower()
-    if not s.strip() or (
-        "<h1" not in low and "<h2" not in low and "<h3" not in low and "<html" not in low
-    ):
-        return doc  # not an HTML report — nothing to reconcile
-
-    # 0) THEMATIC DUPLICATE-TAIL (s13/P1-report): demote a second document-shell title to
-    # a section, then drop any now-duplicate heading family — BEFORE the ToC is re-derived
-    # so the served nav reflects exactly ONE title and one pass of each section. Both are
-    # drop-free/idempotent (enforce_single_h1 changes only a heading LEVEL; collapse keeps
-    # the first grounded occurrence), so a clean single-title document is unchanged.
-    # GATED to ``single_title`` (the sourced deep-research REPORT path, where the B8a2
-    # duplicate-tail lives) so a legitimate MULTI-PAGE document — one ``<h1>`` per page on
-    # the file-delivery/plan-chain path — keeps its per-page titles untouched.
-    if single_title:
-        s = enforce_single_h1(s)
-        s = collapse_duplicate_sections(s)
-
-    # 1) parse the real bytes to learn id collisions, orphan <li>, and nav presence.
-    parser = _DocStructureParser()
-    try:
-        parser.feed(s)
-        parser.close()
-    except Exception:
-        # A parser hiccup on pathological input must never sink the pipeline: fall
-        # back to the regex-only repairs below (id collisions still seen via regex).
-        parser = _DocStructureParser()
-    duplicated = frozenset(v for v, c in parser.id_counts.items() if c > 1)
-    if not duplicated:  # parser saw nothing (fallback) — detect collisions via regex.
-        seen: dict[str, int] = {}
-        for v in _HTML_ID_ATTR_RE.findall(s):
-            seen[v] = seen.get(v, 0) + 1
-        duplicated = frozenset(v for v, c in seen.items() if c > 1)
-
-    # 2) make every id unique (keep the first of each collided value).
-    s = _dedupe_element_ids(s, duplicated)
-
-    # 3) wrap orphan list items before rebuilding the (well-formed) nav.
-    if parser.orphan_li:
-        s = _wrap_orphan_list_items(s)
-
-    # 4) ToC re-derivation — ONLY when the document already carries a spa-nav (i.e.
-    # assemble_html_spa ran). A plain single-file report that was never given a nav is
-    # left untouched: the backstop COMPLETES an existing ToC, it never fabricates one
-    # (so it does not alter the shape of a deliverable that intentionally had no nav).
-    toc: list[tuple[str, str, str]] = []  # (level, id, visible-text)
-    if parser.has_spa_nav:
-        # stamp an id on every h1..h3 lacking one and collect the FULL heading list.
-        used: set[str] = set(_HTML_ID_ATTR_RE.findall(s))
-        idx = 0
-
-        def _stamp(m: "re.Match[str]") -> str:
-            nonlocal idx
-            idx += 1
-            level, attrs, inner = m.group(1), (m.group(2) or ""), m.group(3)
-            bare = re.sub(r"<[^>]+>", "", inner).strip()
-            id_m = _HTML_ID_ATTR_RE.search(attrs)
-            if id_m:
-                hid = id_m.group(1)
-            else:
-                hid = _heading_slug(bare, used, idx)
-                attrs = f'{attrs} id="{hid}"'
-            toc.append((level.lower(), hid, bare))
-            return f"<{level}{attrs}>{inner}</{level}>"
-
-        s = _HTML_HEADING123_RE.sub(_stamp, s)
-
-    # 5) rebuild the ToC from the full heading set (drop a stale/partial spa-nav first).
-    if toc:
-        s = _SPA_NAV_RE.sub("", s)
-        items = "\n".join(
-            f'    <li class="toc-{lvl}"><a href="#{hid}">{txt}</a></li>'
-            for lvl, hid, txt in toc
-        )
-        nav = f'<nav class="spa-nav">\n  <ul>\n{items}\n  </ul>\n</nav>\n'
-        if re.search(r"<body(?:\s[^>]*)?>", s, re.IGNORECASE):
-            # Consume any whitespace immediately after <body> so re-running the pass
-            # (which strips then re-inserts the nav) is a fixed point, not a slowly
-            # growing run of blank lines.
-            s = re.sub(
-                r"(<body(?:\s[^>]*)?>)\s*",
-                lambda m: m.group(1) + "\n" + nav,
-                s,
-                count=1,
-                flags=re.IGNORECASE,
-            )
-        else:
-            s = nav + s
-
-    # 6) wrapper well-formedness: one document, then balance the closing tags.
-    if has_duplicate_html_structure(s):
-        s = enforce_single_html_document(s)
-    gaps = html_close_gap(s)
-    if gaps:
-        s = s.rstrip() + "\n" + "".join(gaps)
-    # 7) FINAL-SECTION TRUNCATION (s13/P1-report): trim a short mid-sentence cut-off tail
-    # (a num_predict/section truncation the tag-balance pass leaves intact) so the served
-    # document never ends on a dangling fragment ("…On February</body></html>").
-    s = trim_dangling_sentence(s)
-    return s
+# RP-1 (d319/d311): reconcile_doc_structure RETIRED — engine no longer fixes/authors the model's output.
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,94 +692,26 @@ def _families_match(a: frozenset[str], b: frozenset[str]) -> bool:
 
 
 def _section_headings(doc: str) -> list[str]:
-    """The inner text of every top-level ``<h1>``/``<h2>`` heading, in document order."""
-    return [m.group(3) for m in _HTML_HEADING_RE.finditer(doc or "")]
+    """The inner text of every top-level section heading, in document order.
+
+    OUTPUT-AGNOSTIC (RP-3c/d330): recognises BOTH an HTML ``<h1>``/``<h2>`` heading and a
+    Markdown top-level (``#``/``##``) ATX heading, so the re-emission guard's section
+    predicate works for an HTML OR a Markdown deliverable. Each format contributes only
+    its own idiom's headings (an HTML doc has no line-start ``# `` marker; a Markdown doc
+    has no ``<h1>`` tag), so a single-format document behaves exactly as before."""
+    doc = doc or ""
+    heads = [m.group(3) for m in _HTML_HEADING_RE.finditer(doc)]
+    heads += [m.group(1) for m in _MD_HEADING_RE.finditer(doc)]
+    return heads
 
 
-def collapse_duplicate_sections(doc: str) -> str:
-    """Collapse re-emitted body-level report passes to ONE pass of each section (c14).
-
-    Deterministic + structural (d48/d60-clean — reads the real bytes, fabricates NO
-    content): segments ``doc`` at its ``<h1>``/``<h2>`` headings, keeps the FIRST
-    occurrence of each heading FAMILY, and DROPS every later section whose family was
-    already kept (a re-emitted duplicate pass). Each heading's segment is extended LEFT
-    over an immediately-preceding wrapper-open tag so the section's own ``<div …>``
-    opener and its matching close are removed together (container nesting stays
-    balanced); any top-level ``</body>``/``</html>`` a dropped TAIL section carried is
-    re-appended via :func:`html_close_gap` so the wrapper never ends up unbalanced.
-
-    Keeping the FIRST occurrence preserves the grounded, source-scoped content (the c13
-    citation win) and never invents text. A document with no repeated heading family —
-    or fewer than two headings — is returned UNCHANGED (idempotent), so a clean
-    single-pass report and a non-HTML/fragment string are untouched."""
-    s = doc or ""
-    heads = list(_HTML_HEADING_RE.finditer(s))
-    if len(heads) < 2:
-        return doc
-    kept_fams: list[frozenset[str]] = []
-    drop = [False] * len(heads)
-    for i, m in enumerate(heads):
-        fam = _heading_family(m.group(3))
-        if any(_families_match(fam, kf) for kf in kept_fams):
-            drop[i] = True
-        else:
-            kept_fams.append(fam)
-    if not any(drop):
-        return doc
-    starts: list[int] = []
-    for m in heads:
-        start = m.start()
-        wm = _WRAPPER_OPEN_TAIL_RE.search(s, 0, start)
-        if wm:
-            start = wm.start()
-        starts.append(start)
-    ends = starts[1:] + [len(s)]
-    out = [s[: starts[0]]]
-    for i in range(len(heads)):
-        if not drop[i]:
-            out.append(s[starts[i] : ends[i]])
-    result = "".join(out)
-    gaps = html_close_gap(result)
-    if gaps:
-        result = result.rstrip() + "\n" + "".join(gaps)
-    return result
+# RP-1 (d319/d311): collapse_duplicate_sections RETIRED — engine no longer fixes/authors the model's output.
 
 
-# --------------------------------------------------------------------------- #
-# THEMATIC DUPLICATE-TAIL kill (s13/P1-report, d115 parity) — single document title.
-# --------------------------------------------------------------------------- #
-# The B8a2 residual: the first write node, tasked "shell + first section", over-produces
-# a WHOLE mini-document — its own title <h1> + figures + a Sources block — then a later
-# section node opens a SECOND <h1> (a second document shell, e.g. "The US-Iran Conflict…"
-# then "Iran War (2026) Conflict Analysis"), so the served doc carries TWO top-level
-# titles and repeats cost/casualty material. The wrapper gate (enforce_single_html_
-# document) misses it — there is only ONE <!DOCTYPE>/<html> — and the family collapse
-# misses it — the two titles differ in wording past the family-overlap threshold. The
-# structured-data -> HTML separation removes the CAUSE (the shared figures/sources live
-# once, not re-emitted per section); this is the deterministic structural backstop for
-# the residual: a report has exactly ONE document title, so any later <h1> is a section.
-_HTML_H1_RE = re.compile(r"<h1((?:\s[^>]*)?)>(.*?)</h1\s*>", re.IGNORECASE | re.DOTALL)
-
-
-def enforce_single_h1(doc: str) -> str:
-    """Keep the FIRST ``<h1>`` as the document title; demote every later ``<h1>`` to ``<h2>``.
-
-    Drop-FREE (d48/d60-clean: no content is removed — only a heading LEVEL changes) and
-    idempotent (a document with at most one ``<h1>`` is returned byte-identical). A later
-    ``<h1>`` is a second document-shell title (the B8a2 thematic duplicate-tail); demoting
-    it to ``<h2>`` collapses the two-title defect AND lets the existing family collapse /
-    ToC re-derivation treat the second shell's body as ordinary sections. Attributes and
-    inner markup of the demoted heading are preserved verbatim."""
-    count = 0
-
-    def _repl(m: "re.Match[str]") -> str:
-        nonlocal count
-        count += 1
-        if count == 1:
-            return m.group(0)  # the document title stays an <h1>
-        return f"<h2{m.group(1)}>{m.group(2)}</h2>"
-
-    return _HTML_H1_RE.sub(_repl, doc or "")
+# RP-1 (d319/d311): the whole d173/d174 deterministic assembly layer (collapse_duplicate_section_ids /
+# dedupe_source_lists / rebuild_section_nav / assemble_report_spa / enforce_single_h1 and their helper
+# regexes) is RETIRED — the engine no longer fixes/authors the model's output; coherence lives in the
+# writer/reviewer SPECS (d310/d313/d319).
 
 
 # --------------------------------------------------------------------------- #
@@ -1170,34 +765,9 @@ def has_truncation_marker(doc: str, *, min_chars: int = 80) -> bool:
     return last not in _SENTENCE_END_CHARS and not last.isdigit() and last != ">"
 
 
-def trim_dangling_sentence(doc: str, *, max_trim: int = 400) -> str:
-    """Remove a SHORT mid-sentence truncated tail so the served doc ends cleanly.
-
-    Offline the cut-off content cannot be regenerated (that would fabricate, d60), but a
-    dangling fragment is not a groundable claim. When the visible body ends mid-sentence
-    (:func:`has_truncation_marker`), trim back to the last sentence-terminating
-    punctuation and re-append the wrapper closes (:func:`html_close_gap`), so no
-    truncation marker reaches the served document. CONSERVATIVE: only a SHORT trailing
-    fragment (``<= max_trim`` chars, carrying no block-level heading) is trimmed — a large
-    dangling block is LEFT untouched (the verify / continuation lanes own it) so real
-    content is never silently dropped. No-op + idempotent on a clean document."""
-    if not has_truncation_marker(doc):
-        return doc
-    body, closes = _visible_body_split(doc)
-    cut = max((body.rfind(c) for c in _SENTENCE_END_CHARS), default=-1)
-    if cut < 0:
-        return doc  # no complete sentence to fall back to — leave it (flagged elsewhere)
-    fragment = body[cut + 1:]
-    if len(fragment) > max_trim or "<h" in fragment.lower():
-        return doc  # not a short clean cut-off — do not drop a whole section
-    trimmed = body[: cut + 1].rstrip()
-    if not trimmed:
-        return doc
-    result = trimmed + (("\n" + closes) if closes else "")
-    gaps = html_close_gap(result)
-    if gaps:
-        result = result.rstrip() + "\n" + "".join(gaps)
-    return result
+# RP-1 (d319/d311): trim_dangling_sentence RETIRED — it EDITED the model's output (trimming a
+# truncated tail); the engine no longer fixes/authors output. ``has_truncation_marker`` above is
+# KEPT: it is a detect-only predicate (reads bytes, informs a decision, never edits).
 
 
 # --------------------------------------------------------------------------- #
@@ -1214,81 +784,6 @@ def trim_dangling_sentence(doc: str, *, max_trim: int = 400) -> str:
 # is dropped. Conservative on purpose — a heading that matches NO outline slot is KEPT
 # (a genuinely new section the planner legitimately added is never dropped). d48/d60-
 # clean: reads the real bytes, fabricates nothing.
-def _outline_families(
-    outline: Optional[Sequence[Mapping[str, str]]],
-) -> list[frozenset[str]]:
-    """The heading FAMILY of each outline entry's title, in outline order (drift-tolerant,
-    reusing :func:`_heading_family`). Blank/untitled entries are skipped."""
-    fams: list[frozenset[str]] = []
-    for sec in outline or ():
-        if not isinstance(sec, Mapping):
-            continue
-        title = str(sec.get("title", "")).strip()
-        if not title:
-            continue
-        fams.append(_heading_family(title))
-    return fams
-
-
-def collapse_outline_duplicate_sections(
-    doc: str, outline: Optional[Sequence[Mapping[str, str]]]
-) -> str:
-    """Collapse a duplicate PARALLEL section set against the agent outline (s13/FX d106 #7).
-
-    Deterministic + structural (d48/d60-clean — reads the real bytes, fabricates NO
-    content): segments ``doc`` at its ``<h1>``/``<h2>`` headings; each heading is mapped
-    to the FIRST outline entry whose family it matches (:func:`_families_match`). When two
-    headings map to the SAME outline slot, the LATER one is a duplicate of that planned
-    section (the B8a appended-tail / "three Section 3s" defect) and its segment is DROPPED;
-    the first (grounded, source-scoped) occurrence is kept. A heading that matches no
-    outline slot is KEPT (conservative — never drops a section the outline does not name).
-
-    No-ops (returns the doc UNCHANGED) when the outline is empty, fewer than two headings
-    are present, or no two headings share an outline slot — so a clean report, a non-HTML
-    fragment, and a doc whose sections already follow the outline are all untouched
-    (idempotent). Segment boundaries + the ``</body>``/``</html>`` re-append mirror
-    :func:`collapse_duplicate_sections` so the wrapper never ends up unbalanced."""
-    s = doc or ""
-    outline_fams = _outline_families(outline)
-    if not outline_fams:
-        return doc
-    heads = list(_HTML_HEADING_RE.finditer(s))
-    if len(heads) < 2:
-        return doc
-    claimed: set[int] = set()
-    drop = [False] * len(heads)
-    for i, m in enumerate(heads):
-        fam = _heading_family(m.group(3))
-        slot = next(
-            (j for j, of in enumerate(outline_fams) if _families_match(fam, of)), None
-        )
-        if slot is None:
-            continue  # matches no outline section → keep (genuinely new)
-        if slot in claimed:
-            drop[i] = True  # a later heading for an already-written outline section
-        else:
-            claimed.add(slot)
-    if not any(drop):
-        return doc
-    starts: list[int] = []
-    for m in heads:
-        start = m.start()
-        wm = _WRAPPER_OPEN_TAIL_RE.search(s, 0, start)
-        if wm:
-            start = wm.start()
-        starts.append(start)
-    ends = starts[1:] + [len(s)]
-    out = [s[: starts[0]]]
-    for i in range(len(heads)):
-        if not drop[i]:
-            out.append(s[starts[i] : ends[i]])
-    result = "".join(out)
-    gaps = html_close_gap(result)
-    if gaps:
-        result = result.rstrip() + "\n" + "".join(gaps)
-    return result
-
-
 # --------------------------------------------------------------------------- #
 # EMPTY-NODE-NO-FABRICATE (s13/FX-writer, d106 #6). A research node that yielded 0
 # sources / timed out (FX-loop's _unsupported_leaf) leaves its write-section node with
@@ -1333,77 +828,62 @@ def section_reemission(new_content: str, existing_doc: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# ANCHORED SECTION INSERT (s13/P2.3, d130/d132.C) — the ROOT-CAUSE structural
-# prevention of the duplicate-TAIL. The per-section write loop used to build the
-# document by BLIND ``file_write(append=True)``: the small model re-emits an
-# already-written chunk (a 2nd ``<!DOCTYPE>`` / a repeated section) and the blind
-# append CONCATENATES it AFTER the closed document — the duplicate-tail / 2nd
-# top-level document defect. The fix replaces blind append with an ANCHORED
-# read->targeted-insert->write: the document always carries ONE unique terminal
-# ANCHOR, and each new section is inserted JUST BEFORE that anchor via
-# ``file_update(old=anchor, new=section+anchor)``. Because every section lands
-# IN PLACE before the single anchor (never blind-appended after the document), no
-# content can ever be concatenated past the document's end — the duplicate-tail
-# cannot form structurally. ``file_update``'s own contract is what makes it safe:
-# the ``old`` anchor must be present (a missing/ambiguous anchor REFUSES the write
-# rather than silently appending), and a match REPLACES the span in place (it
-# grows the doc by exactly the new section, not a blind concatenation).
-#
-# The anchor is a deterministic, UNIQUE, render-invisible HTML comment planted at
-# the end of the document on creation (works for HTML, markdown AND plain text —
-# an HTML comment renders to nothing in all three). For an HTML document that
-# already carries its single ``</body>`` close, that close is an equally valid
-# unique anchor, so :func:`choose_section_anchor` prefers it (a section then lands
-# INSIDE the body). The planted sentinel is STRIPPED at finalize so it never
-# reaches the served file.
-SECTION_ANCHOR = "<!--__RA_SECTION_ANCHOR__-->"
+# OUTPUT-AGNOSTIC document-restart signal (RP-3c, d330) — the format-neutral
+# replacement for the HTML-pinned ``begins_html_document`` + ``top_level_html_doc_count``
+# predicates the c10 re-emission guard used to DECIDE persist/stop/nudge.
+# --------------------------------------------------------------------------- #
+# A small model nudged to "continue" an ALREADY-written deliverable often RESTARTS the
+# whole artifact from the top instead of writing the next section — re-emitting the same
+# opening (``<!DOCTYPE html><html>…`` for HTML, ``# Title …`` for Markdown, the header row
+# for a CSV, the first lines for code). The old guard detected this ONLY for HTML (a fresh
+# ``<!doctype>``/``<html>`` plus a ``</html>`` count). ``document_restart`` detects it in a
+# FORMAT-NEUTRAL way: the new chunk reproduces the opening the real file ALREADY begins with
+# — no format token is hard-coded, so it works for any output shape. Like every guard
+# predicate it reads the REAL bytes and fabricates nothing (d48-clean); it only informs the
+# orchestration's persist/stop/nudge DECISION and never edits the model's output.
+_RESTART_MIN_OVERLAP = 24
+# A document RE-EMISSION re-writes the whole artifact, so the re-emitted chunk is
+# DOCUMENT-SIZED. A short repeated FRAGMENT (e.g. the model churning ``<p>another small
+# part</p>`` every turn without ever closing the document — the R2 non-convergence case)
+# reproduces the file's opening too, but it is NOT a document restart: it is churn that must
+# fall through to the loop's non-convergence path, not be dropped as a finished re-emission.
+# This floor separates "re-emitted the whole document" from "repeated a tiny fragment"
+# WITHOUT any format token (a document is bigger than a naked inline fragment in any format).
+_RESTART_MIN_DOC_CHARS = 64
 
 
-def plant_section_anchor(content: str) -> str:
-    """Append the unique terminal section ANCHOR to freshly-created section content.
-
-    Used on the FIRST write of a node (create, or the first append of a
-    continuation page): the document is left ending with the sentinel so every
-    later section can be inserted just before it. The sentinel is a render-invisible
-    HTML comment (no effect on HTML/markdown/plain-text output) and is removed by
-    :func:`strip_section_anchor` at finalize."""
-    return content + "\n" + SECTION_ANCHOR
+def _normalized_head(doc: str, window: int) -> str:
+    """The document's leading ``window`` chars, whitespace-collapsed and lowercased —
+    a format-neutral fingerprint of how the artifact OPENS."""
+    return re.sub(r"\s+", " ", (doc or "").strip().lower())[:window]
 
 
-def choose_section_anchor(file_text: str, is_html: bool) -> Optional[str]:
-    """Pick the UNIQUE in-document insertion anchor, or None when none is unique.
+def document_restart(
+    new_content: str, existing_doc: str, window: int = 120
+) -> bool:
+    """True when ``new_content`` RE-OPENS the whole artifact ``existing_doc`` already begins with.
 
-    Prefers the planted :data:`SECTION_ANCHOR` sentinel when it is present exactly
-    once (the normal path — it is planted at the document end on the first write).
-    Falls back to the HTML ``</body>`` close when THAT is the only unique anchor
-    (an already-closed HTML document with no sentinel — a section then inserts
-    inside the body). Returns None when neither is uniquely present, so the caller
-    degrades to a guarded append + replant rather than risk a wrong-span edit."""
-    if file_text.count(SECTION_ANCHOR) == 1:
-        return SECTION_ANCHOR
-    if is_html and file_text.count("</body>") == 1:
-        return "</body>"
-    return None
+    Format-neutral (RP-3c/d330): compares the normalized leading fingerprint of each. When
+    the new chunk reproduces the existing document's own opening (its first
+    ``_RESTART_MIN_OVERLAP`` normalized chars match) AND is itself DOCUMENT-SIZED
+    (``_RESTART_MIN_DOC_CHARS``), the model RESTARTED the whole artifact — a re-emission of
+    the shell, not new content — so the orchestration can STOP or nudge rather than
+    concatenate a second copy. Returns False when either side is too short to judge, when the
+    new chunk opens differently (a genuine next section never reproduces the document's
+    opening), or when the new chunk is a short repeated FRAGMENT rather than a whole-document
+    re-emission (the R2 non-convergence churn case). Reads the real bytes, fabricates nothing
+    (d48-clean)."""
+    head_new = _normalized_head(new_content, window)
+    head_old = _normalized_head(existing_doc, window)
+    if len(head_new) < _RESTART_MIN_OVERLAP or len(head_old) < _RESTART_MIN_OVERLAP:
+        return False
+    if head_new[:_RESTART_MIN_OVERLAP] != head_old[:_RESTART_MIN_OVERLAP]:
+        return False
+    # a whole-document re-emission is document-sized, not a tiny repeated fragment
+    return len((new_content or "").strip()) >= _RESTART_MIN_DOC_CHARS
 
 
-def anchored_insert_args(anchor: str, section: str) -> tuple[str, str]:
-    """``(old, new)`` for ``file_update`` to insert ``section`` JUST BEFORE ``anchor``.
-
-    Replacing the unique ``anchor`` with ``section + anchor`` inserts the section in
-    document ORDER and leaves the anchor unique and terminal for the next insert —
-    the growable, no-blind-append invariant. A leading newline separates consecutive
-    sections."""
-    return anchor, section + "\n" + anchor
-
-
-def strip_section_anchor(text: str) -> str:
-    """Remove the planted section ANCHOR (and its leading newline) at finalize.
-
-    Idempotent and content-preserving: a document that never carried the sentinel
-    (e.g. a one-shot raw fallback) is returned byte-identical. Run once the write
-    loop has finished, before the document is assembled/served, so the sentinel
-    never reaches disk."""
-    return text.replace("\n" + SECTION_ANCHOR, "").replace(SECTION_ANCHOR, "")
+# RP-1 (d319/d311): SECTION_ANCHOR / plant_section_anchor / choose_section_anchor / anchored_insert_args / strip_section_anchor RETIRED — engine no longer fixes/authors the model's output.
 
 
 def collect_fetched_sources_full(
@@ -1422,7 +902,12 @@ def collect_fetched_sources_full(
     for tv in tool_values or ():
         if not isinstance(tv, Mapping):
             continue
-        for art in tv.get("fetched") or ():
+        # SoC ENGINE-THIN (SA-4/d254): a gather node's source artifacts ride EITHER the web key
+        # ``fetched`` OR the source-agnostic ``records`` key a NON-WEB bundle (codebase/vector-
+        # db/future) emits — collected the SAME way (URL-deduped, markdown retained) so the
+        # writer grounds in a non-web source through the identical chain_sources path. A web tv
+        # carries only ``fetched`` (no ``records``), so its harvest is byte-identical.
+        for art in list(tv.get("fetched") or ()) + list(tv.get("records") or ()):
             if not isinstance(art, Mapping):
                 continue
             url = str(art.get("url") or "").strip()
@@ -1499,18 +984,23 @@ def render_scoped_sources(
         return ""
     lines = [
         "SOURCES FOR THIS SECTION — these are the REAL articles already fetched and "
-        "read. Write this section's facts/figures FROM the text below and cite each "
-        "claim with the matching URL VERBATIM. NEVER invent a figure, a citation, a "
-        "publication name, a date, a \"[Name, 2025]\" placeholder, or a \"URL 1\"-style "
-        "label, and never cite a URL not listed here:",
+        "read, each labelled by its [S#] number with its real URL. Write this section's "
+        "facts/figures FROM the text below and cite each claim with that source's [S#] "
+        "and its matching URL VERBATIM. If this section has a TABLE with a source/citation "
+        "column, or a Sources list, fill EVERY such cell/entry with a REAL [S#] and its "
+        "real URL from the list below — NEVER leave a worded stand-in like \"URL "
+        "Placeholder\", \"Source Placeholder\", \"Source N Title\", \"[Name, 2025]\", a "
+        "\"URL 1\"-style label, or a bare publication name/date. If you cannot ground a "
+        "row in a real [S#] from this list, drop the row rather than placeholder it; and "
+        "never cite a URL not listed here:",
     ]
     for i, s in picked:
         title = str(s.get("title") or "").strip()
         url = str(s.get("url") or "").strip()
         full = str(s.get("markdown") or "").strip()
         summary = str(s.get("summary") or "").strip()
-        excerpt = select_relevant_excerpt(full, section_topic, budget)
-        block = [f"\n[{i}] {title or url} — {url}"]
+        excerpt = select_relevant_excerpt(full, section_topic, budget, prefer_figures=True)
+        block = [f"\n[S{i}] {title or url} — {url}"]
         if summary:
             block.append(
                 "WHOLE-SOURCE SUMMARY (grounded factual overview of the FULL article — "
@@ -1578,42 +1068,18 @@ def _strip_fence(text: str) -> str:
 # else from a format keyword in the request; else the conventional ``.md``. The
 # stem is a relatable slug from the goal/task — never a generic ``report``/``output``.
 
-# A model-bound output-format writer spec -> its file extension (the planner binds
-# html-writer / markdown-writer on the terminal node; the extension must follow).
-_WRITER_SPEC_EXT: dict[str, str] = {
-    "html-writer": ".html",
-    "markdown-writer": ".md",
-}
-# A format named in the request -> extension (checked when no explicit name / spec).
-_FORMAT_KEYWORD_EXT: tuple[tuple[str, str], ...] = (
-    (r"\bhtml\b|\bweb\s?page\b|\bweb\s?site\b", ".html"),
-    (r"\bmarkdown\b|\bmd\b", ".md"),
-    (r"\bcsv\b|\bspreadsheet\b|\bcomma[- ]separated\b", ".csv"),
-    # ``.txt`` matching (c10 #3): the old ``\b\.txt\b`` FAILED whenever a space
-    # preceded ``.txt`` (a space and ``.`` are both non-word, so no word boundary
-    # sits between them) — "save to a .txt file" / "give me a .txt file" fell through
-    # to the ``.md`` default. Match a literal ``.txt`` (no leading ``\b``), a bare
-    # ``txt`` token, and the plain-text phrasings, so a reasoned ``.txt`` is honored.
-    (r"\.txt\b|\btxt\b|\bplain[- ]?text\b|\btext file\b", ".txt"),
-    (r"\bjson\b", ".json"),
-)
+# RP-1 (d319/d311): the spec-name->ext (``_WRITER_SPEC_EXT``) and format-keyword->ext
+# (``_FORMAT_KEYWORD_EXT``) INFERENCE conditionals are RETIRED — the engine no longer
+# guesses a deliverable FORMAT from the bound writer spec or a request keyword (and there is
+# NO invented ``.html`` default — d318). The MODEL picks its own filename/extension/format:
+# an explicit filename the request names survives verbatim, and a bare fallback stem gets the
+# neutral plain-text ``.md`` extension. ``file_write`` is a pure passthrough.
+_DEFAULT_OUTPUT_EXT = ".md"
 # An explicit filename with one of the deliverable extensions, anywhere in the text.
 _EXPLICIT_NAME_RE = re.compile(
     r"\b([A-Za-z0-9][\w\-]*\.(?:html?|md|markdown|csv|txt|json|xml|ya?ml))\b",
     re.IGNORECASE,
 )
-
-
-def _ext_for(specs: Optional[Sequence[str]], text: str) -> str:
-    """Pick the deliverable extension from the bound writer spec, else the text."""
-    for s in specs or ():
-        ext = _WRITER_SPEC_EXT.get(str(s).strip().lower())
-        if ext:
-            return ext
-    for pattern, ext in _FORMAT_KEYWORD_EXT:
-        if re.search(pattern, text, re.IGNORECASE):
-            return ext
-    return ".md"
 
 
 def _slug(text: str) -> str:
@@ -1630,19 +1096,17 @@ def derive_output_path(
 ) -> str:
     """The deliverable's filename+extension, derived TYPE-AGNOSTICALLY (d49 / c3r).
 
-    Precedence: (1) an explicit filename the request names (``cats.html`` survives
-    verbatim); (2) the bound output-format writer spec's extension (html-writer ->
-    ``.html``); (3) a format keyword in the request; (4) ``.md``. The stem is a
-    relatable slug from the goal/task. This is the chosen name the synthesizer
-    writes to disk, so the LLM-chosen extension reaches the artifact — never the old
-    content-derived ``.md`` fallback that turned ``cats.html`` into ``findings.md``."""
+    RP-1 (d319/d311): the engine no longer INFERS a format. Precedence: (1) an explicit
+    filename the request names (``cats.html`` survives verbatim — the model's own choice);
+    (2) a relatable slug stem from the goal/task with the neutral plain-text
+    ``.md`` extension. ``specs`` is accepted for signature stability but no longer maps a
+    writer spec to an extension (that spec-name->ext conditional was a retired format pin)."""
     text = f"{goal or ''}\n{task or ''}"
     m = _EXPLICIT_NAME_RE.search(text)
     if m:
         return m.group(1).replace("\\", "/").rsplit("/", 1)[-1]
-    ext = _ext_for(specs, text)
     stem = _slug(goal or "") or _slug(task or "") or "report"
-    return f"{stem}{ext}"
+    return f"{stem}{_DEFAULT_OUTPUT_EXT}"
 
 
 def explicit_filename(text: Optional[str]) -> Optional[str]:
@@ -1656,8 +1120,11 @@ def explicit_filename(text: Optional[str]) -> Optional[str]:
 
 
 def deliverable_extension(specs: Optional[Sequence[str]], text: str) -> str:
-    """The deliverable extension from the bound writer spec, else ``text``, else .md."""
-    return _ext_for(specs, text)
+    """RP-1 (d319/d311): format INFERENCE is RETIRED — returns the neutral plain-text default.
+    ``specs``/``text`` are accepted for signature stability but no longer map a writer spec or a
+    request keyword to a format (that was a retired format pin). The model picks its own
+    filename/extension via explicit naming (``explicit_filename`` handles that)."""
+    return _DEFAULT_OUTPUT_EXT
 
 
 def sanitize_write_path(raw: Optional[str], default_path: str) -> str:
@@ -1698,7 +1165,7 @@ def sanitize_write_path(raw: Optional[str], default_path: str) -> str:
 # (d48/d50.1): it strips ONLY the offending URL token, never invents or rewrites
 # prose. A doc whose URLs are all grounded is returned UNCHANGED (idempotent), so a
 # clean report stays byte-identical.
-_DOC_URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
+# RP-1 (d319/d311): _DOC_URL_RE RETIRED — engine no longer fixes/authors the model's output.
 # Trailing punctuation that commonly clings to a URL in prose/markup but is not part
 # of the address — stripped before the grounded-set membership test and removal.
 _URL_TRAILING = ".,;:!?)]}\"'»>"
@@ -1747,50 +1214,7 @@ def fetched_url_set(sources: Sequence[Mapping[str, str]]) -> frozenset[str]:
     return frozenset(urls)
 
 
-def strip_ungrounded_urls(
-    doc: str,
-    sources: Sequence[Mapping[str, str]],
-) -> tuple[str, list[str]]:
-    """Remove every URL in ``doc`` that no fetched source backs (the no-fab URL guard).
-
-    Deterministic ground-or-REMOVE over the final assembled deliverable: collect every
-    distinct URL the model wrote and, for each one whose normalized (scheme/host/path)
-    form is NOT in the run's fetched-URL SET, unwrap its ``<a href>`` anchor to the
-    visible text and delete any bare occurrence. Grounding is now EXACT set membership
-    of actually-fetched source URLs — an inline-only secondary link inside a fetched
-    article is NOT grounded (closes the d92 404 leak). Longer URLs are removed first so
-    a fabricated URL that is a prefix of another in-doc string is excised cleanly.
-    Returns ``(new_doc, removed_urls)``; all-grounded → ``(doc, [])`` unchanged. Never
-    invents or rewrites prose — only the ungrounded link token is excised, so a report
-    that cites only fetched sources is untouched and the guarantee holds for any model."""
-    s = doc or ""
-    if not s.strip():
-        return doc, []
-    fetched = fetched_url_set(sources)
-    seen: set[str] = set()
-    removed: list[str] = []
-    for m in _DOC_URL_RE.finditer(s):
-        raw = m.group(0).rstrip(_URL_TRAILING)
-        norm = _normalize_fetched_url(raw)
-        if not norm or norm in seen:
-            continue
-        seen.add(norm)
-        if norm not in fetched:
-            removed.append(raw)
-    if not removed:
-        return doc, []
-    out = s
-    for bad in sorted(set(removed), key=len, reverse=True):
-        esc = re.escape(bad)
-        # Unwrap an anchor whose href is the fabricated URL → keep the inner text.
-        anchor = re.compile(
-            r"<a\b[^>]*?href\s*=\s*[\"']?" + esc + r"[^\"'>]*[\"']?[^>]*>(.*?)</a>",
-            re.IGNORECASE | re.DOTALL,
-        )
-        out = anchor.sub(lambda mm: mm.group(1), out)
-        # Drop any remaining bare occurrence (with an optional trailing slash).
-        out = re.sub(esc + r"/?", "", out)
-    return out, removed
+# RP-1 (d319/d311): strip_ungrounded_urls RETIRED — engine no longer fixes/authors the model's output.
 
 
 # --------------------------------------------------------------------------- #
@@ -1826,105 +1250,10 @@ def _esc_html_attr(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace('"', "&quot;")
 
 
-def _insert_before_close(doc: str, block: str) -> str:
-    """Insert ``block`` just before the document's last ``</body>``/``</html>`` close.
-
-    Keeps the reference block INSIDE the document body. Falls back to appending at the
-    end when there is no wrapper close (a bare HTML fragment) — the final
-    :func:`reconcile_doc_structure`/:func:`html_close_gap` pass then balances the wrapper.
-    """
-    for pat in (_HTML_BODY_CLOSE_RE, _HTML_DOC_CLOSE_RE):
-        matches = list(pat.finditer(doc))
-        if matches:
-            i = matches[-1].start()
-            return doc[:i].rstrip() + "\n" + block + "\n" + doc[i:]
-    return doc.rstrip() + "\n" + block
+# RP-1 (d319/d311): _insert_before_close RETIRED — engine no longer fixes/authors the model's output.
 
 
-def ensure_source_coverage(
-    doc: str,
-    sources: Sequence[Mapping[str, str]],
-    assigned_ids: Optional[Iterable[object]] = None,
-    *,
-    is_html: Optional[bool] = None,
-) -> tuple[str, list[str]]:
-    """Append a reference for every fetched source the write plan left UNASSIGNED (Backstop C).
-
-    The deterministic source-coverage net (s13/B5c, design §4C — the
-    ``_ensure_source_coverage`` d89 specified but never shipped). Given the assembled
-    deliverable ``doc``, the run's global fetched ``sources`` (1-based,
-    ``[{title,url,…}]`` from :func:`collect_fetched_sources_full`), and the set of 1-based
-    ``assigned_ids`` the PHASE-2 write planner gave to a section, append an "Additional
-    sources" reference block listing every fetched source that was assigned to NO section
-    AND whose URL is not already present (cited/listed) anywhere in ``doc`` — so a source
-    the planner skipped cannot silently vanish (the d87 dropped-source risk).
-
-    Presence is tested by the SAME normalized-URL identity as the no-fab URL guard
-    (:func:`_normalize_fetched_url`), so a source cited under a different section — or by
-    another writer node on the multi-page chain — counts as covered and is NOT re-listed.
-    d60-safe: adds ONLY a title+URL reference for material the run actually fetched; never
-    invents a source or generates content. ``is_html`` None ⇒ inferred from ``doc``.
-    Idempotent — a doc whose every fetched source is assigned or already present is
-    returned UNCHANGED. Returns ``(new_doc, added_urls)``."""
-    s = doc or ""
-    if not s.strip() or not sources:
-        return doc, []
-    assigned: set[int] = set()
-    for i in assigned_ids or ():
-        if isinstance(i, bool):
-            continue
-        if isinstance(i, int):
-            assigned.add(i)
-        elif isinstance(i, str) and i.strip().lstrip("-").isdigit():
-            assigned.add(int(i.strip()))
-    # URLs already present (cited or listed) in the assembled doc — normalized so a cited
-    # source matches its fetched record regardless of #anchor / ?query / trailing-slash.
-    present: set[str] = set()
-    for m in _DOC_URL_RE.finditer(s):
-        n = _normalize_fetched_url(m.group(0).rstrip(_URL_TRAILING))
-        if n:
-            present.add(n)
-    missing: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for idx, src in enumerate(sources, 1):
-        if not isinstance(src, Mapping) or idx in assigned:
-            continue
-        url = str(src.get("url") or "").strip()
-        norm = _normalize_fetched_url(url)
-        if not norm or norm in present or norm in seen:
-            continue
-        seen.add(norm)
-        missing.append((str(src.get("title") or "").strip(), url))
-    if not missing:
-        return doc, []
-    if is_html is None:
-        low = s.lower()
-        is_html = any(
-            t in low
-            for t in ("<!doctype", "<html", "<body", "<h1", "<h2", "<section", "<ul")
-        )
-    added = [u for _, u in missing]
-    if is_html:
-        items = "\n".join(
-            f'      <li><a href="{_esc_html_attr(u)}">{_esc_html_text(t or u)}</a></li>'
-            for t, u in missing
-        )
-        block = (
-            '<section class="sources additional-sources">\n'
-            f"  <h2>{_ADDITIONAL_SOURCES_HEADING}</h2>\n"
-            f"  <p>{_ADDITIONAL_SOURCES_CAPTION}</p>\n"
-            "  <ul>\n"
-            f"{items}\n"
-            "  </ul>\n"
-            "</section>"
-        )
-        return _insert_before_close(s, block), added
-    items = "\n".join(f"- [{t or u}]({u})" for t, u in missing)
-    block = (
-        f"\n\n## {_ADDITIONAL_SOURCES_HEADING}\n\n"
-        f"{_ADDITIONAL_SOURCES_CAPTION}\n\n{items}\n"
-    )
-    return s.rstrip() + block, added
+# RP-1 (d319/d311): ensure_source_coverage RETIRED — engine no longer fixes/authors the model's output.
 
 
 __all__ = [
@@ -1932,26 +1261,10 @@ __all__ = [
     "split_done_signal",
     "html_close_gap",
     "is_detailed_task",
-    "strip_wrapper_closers",
-    "top_level_html_doc_count",
-    "dedupe_html_documents",
-    "begins_html_document",
-    "strip_wrapper_openers",
-    "has_duplicate_html_structure",
-    "enforce_single_html_document",
-    "ensure_source_coverage",
-    "assemble_html_spa",
-    "collapse_duplicate_sections",
-    "collapse_outline_duplicate_sections",
     "UNSUPPORTED_SECTION_INSTRUCTION",
     "section_reemission",
-    "SECTION_ANCHOR",
-    "plant_section_anchor",
-    "choose_section_anchor",
-    "anchored_insert_args",
-    "strip_section_anchor",
+    "strip_internal_scaffolding",
     "fetched_url_set",
-    "strip_ungrounded_urls",
     "collect_fetched_sources",
     "collect_fetched_sources_full",
     "render_source_catalog",

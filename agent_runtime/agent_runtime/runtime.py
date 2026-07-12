@@ -33,11 +33,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass, field
+import re
+import sys
+import traceback
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from llm_framework import Chain, Context, Transport
 from llm_framework.stages import call_stage, prompt_assembly, structured_output
+from llm_framework.tokens import estimate_message_tokens, estimate_tokens
+from llm_framework.context import Conversation, deterministic_summary
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace.status import Status, StatusCode
@@ -49,11 +54,14 @@ from .tracing import get_tracer, run_blocking_in_span
 from .article_note import coerce_article_note
 from .chunked_read import chunked_read as _chunked_read
 from .claim_verify import (
-    REVIEWER_TOOL_SPECS,
     research_answered_from_memory,
-    verify_and_revise,
 )
-from .research_tree import first_native_call, make_tool_spec
+from .research_tree import (
+    first_native_call,
+    make_tool_spec,
+    render_scoped_source_index,
+    repair_model_json,
+)
 from .collision import (
     Collision,
     CollisionResolver,
@@ -73,40 +81,54 @@ from .heal_router import (
 from .reactor import PlannerReactor
 from .roles import (
     READ_NOT_DESCRIBE,
+    # SB-RR (d293): ROLE_RESEARCHER + ROLE_WORKER are no longer referenced here — gather is a
+    # self-selected specialization (not a role) and every worker shares ONE unified loop, so the
+    # engine branches on neither. Only ROLE_SYNTHESIZER (terminal delivery, d215) survives.
     ROLE_SYNTHESIZER,
     role_framing,
 )
+# OO tool-bundle layer (d190/d212/d221): the canonical {tools + doctrine} per CAPABILITY
+# DOMAIN. NODE-SELF-SELECT (d221): a node SELF-SELECTS the bundle(s) its task needs at
+# runtime (the per-node ``_loaded_bundles`` set, grown via the get_bundles tool /
+# :meth:`SubAgent._load_bundle`); ``object`` is the only always-on floor. The runtime
+# unions the loaded bundles' tools + doctrine; the research/file doctrine TEXTS live in
+# the bundles (single source of truth), re-bound here under their prior private names.
+from .bundles import (
+    BUNDLE_FILE,
+    BUNDLE_OBJECT,
+    BUNDLE_RESEARCH,
+    BUNDLE_RESEARCH_READ,
+    bundles_catalog_text,
+    compose_doctrine,
+    compose_tool_specs,
+    expand_bundle,
+    get_bundle,
+)
+from .bundles.file import REPORT_SEPARATION_GUIDANCE as _REPORT_SEPARATION_GUIDANCE
+# SoC ENGINE-THIN (SA-5/d254): the web URL/article/readability/record DISPATCH+INGEST
+# semantics are OWNED by the web bundle now; the engine imports the bundle's adapter +
+# the URL-grounding predicate and DELEGATES (it hardcodes no web semantics of its own).
+from .bundles.research import WebGatherAdapter as _WebGatherAdapter
+from .bundles.web_ingest import url_offered as _url_offered
 from .synth_tools import (
     DONE_SENTINEL,
+    _section_headings,
     _strip_fence as _strip_synth_fence,
-    anchored_insert_args,
-    begins_html_document,
-    choose_section_anchor,
-    collapse_duplicate_sections,
     collect_fetched_sources,
     derive_output_path,
-    enforce_single_html_document,
-    ensure_source_coverage,
-    has_duplicate_html_structure,
-    has_truncation_marker,
+    document_restart,
     html_close_gap,
     is_detailed_task,
-    plant_section_anchor,
-    reconcile_doc_structure,
     render_scoped_sources,
     resolve_writer_source_budget,
     READ_RANKING_CHUNK_CHARS,
     read_content_char_budget,
     section_reemission,
     select_relevant_chunks,
-    strip_ungrounded_urls,
     render_source_index,
     sanitize_write_path,
     split_done_signal,
-    strip_section_anchor,
-    strip_wrapper_closers,
-    strip_wrapper_openers,
-    top_level_html_doc_count,
+    strip_internal_scaffolding,
 )
 from .scheduler import ExecutionMode, next_dispatch
 from .scope import ScopedSpec
@@ -178,12 +200,8 @@ RUN_LIFECYCLE_KINDS: tuple[str, ...] = (
 # truncated D1 mid-document). The write node runs deterministic (temp=0, d35).
 SYNTH_MAX_SECTIONS = 16
 SYNTH_NUM_PREDICT = 4096
-# s9/N5: the largest deliverable (chars) the verify lane will re-persist from a SINGLE
-# whole-document revise turn. A revise turn re-emits the corrected doc in one call,
-# bounded by SYNTH_NUM_PREDICT (4096 tok, ~shared with think CoT) — beyond ~this many
-# chars a one-turn rewrite would truncate, so the lane surfaces the unbacked verdict
-# but does NOT auto-rewrite (never trade a fabrication-flag for a truncated file).
-_VERIFY_REVISE_MAX_CHARS = 9000
+# RP-3c (d330): ``_VERIFY_REVISE_MAX_CHARS`` (the single-turn whole-document revise size
+# cap of the retired engine verify lane) is removed with the lane.
 
 # WRITER-SOURCE WINDOW SIZING (MSF/d89): the write phase does NOT pass num_ctx in its
 # subagent_call_opts — it relies on the value BAKED into the model's Modelfile (E4B =
@@ -226,6 +244,15 @@ def _load_read_embedder() -> Any:
 # leaving the rest for the section prompt scaffolding + the num_predict output.
 _WRITE_SOURCE_WINDOW_FRACTION = 0.6
 
+# d162 — the per-source LEAD cap for the UNSCOPED terminal writer (a single-section
+# synthesis the planner left without ``source_ids``). It is fed the bounded compact SOURCE
+# INDEX + a LEAD excerpt over EVERY source (so it has real grounding to write a substantive
+# report) instead of the raw fetched-body fold that ballooned the served write input to
+# 137KB / 107% of num_ctx at 11 sources (a15, silently truncated → thin report). Generous
+# enough for substance, but the renderer's window-sized ``lead_total`` is the hard bound:
+# more sources => thinner per-source leads, the TOTAL stays a fraction of the window.
+_UNSCOPED_LEAD_CHARS = 3600
+
 # AGENTIC RESEARCH loop bounds (s9/c5, d49/d50 — retires flags #1/#3). A web_search
 # node is no longer driven by a deterministic search-then-read EXECUTOR; it is a TRUE
 # AGENT that DECIDES to search and which sources to read via lightweight tool calls
@@ -235,6 +262,16 @@ _WRITE_SOURCE_WINDOW_FRACTION = 0.6
 # ``RESEARCH_DEFAULT_FETCH_CAP`` is the fetch cap used when a caller wired none.
 RESEARCH_MAX_TURNS = 12
 RESEARCH_DEFAULT_FETCH_CAP = 5
+# d157 (latency-first) — tool-layer chunking on the RESEARCH.react READ PATH. Each web_fetch
+# returns the 1+ MOST RELEVANT CHUNKS (the top embedding-ranked passages for THIS sub-question,
+# d184 — several passages assembled up to the budget, not the single top chunk) to the research
+# worker, NOT the whole 8-27KB article body — so a multi-turn react loop's accumulated input
+# stays compact and the per-node latency drops. The full verbatim ``markdown`` is STILL stored
+# on the source record (the writer's citation / load_source path is untouched); this only bounds
+# what the WORKER ingests per fetch. Env-tunable for live tuning; the relevance-select keeps the
+# MOST relevant passages so the bound trims raw bulk, not the useful content. A bounded compact
+# representation, NOT an app truncation cap.
+RESEARCH_READ_CHUNK_CHARS = max(1500, int(os.environ.get("RA_RESEARCH_READ_CHUNK_CHARS", "5000")))
 # BREADTH (s9/N1, d60/c15 part-a): the total ReAct turn ceiling RISES PROPORTIONALLY
 # with the fetch cap so a high-breadth gather can search several angles AND read MANY
 # sources without the flat turn ceiling clipping it (a cap of ~10 needs >12 turns to
@@ -245,42 +282,44 @@ RESEARCH_DEFAULT_FETCH_CAP = 5
 # the effective ceiling stays RESEARCH_MAX_TURNS (max() floor), so narrow paths are
 # byte-identical to before.
 RESEARCH_SEARCH_HEADROOM = 6
+# BUDGET-RESERVING SEED SLICE (live 6GB catch): the FRACTION of the growable drive's
+# wall-clock budget the SEED wave may spend before the dispatch gate stops launching
+# further gather nodes (see AgentRuntime._dispatch_deadline). Reserves the remainder
+# for the grow/decision loop (expand/prune/stop reasoning), which was previously
+# starved when a wide seed consumed the whole budget and the outer run timeout
+# cancelled it mid-flight. Env-tunable; a NON-FLOW resource bound (d240).
+RESEARCH_SEED_BUDGET_FRACTION = min(
+    0.95, max(0.2, float(os.environ.get("RA_RESEARCH_SEED_BUDGET_FRACTION", "0.6")))
+)
+_SEED_BUDGET_FRACTION = RESEARCH_SEED_BUDGET_FRACTION
 
 # The research-agent instruction (d38/d39/d50 prompt-quality mandate: crisp, anti-
-# hallucination). Appended to the assembled USER turn so the worker knows it must
-# gather REAL evidence via its tools before answering, and that FINDINGS are RAW prose
-# (never JSON — content is RAW on every route, d50.1).
-_RESEARCH_LOOP_INSTRUCTION = (
-    "----\n"
-    "You are a RESEARCH AGENT with two tools. Gather REAL evidence with them before "
-    "you answer — do not rely on memory.\n\n"
-    "To call a tool, reply with ONLY a JSON object and NOTHING else:\n"
-    '  {{"tool": "web_search", "args": {{"query": "<search terms>"}}}}\n'
-    '  {{"tool": "web_fetch", "args": {{"url": "<a result URL to read in full>"}}}}\n\n'
-    "Workflow: search the topic, then READ the most relevant results by fetching their "
-    "URLs (up to {fetch_cap} fetches), then write your findings. Fetch a source before "
-    "relying on it; never invent facts or cite a page you have not read. Issue ONE tool "
-    "call per turn.\n\n"
-    "When you have read enough, STOP calling tools and write your FINDINGS as plain "
-    "prose (NOT JSON): the key facts, figures and events, each attributed to the source "
-    "URL you read it from. Be specific and substantive."
-)
+# hallucination) — the worker must gather REAL evidence via its tools before answering,
+# and FINDINGS are RAW prose (never JSON — content is RAW on every route, d50.1). The TEXT
+# lives in the ResearchBundle (d190 — the bundle owns the doctrine) and is surfaced to the
+# model EXACTLY ONCE, in the ``get_bundles`` LOAD observation when the node self-selects the
+# bundle (its ``own_doctrine``, carried forward by the convo window). d229/d263: the research
+# ReAct loop NEVER re-pastes that doctrine into the per-turn task message — that was a pure
+# ~400-500-token-per-prompt duplication (trace 620d38fa); d263 further retired the pinned-head
+# copy, so the doctrine now rides the load observation ONCE and nothing re-pastes it.
 _RESEARCH_NUDGE = (
     "Reply with EITHER a single tool-call JSON object (to search or fetch), OR your "
     "FINDINGS as plain prose — nothing else."
 )
 _RESEARCH_FINALIZE = (
     "Stop searching. Write your FINDINGS now as plain prose, drawn from the sources you "
-    "have already read — the key facts and figures, each attributed to its source URL. "
-    "Output ONLY the findings (no JSON, no preamble)."
+    "have already read — the key facts and figures, each attributed to its source URL, and "
+    "end with a line naming WHAT IS STILL MISSING or UNVERIFIED so the next layer can pursue "
+    "it. Output ONLY the findings (no JSON, no preamble)."
 )
-# s9/N5 (d62/c15 part-e): the no-fabrication GATHER-MORE nudge — sent when the
-# ``verify_lane`` is ON and a research stage wrote substantive findings with ZERO real
-# fetches (it answered FROM MEMORY; E4B does this on the bare ReAct path). The model
-# MUST search + read a real source before its findings are accepted. Bounded by
-# ``_RESEARCH_GATHER_MORE_MAX`` (NON-FLOW): a genuinely unfetchable topic cannot loop
-# forever — after the budget the findings stand and the deliverable verify lane still
-# re-checks each claim against the (still 0) fetched sources.
+# s9/N5 (d62/c15 part-e): the no-fabrication GATHER-MORE nudge — sent when a research
+# stage that self-selected the gather bundle wrote substantive findings with ZERO real
+# fetches (it answered FROM MEMORY; E4B does this on the bare ReAct path). The model MUST
+# search + read a real source before its findings are accepted. RP-3c (d330): this gate is
+# DE-FLAGGED — an output-agnostic no-fab research-grounding orchestration, no ``verify_lane``
+# boolean. Bounded by ``_RESEARCH_GATHER_MORE_MAX`` (NON-FLOW): a genuinely unfetchable topic
+# cannot loop forever — after the budget the findings stand (the writer-doctrine self-review
+# is what grounds-or-drops any remaining unbacked claim).
 _RESEARCH_GATHER_MORE_MAX = 2
 _RESEARCH_GATHER_MORE = (
     "You answered from MEMORY — you fetched NO real source. A research task may NOT be "
@@ -295,15 +334,50 @@ _RESEARCH_GATHER_MORE = (
 # — a lightweight control record (like the c5 tool args), NOT the deliverable document
 # (content stays RAW, d50.1). The note steers the NEXT search via ``gaps_or_followups``.
 _RESEARCH_NOTE_CLAUSE = (
-    "\n\nAfter you READ a source (web_fetch), record a SHORT note about it before moving "
+    "\n\nYou are GATHERING evidence — your job this phase is to search, read, and NOTE. Do "
+    "NOT write the final report or any HTML/Markdown deliverable now (it is authored in a "
+    "LATER phase); even if your spec describes an output format, that format applies to that "
+    "later write phase, not to this gathering. "
+    "After you READ a source (web_fetch), record a SHORT note about it before moving "
     "on — reply with ONLY this JSON and nothing else:\n"
     '  {"tool": "note", "args": {"url": "<the source URL you just read>", '
     '"summary": "<2-3 sentence summary>", "category": "<topic>", '
     '"source_trust": "primary|secondary|reference-untrusted", '
     '"key_claims": ["<short fact>", "..."], "relevance": "<why it serves the goal>", '
     '"gaps_or_followups": ["<what to search next>", "..."]}}\n'
-    "Keep it SHORT — this note STEERS your next search; it is NOT the final answer. Treat "
+    "ALWAYS fill gaps_or_followups with what this source did NOT settle — the unanswered "
+    "question, the figure it left unverified, the angle to search next. That field is the GAP "
+    "LANE that DIRECTS the next research layer, so it must not be empty while the facet is still "
+    "open. Keep the note SHORT — it STEERS your next search; it is NOT the final answer. Treat "
     "Wikipedia as reference-untrusted (citable only if attributed, never sole backing)."
+)
+# s15/a6 (d182) — the MESSAGE-CHAINING lever for the gap lane is now the RESEARCH bundle's
+# web_fetch OUTPUT-MESSAGE OVERRIDE (d221): the research CONTEXT overrides web_fetch's
+# observation to prompt the model to record the note at the EXACT moment it has just read a
+# source (the just-in-time chain), instead of jumping straight to findings (the measured
+# notes=0 cause: E4B treats the separate note turn as optional, d79/d122). The text lives in
+# :data:`~agent_runtime.bundles.research.WEB_FETCH_NOTE_OVERRIDE` (single source of truth);
+# the runtime sources it from the LOADED research bundle
+# (:meth:`SubAgent._fetch_output_override`), so a plain (non-research) context gets no note
+# message and the served research path is byte-identical (research is always loaded there).
+# s15/a27 (d199 follow-on) — the NOTE GATE. The note ack + the fetch note override (a25/d199) made the
+# note RIGHT-MOMENT and role:'user'-visible, but on live Gemma the model still fetches ONE source
+# and jumps STRAIGHT to findings, skipping the (still optional) note — measured on trace
+# 1427f176 (the US-Iran report): every single-fetch research node emitted notes=0, so the
+# write-from-notes substrate (d184) and the gap lane go empty (the exact "research not used
+# downstream" data gap). When the lane is ON and the model tries to FINALISE with a fetched-but-
+# un-noted source, push it back to record THAT source's note first — bounded (``note_gate_max``,
+# ~fetch_cap) so an unwilling model cannot loop, and the salvaged findings still stand if it never
+# re-emits them. Robust feedback, NOT a seatbelt (the model authors the note); OFF (lane disabled)
+# the whole block is skipped → byte-identical to the pre-fix path.
+_RESEARCH_NOTE_GATE = (
+    "Before you finish: you READ <{title}> ({url}) but have NOT recorded its note yet "
+    "({remaining} read source(s) still un-noted). A SHORT structured note must land for EVERY "
+    "source you read — its key_claims and, crucially, gaps_or_followups (what it did NOT settle) "
+    "are the GAP LANE that directs the next research layer AND the substrate the report is "
+    'written from. Record it now — reply with ONLY {{"tool":"note","args":{{"url":"{url}", '
+    '...}}}} for THIS source. One note per turn; once every read source has a note, write your '
+    "FINDINGS."
 )
 
 
@@ -375,6 +449,61 @@ Replanner = Callable[[PlanNode, str, list[str]], Awaitable[PlanDAG]]
 # still traverses VERIFIABLE — the lifecycle is mandatory, the gate is optional).
 NodeVerifier = Callable[[PlanNode, "SubAgentResult"], Any]
 
+# ONE-DRIVE PHASE-TRANSITION AUTHORING HOOK (RP-6c B1). Given the live runtime, the live DAG, and
+# the next phase's PLAN KIND, author (MODEL-authored, via ``IncrementalPlanner.plan``) the next
+# phase's sub-DAG and return its node(s). It is the mid-drive analogue of ``DagGrower.grow`` — the
+# grower authors the next RESEARCH wave; this authors the next PHASE (research → write). The engine
+# does NOT synthesize the structure; it only INVOKES the authorer the shape's declared phase names
+# and appends the returned model-authored nodes. Async; returns an empty sequence to author nothing.
+PhaseAuthor = Callable[["AgentRuntime", PlanDAG, str], Awaitable[Sequence[PlanNode]]]
+
+
+@dataclass
+class PhaseTransition:
+    """The OPTIONAL, additive wiring that turns the growable research drive into the ONE-DRIVE
+    phase-transition drive (RP-6c B1). Set on :attr:`AgentRuntime._phase_transition`; consulted by
+    :meth:`AgentRuntime._drive_growable` AFTER the research grow loop stops.
+
+    The shape OWNS the phase sequencing (RP-6b's ``[[phases]]`` → ``next_phase_plan`` /
+    ``spec_role_for``); the engine drive READS that declaration and performs the mid-run authoring;
+    the MODEL authors the actual write topology + content. There is NO engine ``if phase == 'write'``
+    structural authoring beyond "call the authorer the shape's phase names and append its nodes".
+
+    Fields
+    ------
+    next_plan:
+        The shape's ``next_phase_plan`` bound method (reads the DECLARED phase order). Given the
+        last completed phase kind (``first_kind``), returns the next plan kind (e.g. ``"write_plan"``)
+        or ``"done"`` at the terminal phase. When it returns ``"done"`` the drive STOPS at research
+        (no transition), byte-identical to a research-only run.
+    author:
+        The MODEL-authoring hook (:data:`PhaseAuthor`) invoked to author the next phase's sub-DAG.
+        For B1 an injected minimal hook exercises the mechanism; the live hook (composing the write
+        goal from live run state + ``IncrementalPlanner.plan``) lands in B2.
+    deliverable_path:
+        O1 — the write-phase delivery target STAMPED per-node onto every authored write-phase node
+        (``PlanNode.deliverable_path``) so ONLY those nodes take the writer route in this SHARED
+        runtime (research nodes, which carry none, keep the research route). Decided by the caller
+        from the shape's declared ``spec_role_for(next_kind) == 'writer'`` — not a spec-name branch.
+        Empty → the authored nodes are appended UNSTAMPED (they must self-carry a delivery target or
+        route as plain workers).
+    first_kind:
+        The phase kind the research grow loop represents (``"research"``). Passed to ``next_plan`` to
+        find the phase to transition INTO.
+    headroom_fraction:
+        O2 — the fraction of the run's timeout envelope RESERVED for the write phase (authoring +
+        the write node run) within this one drive. The research grow budget is already set to
+        ``timeout * (1 - headroom_fraction)`` upstream (agentic ``_run_generic_research_phase``), so
+        the grow loop stops AUTHORING new research layers with this headroom left; the drive records
+        the reservation for the trace/tests. Default 0.1 (the established ~10% write headroom).
+    """
+
+    next_plan: Callable[[str], str]
+    author: PhaseAuthor
+    deliverable_path: str = ""
+    first_kind: str = "research"
+    headroom_fraction: float = 0.1
+
 # The SHAPING framing (d1): a specialization body is an OUTPUT-SHAPING RULESET,
 # not a task and not a skill how-to. At produce time it is injected as the SYSTEM
 # turn ABOVE the spec body, and the REAL task content + tool findings ride the
@@ -404,16 +533,9 @@ _SHAPING_FRAMING = (
 # itself stays RAW prose/HTML (d50.1, never a JSON envelope). The invariants: ONE
 # document title written once, each later part a sub-section (never a second title),
 # the shared figures/Sources block written ONCE (never repeated per section).
-_REPORT_SEPARATION_GUIDANCE = (
-    " SEPARATE DATA FROM PRESENTATION: the shared facts (key figures, the timeline, the "
-    "SOURCES list) are the DOCUMENT'S, written ONCE — never repeated in a later section. "
-    "You MAY first save those key facts to a small structured data file (a .json, via "
-    "file_write) and then write the report prose from it, but the report itself is RAW "
-    "content, never JSON. Give the document ONE title (a single top-level heading) on "
-    "this first section; every later section is a SUB-section under it — never open a "
-    "second top-level title or a second figures/sources block. Finish each sentence you "
-    "start — never stop a section mid-sentence."
-)
+# The TEXT now lives in the FileBundle (d190/d212 — the bundle owns the doctrine) and is
+# imported above as ``_REPORT_SEPARATION_GUIDANCE`` (byte-identical), so the write
+# loop is unchanged while the bundle is the single source of truth.
 
 # DAG SPEC-COMPOSITION (d2/d11): a node may carry 1+ specs (``node.effective_specs``).
 # When it carries MORE THAN ONE, their ruleset bodies are LAYERED into a single
@@ -517,6 +639,16 @@ class SubAgentResult:
     parsed: Any = None
     verdict: Optional[str] = None
     verdict_repairs: int = 0
+    # UNIVERSAL FINALIZE PAIR (d285 SB-4): the ``(summary, memory_index)`` this node emitted
+    # when it finished — SB-2's :meth:`~agent_runtime.Planner.finalize_node` digest (the
+    # NODE's own model summary of its real work) plus the index of the research memory it
+    # used. Produced by the runtime's injected ``node_finalizer`` (the served orchestration
+    # wires it to the planner + SB-1's resolver); ``None`` when no finalizer is wired
+    # (offline/unit path) — then the inter-node handoff is byte-identical to pre-SB-4. The
+    # downstream node's :meth:`SubAgent._compose_task` consumes the pair as the SOLE
+    # inter-node payload (the clipped-prose input + the folded fetched value are dropped).
+    summary: Optional[str] = None
+    memory_index: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -561,6 +693,7 @@ class SubAgent:
         conversation_context: Optional[str] = None,
         overall_goal: Optional[str] = None,
         upstream_tool_values: Optional[Mapping[str, Any]] = None,
+        upstream_memory: Optional[Mapping[str, Mapping[str, str]]] = None,
         max_repair_attempts: int = 2,
         max_verdict_repairs: int = 2,
         read_search_max_fetch: int = 0,
@@ -569,18 +702,26 @@ class SubAgent:
         emit_article_notes: bool = False,
         note_tool: str = "note",
         chunked_read: bool = False,
-        verify_lane: bool = False,
         fetched_char_budget: int = 2000,
         upstream_input_char_budget: int = 4000,
         writer_source_budget: Optional[int] = None,
         chain_continue_path: Optional[str] = None,
         chain_is_final: bool = True,
         chain_sources: Optional[Sequence[Mapping[str, str]]] = None,
+        chain_notes: Optional[Sequence[Mapping[str, Any]]] = None,
         read_embedder: Any = None,
+        deliverable_path: Optional[str] = None,
     ) -> None:
         self.node = node
         self.transport = transport
         self.hook = hook
+        # NODE-SELF-SELECT (d221): the bundle(s) THIS node has loaded. Starts at the
+        # always-on ``object`` floor only — there is no role/tool -> bundle table; a node
+        # grows this set by SELF-SELECTING bundles at runtime (the get_bundles tool /
+        # :meth:`_load_bundle`). Each load surfaces that bundle's doctrine ONCE in its load
+        # observation (d263), so the model's active doctrine reflects exactly the
+        # capabilities it actually loaded.
+        self._loaded_bundles: set[str] = {BUNDLE_OBJECT}
         # READ-SIDE relevance embedder (d109): the MiniLM ``CpuEmbedder`` used to rank a
         # fetched source's chunks against this node's sub-question (RELEVANCE-SELECT read).
         # The served deep-research route wires the shared embedder (``_load_read_embedder``);
@@ -594,6 +735,16 @@ class SubAgent:
         # sliding window — the d55/d56 SWA fix. None / a node with no source_ids =
         # the pre-c13 full-index behaviour (graceful 1-section degenerate case).
         self._chain_sources = list(chain_sources) if chain_sources else []
+        # CHAIN-NOTES seam (SA-4/d234/d235 — folds in the SA-1-deferred read_notes bridge):
+        # the SEPARATE WRITE RUNTIME feeds its served research NOTES here (the gather notes
+        # arrive as a write_report_spa PARAM, not via the DAG, so ``_collect_upstream_notes``
+        # is empty on the write runtime). :meth:`_node_run_ctx` folds these into ``ctx['notes']``
+        # so a write/review node that SELF-SELECTS ``research_read`` binds ``read_notes`` — the
+        # CHEAP first leg of the d234/d235 read-hierarchy — WITHOUT the retired per-run
+        # pre-registration. The exact mirror of ``chain_sources`` for the sources leg. None /
+        # empty (every non-report caller, and the gather DAG itself) → byte-identical (no notes
+        # fed; the gather runtime keeps reading its upstream notes via the DAG as before).
+        self._chain_notes = list(chain_notes) if chain_notes else []
         # PLAN-CHAINING (c1b/d49.4): when this writer node is a CONTINUATION page of a
         # multi-page write-file plan, ``chain_continue_path`` is the file an UPSTREAM
         # writer already started — this node APPENDS its page/section onto it (reads
@@ -605,6 +756,16 @@ class SubAgent:
         # so a single-file deliverable is byte-for-byte the pre-c1b behaviour.
         self._chain_continue_path = (chain_continue_path or "").strip() or None
         self._chain_is_final = bool(chain_is_final)
+        # s14/P3A §3D — a FRAMEWORK-INJECTED review node (id ``*_review`` / ``final_review``)
+        # SB-6/d301 — the report write phase's single DELIVERABLE path (the runtime's
+        # ``deliverable_path``, set ONLY on the write runtime by chat_app.run_section_write_phase).
+        # This is the WRITE-PHASE-EXCLUSIVE delivery-context signal the dispatch routes the TOOL-LESS
+        # write node on (NOT ``chain_sources``, which a follow-up READER also carries to resolve
+        # prior sources — routing on chain_sources alone over-broadly forced a non-writer to write a
+        # file). None for every non-write-phase node (research/gather/follow-up), so those stay on
+        # the unified self-select loop. The all-writers invariant (only writers run in a runtime with
+        # deliverable_path set) makes routing all such non-review nodes to the writer SOUND.
+        self._deliverable_path = (deliverable_path or "").strip() or None
         # FETCH CAP (s9/c5, d49/d50 — reframes the retired d13 search-then-read GATE):
         # this is NO LONGER a flow gate that FORCES a web_search node to auto-fetch.
         # A web_search node is now a TRUE AGENT (:meth:`_run_research_loop`) that DECIDES
@@ -625,6 +786,13 @@ class SubAgent:
         # extra turns, no tool_value change); the deep-research orchestration opts in (N6).
         self._emit_article_notes = bool(emit_article_notes)
         self._note_tool = note_tool
+        # SoC ENGINE-THIN (SA-5/d254): the WEB bundle owns the web_search/web_fetch dispatch +
+        # all URL/article/readability/record semantics. The engine constructs the bundle's
+        # gather adapter (keyed by THIS run's configured tool names) and delegates a web tool
+        # call to it (:meth:`_dispatch_research_tool`), so the engine itself keeps only generic
+        # by-name dispatch. Built directly from the bundle class (the single owner) — no web
+        # logic lives in this module.
+        self._web_adapter = _WebGatherAdapter(search_tool, fetch_tool, note_tool)
         # CHUNKED READ (s9/N3, d62/c15 part-d): the READ-side analog of the c13/d55
         # write-side 512-token SWA window. When enabled, a fetched source LONGER than
         # ``fetched_char_budget`` is read via a map/reduce summary (each in-window chunk
@@ -636,18 +804,12 @@ class SubAgent:
         # byte-identical truncation, no summarizer call, no ``summary`` key; the deep-
         # research orchestration opts in (N6) and N3r leg-probes with the flag ON.
         self._chunked_read = bool(chunked_read)
-        # NO-FABRICATION VERIFICATION LANE (s9/N5, d62/c15 part-e — the PRIMARY no-fab
-        # mechanism per the neuron ruling). When enabled, this sub-agent runs the
-        # REASONING claim->source provenance check (``agent_runtime.claim_verify``) at
-        # two seams: (1) a RESEARCH node that wrote substantive findings with ZERO real
-        # fetches (answered FROM MEMORY) is forced to GATHER-MORE before its findings are
-        # accepted; (2) a terminal SYNTHESIS deliverable is re-checked claim-by-claim
-        # against the run's fetched sources and the model is forced to GROUND or
-        # REVISE/REMOVE any unbacked claim (the c13r B2 narrative-fabrication gap). It is
-        # REASONING, never a regex/string content-filter (d14/d48). Default OFF →
-        # byte-identical (no verify turn, no gather-more nudge, no rewrite); the served
-        # deep-research / plan-chain gather turns it ON for every sub-agent it builds (N6).
-        self._verify_lane = bool(verify_lane)
+        # RP-3c (d330): the flag-gated NO-FAB VERIFY/REVISE self-review lane
+        # (``self._verify_lane``) is RETIRED. The model self-review MOVED to the definition
+        # layer (the writer specs' _COHERENT_ARTIFACT_DOCTRINE self-review-before-finish
+        # clause); the no-fab research GATHER-MORE gate is KEPT but DE-FLAGGED to an
+        # output-agnostic signal gate (see the write loop). No ``verify_lane`` boolean
+        # survives (d311 no-hardcoded-flags; d319 the engine authors/decides/fixes nothing).
         # Per-article char budget when the FETCHED article text is folded into the
         # user turn (the generic 1200-char tool-output cap is far too small to carry
         # real article content to synthesis). Each fetched source is truncated to
@@ -689,6 +851,19 @@ class SubAgent:
         # file_write.content can be the real upstream report. None => the emitter
         # grounds from nothing (back-compat: identical to the pre-fix behaviour).
         self._upstream_tool_values = dict(upstream_tool_values or {})
+        # UNIVERSAL FINALIZE HANDOFF (d285 SB-4): the DIRECT-upstream ``(summary, memory_index)``
+        # pairs — ``{dep_id: {"summary": str, "memory_index": str}}`` — the runtime built from
+        # each finished dependency's :class:`SubAgentResult` finalize pair (SB-2). This is the
+        # SOLE inter-node context payload (d285): for any dep present here, ``_compose_task``
+        # renders ITS (summary, index) pair and DROPS that dep's clipped-prose input (ch1) AND
+        # its directly-folded fetched value (ch3) — the detail lives in the research memory,
+        # read by index on demand (the writer's scoped-source PUSH stays a SEPARATE delivery
+        # path, not a re-fold here). Built from ``node.depends_on`` ONLY (d15 direct-upstream).
+        # Empty (no finalizer wired / a seed node) => the handoff is byte-identical to pre-SB-4.
+        self._upstream_memory = {
+            str(k): dict(v) for k, v in dict(upstream_memory or {}).items()
+            if isinstance(v, Mapping)
+        }
         # CONVERSATION MEMORY (s5/a4): bounded prior-turn context for THIS chat
         # thread, injected into the produce USER turn so this node grounds its
         # answer in the conversation. None/blank => omitted (no regression).
@@ -802,10 +977,40 @@ class SubAgent:
             parts.append("\n\n".join(preamble) + "\n\nCURRENT TASK:")
         # 3) This node's specific task.
         parts.append(self.node.task)
+        # MEMORY-BY-HANDLE (d221): when this node is BOUND to a research memory, name the
+        # handle so the model knows the research lives there and READS it via its tools
+        # (load_source / the on-demand source index) — NEVER expecting a verbatim dump in
+        # this turn (d192/d202). The line is grounding CONTEXT, not a new instruction; it
+        # is omitted entirely when the node carries no handle (byte-identical to pre-d221).
+        handle = getattr(self.node, "research_memory_handle", None)
+        if handle:
+            parts.append(
+                f"\nBinded research memory: {handle}\n"
+                "Your research is held in this memory — READ it with your source tools "
+                "(load_source by [S#], or the source index) when you need a fact, figure, "
+                "or URL; do not expect it pasted in full here, and never invent a source."
+            )
+        # UNIVERSAL FINALIZE HANDOFF (d285 SB-4): the SOLE inter-node context payload is the
+        # DIRECT-upstream ``(summary, memory_index)`` PAIR(s). For every dep that carries a pair
+        # we render the pair here and DROP that dep's clipped-prose input (ch1) AND its folded
+        # fetched value (ch3): the engine no longer passes raw upstream bodies as context — it
+        # passes the model's own per-node SUMMARY + the INDEX of the memory the detail lives in,
+        # which the node reads on demand by index (the writer's scoped-source PUSH is a separate
+        # delivery path, NOT a re-fold here). ``_upstream_memory`` is built from ``depends_on``
+        # only, so this stays DIRECT-upstream-only (d15). Empty => byte-identical to pre-SB-4.
+        paired_deps = {d for d, p in self._upstream_memory.items() if p}
+        if paired_deps:
+            parts.append(self._upstream_pair_block(paired_deps))
         if inputs:
-            parts.append("\nINPUTS FROM PRIOR STEPS:")
-            for k, v in inputs.items():
-                parts.append(f"- {k}: {str(v)[: self._upstream_input_char_budget]}")
+            # ch1 COLLAPSE: a paired dep's prose output is REPLACED by its (summary, index) pair
+            # above — render only the NON-paired deps' inputs (byte-identical when no pair).
+            shown = [(k, v) for k, v in inputs.items() if k not in paired_deps]
+            if shown:
+                parts.append("\nINPUTS FROM PRIOR STEPS:")
+                for k, v in shown:
+                    parts.append(
+                        f"- {k}: {str(v)[: self._upstream_input_char_budget]}"
+                    )
         # INTER-NODE CONTEXT (o4 fix, part 2): a downstream writer/synthesize node
         # has no tool of its OWN, so the rich fetched-source text its research
         # dependency retrieved only ever rendered into THAT node's turn — the writer
@@ -817,8 +1022,32 @@ class SubAgent:
         # (out of scope). Each rendered value is already budget-bounded inside
         # :meth:`_render_tool_value` (fetched sources to ``_fetched_char_budget``,
         # other values to the compact cap), so this stays safe against num_ctx.
+        # d156/d162: a write-phase node fed via the BOUNDED SOURCE INDEX + LEAD +
+        # ``load_source`` (compact + chunked on demand) must NOT also get the upstream FETCHED
+        # full bodies folded here — that re-introduces the 81-137KB raw-body dump the
+        # tool-layer chunking exists to eliminate (a15 measured 137KB / 107% of num_ctx at 11
+        # sources for the UNSCOPED single-section synthesis, silently truncated → thin report).
+        # :meth:`_feeds_via_source_index` covers BOTH a scoped node (``source_ids``) AND the
+        # unscoped terminal writer/review now routed through the compact full-index feed; an
+        # ordinary worker with no chain sources keeps its fetched fold (its only source feed).
+        feeds_via_index = self._feeds_via_source_index()
         for dep, uv in self._upstream_tool_values.items():
             if uv is None:
+                continue
+            # ch3 COLLAPSE (d285 SB-4): a dep handed off via its (summary, memory_index) pair
+            # does NOT also get its raw fetched bodies folded as inter-node context — the detail
+            # is read from that memory by index (NOT pasted). Drop it here.
+            if dep in paired_deps:
+                continue
+            # s14/a8 (d149): a WRITER dependency's tool_value is just the deliverable PATH
+            # reference (``{"path": ...}``), not source content. Folding it rendered a
+            # "SOURCES & FINDINGS FROM PRIOR STEP … TOOL OUTPUT (file_write): {'path': …}"
+            # block that a small writer then ECHOED into the document (the scaffolding leak).
+            # Skip a path-only value — it carries no findings for this node to use (the real
+            # sources arrive via the scoped SOURCE INDEX / the research fetched-content feed).
+            if isinstance(uv, Mapping) and uv.get("path") and not uv.get("fetched"):
+                continue
+            if feeds_via_index and isinstance(uv, Mapping) and uv.get("fetched"):
                 continue
             parts.append(
                 f"\nSOURCES & FINDINGS FROM PRIOR STEP {dep} "
@@ -828,6 +1057,38 @@ class SubAgent:
         if tool_value is not None:
             parts.append(self._render_tool_value(tool_value))
         return "\n".join(parts)
+
+    def _upstream_pair_block(self, paired_deps: set[str]) -> str:
+        """Render the d285 SB-4 inter-node payload — the DIRECT-upstream ``(summary, index)`` pair(s).
+
+        This is the SOLE inter-node context the engine passes (the clipped-prose input + the
+        folded fetched bodies are dropped for these deps): each upstream's own per-node SUMMARY
+        (SB-2's ``finalize_node`` digest) plus the INDEX of the research memory holding its
+        detail, which the node reads on demand BY INDEX (never expecting it pasted here).
+
+        UNIFORM rendering — NO role/spec conditional (d285 anti-fabrication: zero spec/role-name
+        conditionals). The worker-vs-reviewer distinction the design describes EMERGES from the
+        DAG, not a code branch: a downstream WORKER usually has ONE direct upstream, so it sees
+        that one previous step's pair; a downstream REVIEWER/synthesizer joins MANY branches, so
+        it naturally sees the FULL set of their (summary, index) pairs — i.e. the joined overall.
+        The engine authors no structure and folds no raw upstream bodies — it names the summary
+        and the index. Deterministic ``depends_on`` order for a stable, legible turn."""
+        rows = []
+        for d in self.node.depends_on:
+            if d not in paired_deps:
+                continue
+            p = self._upstream_memory.get(d) or {}
+            summ = str(p.get("summary") or "").strip() or "(no summary)"
+            idx = str(p.get("memory_index") or "").strip() or "(unset)"
+            rows.append(f"- prior step {d} [research memory: {idx}]: {summ}")
+        if not rows:
+            return ""
+        return (
+            "\nUPSTREAM RESEARCH (what the previous step(s) produced — each a (summary, "
+            "research-memory index) pair; the full DETAIL is held in that memory, read it BY "
+            "INDEX with your source tools when you need a fact/figure/URL, never expect it "
+            "pasted here):\n" + "\n".join(rows)
+        )
 
     def _render_tool_value(self, tool_value: Any) -> str:
         """Fold a tool's output into the user turn.
@@ -884,76 +1145,586 @@ class SubAgent:
         )
         return f"{user}\n\n----\n{block}" if block else user
 
-    def _scoped_source_block(self) -> str:
-        """This node's assigned sources, rendered TIGHT for nearest-cursor placement (c13).
+    def _feeds_via_source_index(self) -> bool:
+        """True when this node receives the run's sources via the BOUNDED SOURCE INDEX feed
+        (so the raw fetched-body fold must be suppressed — d156/d162).
 
-        Returns the compact per-section source block (real article excerpts + URLs +
-        the cite-verbatim/no-fabrication instruction) for a write/synthesis node that
-        carries ``node.source_ids`` against the run's global ``_chain_sources`` — the
-        (F) feed-scoping half of d56. Empty string when the node is unscoped or the
-        global source list is absent (graceful no-op), so the block is appended at the
-        very END of the section's first user turn ONLY when it has scoped sources.
-
-        MSF/d89: the per-source budget is RAISED from 700 to ``self._writer_source_budget``
-        (default 12k) but SIZED to the write window so a section's TOTAL source bytes stay
-        under a fraction of num_ctx — ``min(per_source, window_chars*0.6/n_sources)``,
-        window_chars ≈ num_ctx*3.5 — leaving room for the section prompt + num_predict
-        output (never reintroducing the d22 overflow). The section's own task is passed as
-        the relevance topic so each source's excerpt is SECTION-RELEVANT, not first-N-raw."""
-        if not (self.node.source_ids and self._chain_sources):
-            return ""
-        # count THIS section's in-range assigned sources (the bytes that compete for the
-        # window); at least 1 so a single-source section keeps the full per-source budget.
-        n_sources = sum(
-            1 for i in self.node.source_ids
-            if isinstance(i, int) and 1 <= i <= len(self._chain_sources)
-        )
-        n_sources = max(1, n_sources)
-        num_ctx = int(self._call_opts.get("num_ctx") or 0) or _DEFAULT_WRITE_NUM_CTX
-        window_chars = num_ctx * _CHARS_PER_TOKEN
-        fit = int(window_chars * _WRITE_SOURCE_WINDOW_FRACTION / n_sources)
-        # never size BELOW the legacy floor — the cap only ever trims the RAISE down to
-        # what the window holds, it does not re-starve a section with many sources.
-        per_source = max(700, min(self._writer_source_budget, fit))
-        return render_scoped_sources(
-            self._chain_sources,
-            self.node.source_ids,
-            excerpt_budget=per_source,
-            section_topic=self.node.task or "",
-        )
-
-    # URL extensions that ``web_fetch`` cannot turn into readable article TEXT:
-    # Trafilatura is HTML-only, so a PDF/office/media URL decodes to binary garbage
-    # and a research layer reports "unreadable binary data" instead of findings (the
-    # max_iter=10 live finding). Skip these up front so the layer reads real prose.
-    _NON_ARTICLE_EXT = (
-        ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv",
-        ".zip", ".gz", ".tar", ".png", ".jpg", ".jpeg", ".gif", ".svg",
-        ".mp4", ".mp3", ".mov", ".avi", ".bin",
-    )
-
-    @classmethod
-    def _looks_like_article_url(cls, url: str) -> bool:
-        """A public http(s) URL that is plausibly a readable HTML page (not a file)."""
-        if not url.startswith(("http://", "https://")):
+        Fires for the write-phase nodes that route through :meth:`_scoped_source_block`:
+        a SCOPED node (``source_ids``), or an UNSCOPED terminal writer / file-delivery /
+        review node (which now gets the compact full-index feed instead of the
+        num_ctx-saturating raw-body dump). An ordinary worker step with no chain sources
+        keeps its fetched fold (its only source feed). Guarded on ``_chain_sources`` so a
+        research/worker node — which never has chain sources set — is never starved."""
+        if not self._chain_sources:
             return False
-        path = url.split("?", 1)[0].split("#", 1)[0].lower()
-        return not path.endswith(cls._NON_ARTICLE_EXT)
+        if self.node.source_ids:
+            return True
+        if self.node.role == ROLE_SYNTHESIZER:
+            return True
+        if (self.node.tool or "") in ("file_write", "write_file"):
+            return True
+        return False
+
+    def _bound_chat_convo(
+        self,
+        convo: list[dict[str, Any]],
+        system: Optional[str],
+        *,
+        reserve_predict: int = SYNTH_NUM_PREDICT,
+    ) -> list[dict[str, Any]]:
+        """Window a multi-turn write/review convo so a served ``llm.chat`` input never
+        approaches num_ctx (d162).
+
+        The on-disk deliverable is the ground truth — each turn already re-feeds the
+        document's bounded TAIL via ``file_read`` (writer) or a clamped slice (reviewer), and
+        the model is told to continue from THAT, not from its own accumulated section
+        emissions sitting in history. So when the assembled window (system + convo) would
+        crowd num_ctx, DROP the oldest MIDDLE turns while KEEPING ``convo[0]`` (the task + the
+        bounded SOURCE INDEX) and the most-recent turns (the latest file tail + the
+        continue-from-here instruction). The dropped text is not lost — it is on the file and
+        re-surfaced via the bounded tail — so the bound emerges from the chunked/compact
+        representation, NOT a blunt truncation of the live feed. Short runs (≤3 turns) and
+        runs already inside budget are returned unchanged (byte-identical)."""
+        if len(convo) <= 3:
+            return convo
+        num_ctx = int(self._call_opts.get("num_ctx") or _DEFAULT_WRITE_NUM_CTX)
+        # Reserve the model's own output (num_predict) + a safety margin so prompt + output
+        # never reach the num_ctx ceiling; the rest is the INPUT budget.
+        budget = max(2048, num_ctx - int(reserve_predict) - 2048)
+        sys_msgs = (
+            [{"role": "system", "content": system}] if system else []
+        )
+
+        def total(msgs: list[dict[str, Any]]) -> int:
+            return estimate_message_tokens(sys_msgs + msgs)
+
+        if total(convo) <= budget:
+            return convo
+        head, tail = convo[:1], convo[1:]
+        # Drop the oldest middle turn until the window fits, always retaining the last two
+        # turns (the most recent emission + the file-tail observation to continue from).
+        dropped = 0
+        while len(tail) > 2 and total(head + tail) > budget:
+            tail = tail[1:]
+            dropped += 1
+        # OBSERVABILITY (d162 hard line): this safety net is NON-LOAD-BEARING — the tool/feed
+        # push-leads + fold suppression must bound EVERY input BY CONSTRUCTION so this never
+        # fires. If it ever does, SURFACE it (it is not a silent app-cap: it drops only the
+        # OLDEST middle turns, whose content is on disk and re-fed via the bounded tail — the
+        # task turn + SOURCE INDEX + the recent file tail are always retained, never a figure
+        # or source dropped). A non-zero count on the trace flags that the primary bound
+        # leaked and must be tightened at the tool/feed layer.
+        if dropped:
+            try:
+                span = trace.get_current_span()
+                span.set_attribute("convo_bound.fired", True)
+                span.set_attribute("convo_bound.dropped_middle_turns", dropped)
+            except Exception:  # noqa: BLE001 - observability must never break the write loop
+                pass
+        return head + tail
+
+    # ------------------------------------------------------------------ #
+    # PER-NODE bounded MULTI-TURN MEMORY (d263 — pin/SWA-tail retired): the simple
+    # middle-turn compaction that wraps a per-node loop's convo (see _node_history).
+    # ------------------------------------------------------------------ #
+    def _node_bundle_doctrine(self) -> str:
+        """The composed doctrine of the bundle(s) THIS node has LOADED (d212/d221).
+
+        NODE-SELF-SELECT (d221): the doctrine is the union over ``self._loaded_bundles``
+        — the ``object`` floor plus whatever the node self-selected at runtime — NOT a
+        role/tool -> bundle table lookup. The union is the 'active bundle defs' of the
+        capabilities the node loaded. Never raises — a mis-wired bundle degrades to no
+        doctrine rather than crashing the node."""
+        try:
+            names = getattr(self, "_loaded_bundles", None) or {BUNDLE_OBJECT}
+            return compose_doctrine(names)
+        except Exception:  # noqa: BLE001 - doctrine composition must never break a node
+            return ""
+
+    def _load_bundle(self, name: str) -> dict[str, Any]:
+        """SELF-SELECT a bundle at runtime (d221) — the effect of ``get_bundles(name=…)``.
+
+        Records ``name`` in :attr:`_loaded_bundles` (so the node's active doctrine now
+        carries its usage text) and registers its handler-backed ToolDefs onto this node's tool
+        registry when the run supplies one (the real GrowableToolRegistry growth point,
+        bound to this run's fetched sources). Returns the bundle's ``{loaded, summary,
+        doctrine, tools}``; an unknown name degrades to ``{error, …}`` rather than
+        crashing the node."""
+        from .bundles import UnknownBundleError
+
+        registry = getattr(self.hook, "registry", None) if self.hook is not None else None
+        ctx: dict[str, Any] = {}
+        if self._chain_sources:
+            ctx["sources"] = self._chain_sources
+        try:
+            result = expand_bundle(str(name).strip(), registry, ctx)
+        except UnknownBundleError as exc:
+            return {"error": str(exc)}
+        self._loaded_bundles.add(result["loaded"])
+        return result
+
+    # ------------------------------------------------------------------ #
+    # NODE-SELF-SELECT scaffolding (d221/d242 — TRUE self-select): every in-plan
+    # node starts TOOL-LESS (only get_bundles + finish) and MUST self-select the
+    # bundle(s) its task needs to OBTAIN its domain tools. There is NO role->bundle
+    # table and NO pre-mounted domain tool — tools + doctrine + ctx-sources all arrive
+    # on bundle LOAD. The same scaffolding drives every loop (research/review/write/
+    # synthesis/file-delivery + the linear chat worker), exactly as the planner
+    # self-selects via the same get_bundles tool.
+    # ------------------------------------------------------------------ #
+    def _node_run_ctx(self) -> dict[str, Any]:
+        """The per-run binding ctx a self-selected bundle needs to register its tools.
+
+        GENERIC seam (as4): supplies the run's fetched SOURCES (so research_read binds
+        load_source to the real prior research) AND the prior gather NOTES (so research_read
+        also binds read_notes — the CHEAP first leg of the cost hierarchy) plus the configured
+        research tool names + note flag (so the research bundle binds the configured search/
+        fetch/note schemas). A DOMAIN-AGNOSTIC memory-read (as4/d241) is realized HERE: the
+        sources + notes are collected SOURCE-AGNOSTICALLY (web ``fetched``/``article_notes`` OR
+        generic ``records``/``notes``), so a non-web complex-memory type (codebase, vector-db)
+        extends THIS provider — and reaches every self-selecting node, INCLUDING the LINEAR/chat
+        worker answering a follow-up over prior research — without touching any loop."""
+        ctx: dict[str, Any] = {
+            "search_tool": self._search_tool,
+            "fetch_tool": self._fetch_tool,
+            "note_tool": self._note_tool,
+            "emit_notes": self._emit_article_notes,
+        }
+        if self._chain_sources:
+            ctx["sources"] = self._chain_sources
+        # DOMAIN-AGNOSTIC memory-read (as4/d241): bind read_notes (the cheap gist leg) — not
+        # only load_source — for ANY self-selecting node by supplying the prior gather NOTES.
+        # SA-4: the WRITE RUNTIME's served notes (``_chain_notes``, the retired read_notes
+        # pre-reg's replacement) ride FIRST, then any in-DAG upstream notes — so the write/
+        # review path binds read_notes via self-select (its DAG upstream is empty) AND the
+        # gather DAG keeps reading its upstream notes. None fed on either side → no key.
+        notes = list(self._chain_notes) + self._collect_upstream_notes()
+        if notes:
+            ctx["notes"] = notes
+        return ctx
+
+    def _collect_upstream_notes(self) -> list[Mapping[str, Any]]:
+        """The prior gather NOTES this node can READ (as4 domain-agnostic memory-read, d241).
+
+        Folds the structured note artifact every upstream gather dependency emitted into this
+        node's ``tool_value`` — under the web key (``article_notes``) or a generic key
+        (``notes``) — so ``read_notes`` binds for ANY self-selecting node (incl. the linear
+        worker) over ANY source. Source-agnostic + order-preserving; ``read_notes`` keys each
+        gist to the SAME ``[S#]`` as the supplied ``sources``."""
+        out: list[Mapping[str, Any]] = []
+        for tv in self._upstream_tool_values.values():
+            if isinstance(tv, Mapping):
+                for x in (tv.get("article_notes") or tv.get("notes") or []):
+                    if isinstance(x, Mapping):
+                        out.append(x)
+        return out
+
+    def _get_bundles_handler(self) -> Callable[..., dict[str, Any]]:
+        """The ``get_bundles`` handler bound to THIS node (memoized).
+
+        Lists the catalog, or LOADS a bundle by name — registering its tools onto the
+        node's LIVE registry (so they become callable), binding this run's ctx, and
+        recording the load in :attr:`_loaded_bundles` (so the node's active doctrine grows). This
+        is the SAME ``make_get_bundles`` the planner registers, wired with the node's
+        registry + ctx + the load hook (d242)."""
+        handler = getattr(self, "_get_bundles_handler_cached", None)
+        if handler is None:
+            from .discovery_tools import make_get_bundles
+
+            registry = getattr(self.hook, "registry", None) if self.hook is not None else None
+            handler = make_get_bundles(
+                registry=registry,
+                ctx_provider=self._node_run_ctx,
+                on_load=self._loaded_bundles.add,
+            )
+            self._get_bundles_handler_cached = handler
+        return handler
+
+    def _get_bundles_spec(self) -> dict[str, Any]:
+        """The native ``get_bundles`` tool schema — the SELF-SELECT surface every in-plan
+        node is offered (d242). The description is the d186 selection lever: it frames that
+        the node starts tool-less and MUST load the bundle its task needs FIRST."""
+        return make_tool_spec(
+            "get_bundles",
+            "SELF-SELECT your tools. Call with NO args to LIST the capability bundles you "
+            "can load ({name, summary}); call name=\"<NAME>\" to LOAD one — its tools become "
+            "callable and its doctrine guides you. You START with ONLY get_bundles + finish, "
+            "so you MUST load the bundle your task needs (e.g. 'research' to search/fetch the "
+            "web, 'file' to author a document, 'research_read' to read an already-fetched "
+            "source) BEFORE you can use its tools. Load the right bundle FIRST, then work.",
+            {"name": {"type": "string"}},
+            [],
+        )
+
+    def _offered_tool_specs(
+        self, only: Optional[Sequence[str]] = None
+    ) -> list[dict[str, Any]]:
+        """The tool schemas offered to the model THIS turn (d242 TRUE self-select):
+        get_bundles (always) + the base finish + the tools of every bundle the node has
+        SELF-SELECTED so far. Before any self-select this is EXACTLY {get_bundles, finish}
+        — no domain tool is pre-offered; the node obtains its tools only by loading a
+        bundle. Recomputed each turn so a freshly-loaded bundle's tools appear next turn.
+
+        ``only`` (an optional allow-list of domain tool names) CURATES the loaded bundles'
+        surface down to the subset THIS phase uses (the d212 'runtime selects the subset a
+        phase needs' filter — e.g. a reviewer that loads 'file' but is offered file_read +
+        file_update, never file_write). It NEVER pre-mounts a tool: a name in ``only`` whose
+        bundle is not loaded yet simply does not appear. get_bundles + the base finish are
+        always offered regardless of ``only``."""
+        allow = set(only) if only is not None else None
+        specs: list[dict[str, Any]] = [self._get_bundles_spec()]
+        seen = {"get_bundles"}
+        for spec in compose_tool_specs(self._loaded_bundles, self._node_run_ctx()):
+            try:
+                fname = spec["function"]["name"]
+            except (KeyError, TypeError):
+                fname = None
+            if fname and fname in seen:
+                continue
+            # the base finish is always available; domain tools may be curated to ``only``.
+            if fname and fname != "finish" and allow is not None and fname not in allow:
+                continue
+            if fname:
+                seen.add(fname)
+            specs.append(spec)
+        return specs
+
+    def _offered_tool_names(self, only: Optional[Sequence[str]] = None) -> tuple[str, ...]:
+        """The names of the tools offered this turn — the ``accepted`` set the call
+        parsers gate on (recomputed each turn as bundles load, curated to ``only``)."""
+        return tuple(s["function"]["name"] for s in self._offered_tool_specs(only))
+
+    async def _handle_self_select(
+        self, tool: str, args: Mapping[str, Any]
+    ) -> Optional[str]:
+        """If ``tool`` is ``get_bundles``, run the self-select (LIST or LOAD) and return its
+        observation string; else return None (not a self-select call → the loop dispatches
+        its own domain tool). The observation tells the model exactly which tools it just
+        unlocked so it acts on them next turn. Never raises — a self-select failure degrades
+        to a 'list the bundles' nudge rather than crashing the node."""
+        if tool != "get_bundles":
+            return None
+        handler = self._get_bundles_handler()
+        name = args.get("name") if isinstance(args, Mapping) else None
+        try:
+            result = handler(name=name)
+        except Exception as exc:  # noqa: BLE001 - self-select must never crash a node
+            return (f"get_bundles failed: {exc}. Call get_bundles with no arguments to list "
+                    "the bundles, then load the one you need.")
+        if "loaded" in result:
+            tools = ", ".join(result.get("tools") or []) or "(none)"
+            obs = (f"Loaded bundle '{result['loaded']}'. Its tools are now available: "
+                   f"{tools}. Use them now to do your task; load another bundle only if you "
+                   "still need a capability you have not loaded.")
+            # d263: the bundle's DOCTRINE (its how-to: the research ReAct loop, the file
+            # author/read doctrine, …) rides this LOAD observation ONCE — delivered in-band
+            # when the node self-selects the bundle, carried forward by the convo window —
+            # rather than re-pasted every turn as the retired pinned head did. (GET_BUNDLES
+            # already promises 'you get back its doctrine'; this makes that true.)
+            doctrine = str(result.get("doctrine") or "").strip()
+            if doctrine:
+                obs += f"\n\nHOW TO USE THIS BUNDLE:\n{doctrine}"
+            return obs
+        rows = result.get("bundles") or []
+        listing = "; ".join(f"{r['name']} ({r['summary']})" for r in rows) or "(none)"
+        err = result.get("error")
+        prefix = f"{err}. " if err else ""
+        return (f"{prefix}Bundles you can load — {listing}. Call "
+                "get_bundles(name=\"<NAME>\") to LOAD the one your task needs, then use its "
+                "tools.")
+
+    # How many turns a RAW-emission loop (file-delivery / synthesis) may spend SELF-SELECTING
+    # its bundles before the write phase. Small — a node typically loads 1-2 bundles.
+    _SELF_SELECT_FRONT_TURNS = 4
+
+    async def _invoke_loaded_tool(
+        self, tool: str, args: Mapping[str, Any]
+    ) -> tuple[str, Any]:
+        """Invoke a self-selected loaded tool → ``(observation_str, raw_value_or_None)``.
+
+        The value-returning core of :meth:`_dispatch_loaded_tool`: a caller that only needs
+        the observation uses the wrapper; the generic GATHER path (:meth:`_run_research_loop`,
+        SA-4) needs the RAW value too so it can shape a downstream-pullable record. ``None``
+        value on any unavailable/failed call (the observation still explains why)."""
+        try:
+            res = await self.hook.invoke(tool, **dict(args))
+        except Exception as exc:  # noqa: BLE001 - a tool call must not crash the node
+            return (f"{tool} is not available — load its bundle with get_bundles first, or "
+                    f"answer from what you have ({exc}).", None)
+        if not getattr(res, "ok", False):
+            return (f"{tool} returned no usable result: {getattr(res, 'error', '')}.", None)
+        return (f"{tool} result: {res.value}", res.value)
+
+    async def _dispatch_loaded_tool(self, tool: str, args: Mapping[str, Any]) -> str:
+        """Dispatch a tool the node SELF-SELECTED (its bundle registered it on the hook) → an
+        observation string. GENERIC (d242 / as4): any loaded bundle's tool flows through the
+        hook BY NAME, so a future domain-agnostic memory-read bundle (session/complex-memory,
+        codebase, vector-db) needs NO loop change — it just registers more tools + widens
+        :meth:`_node_run_ctx`. Never raises — an unavailable/failed tool degrades to a note."""
+        obs, _ = await self._invoke_loaded_tool(tool, args)
+        return obs
 
     @staticmethod
-    def _is_readable_fetch(val: Mapping[str, Any]) -> bool:
-        """True if a web_fetch result carries READABLE article text (not binary).
+    def _gather_record(
+        tool: str, args: Mapping[str, Any], value: Any
+    ) -> dict[str, str]:
+        """Shape one self-selected NON-WEB gather call into a generic source-like RECORD
+        (SA-4/d254). Mirrors a web ``fetched`` entry — ``{title, url, markdown}`` — so a
+        downstream reader/writer grounds in it through the SAME ``chain_sources`` harvest the
+        web path uses (:func:`collect_fetched_sources_full`), with ZERO web semantics in the
+        engine. Pure + source-agnostic: the ``url`` is a STABLE synthetic id (e.g.
+        ``read_file://path``) so the writer's URL-dedup keys it; the body is whatever textual
+        content the tool returned. Works for any bundle (codebase/vector-db/bash/future)."""
+        text = ""
+        ident = ""
+        title = ""
+        if isinstance(value, Mapping):
+            for k in ("markdown", "text", "content", "body", "value"):
+                v = value.get(k)
+                if v:
+                    text = str(v)
+                    break
+            ident = str(
+                value.get("path") or value.get("url") or value.get("id") or ""
+            ).strip()
+            title = str(
+                value.get("title") or value.get("name") or value.get("path") or ""
+            ).strip()
+        if not text:
+            text = "" if value is None else str(value)
+        if not ident:
+            a = args if isinstance(args, Mapping) else {}
+            ident = str(
+                a.get("path") or a.get("url") or a.get("id") or a.get("query") or title or ""
+            ).strip()
+        if not ident:
+            ident = (text[:48].strip() or tool)
+        url = ident if "://" in ident else f"{tool}://{ident}"
+        return {"title": title or ident or tool, "url": url, "markdown": text}
 
-        Trust the tool's ``extracted`` flag (Trafilatura produced article markdown);
-        otherwise require a text-ish content type. A PDF/binary fetch (``extracted``
-        False + a non-text content type) is rejected so its garbage never reaches the
-        research call — the fix for the live "uninterpretable binary data" failure."""
-        if val.get("extracted"):
-            return True
-        ctype = str(val.get("content_type") or "").lower()
-        if "pdf" in ctype:
-            return False
-        return any(t in ctype for t in ("text/", "html", "json", "xml")) and bool(ctype)
+    # NOTE (SB-RR, d293): the former ``_run_linear_worker`` (the LINEAR/CHAT self-select loop)
+    # is RETIRED — its job is subsumed by the UNIFIED worker loop (:meth:`_run_research_loop`),
+    # which every hooked tool-less worker now enters. A trivial chat message is answered in ONE
+    # emission there (the model selects no actionable bundle and writes its prose); a research
+    # FOLLOW-UP self-selects ``research_read`` and answers from prior sources via the SAME loop
+    # (whose generic non-web tool dispatch routes read_notes/load_source through
+    # :meth:`_invoke_loaded_tool`).
+
+    async def _self_select_front(self, system: Optional[str], *, suggest: str) -> None:
+        """Run a bounded SELF-SELECT phase (d242) for a loop whose MAIN phase is RAW emission
+        (file-delivery / synthesis): the node LOADS the bundle(s) it needs so its doctrine
+        (and any read tools) arrive via self-select, NOT a prime. The raw write phase that
+        follows offers the model no domain tools (it emits content; the loop drives the file
+        tools), so this front is the loop's only self-select opportunity — its job is to pin
+        the right doctrine before authoring.
+
+        ``suggest`` is a PROMPT HINT naming the bundles this kind of node typically needs (a
+        d186 framing lever, NOT a hardcoded load — the MODEL issues the get_bundles calls).
+        Grows :attr:`_loaded_bundles`; never raises (a model that loads nothing degrades to
+        the object floor, and raw emission still produces the deliverable)."""
+        if self.hook is None:
+            return
+        convo: list[dict[str, Any]] = [{"role": "user", "content": (
+            "Before you author the deliverable, SELF-SELECT your tools. " + suggest +
+            " You start with only get_bundles + finish — call get_bundles(name=\"<NAME>\") "
+            "once for EACH bundle you need, then reply READY to begin writing.")}]
+        # Match the raw write phase's determinism (d35): temp=0, no inherited format schema,
+        # so a self-select turn is consistent with the authoring turns that follow.
+        opts = dict(self._call_opts)
+        opts.pop("format", None)
+        opts["temperature"] = 0
+        for _ in range(self._SELF_SELECT_FRONT_TURNS):
+            opts["tools"] = self._offered_tool_specs()
+            accepted = self._offered_tool_names()
+            raw, tool_calls = await self._research_emit(system, convo, opts)
+            call = (first_native_call(tool_calls, accepted)
+                    or self._parse_lightweight_call(raw, accepted))
+            if call is None:
+                break  # READY / prose → the node has loaded what it wants
+            convo.append({"role": "assistant", "content": raw or (
+                json.dumps({"tool": call[0], "args": call[1]}))})
+            if call[0] == "get_bundles":
+                obs = await self._handle_self_select(call[0], call[1])
+                convo.append({"role": "tool", "content": obs or ""})
+                continue
+            break  # finish or any other reply → stop loading, proceed to write
+
+    def _parse_lightweight_call(
+        self, raw: str, accepted: Sequence[str]
+    ) -> Optional[tuple[str, dict[str, Any]]]:
+        """Recover a lightweight ``(tool, args)`` call for ANY name in ``accepted`` from a
+        prose turn — the balanced-brace STRING fallback paired with :func:`first_native_call`
+        for the self-select loops (so a non-native model can still call get_bundles or a
+        loaded tool). Generic sibling of :meth:`_parse_research_call`; an unparseable or
+        unknown object is treated as 'no call' (the turn is the model's content)."""
+        s = _strip_synth_fence(raw or "").strip()
+        if not s.startswith("{"):
+            return None
+        blob = _first_json_object(s)
+        if not blob:
+            return None
+        try:
+            parsed = json.loads(blob)
+        except (ValueError, TypeError):
+            try:
+                parsed = json.loads(repair_model_json(blob))
+            except (ValueError, TypeError):
+                return None
+        if not isinstance(parsed, Mapping):
+            return None
+        tool = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
+        args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters")
+        accepted_set = set(accepted)
+        if not (isinstance(tool, str) and tool.strip()):
+            for key, val in parsed.items():
+                if str(key).strip() in accepted_set:
+                    tool, args = str(key).strip(), val
+                    break
+        name = str(tool).strip() if isinstance(tool, str) else ""
+        if name not in accepted_set:
+            return None
+        if not isinstance(args, Mapping):
+            args = {
+                k: v for k, v in parsed.items()
+                if k not in ("tool", "name", "tool_name", "args", "arguments", "parameters")
+            }
+        return name, dict(args)
+
+    def _fetch_output_override(self) -> str:
+        """The web_fetch output-message override from a LOADED bundle's context (d221).
+
+        Scans the bundle(s) this node has self-selected for one that OVERRIDES the
+        ``web_fetch`` observation (the research bundle prompts take-a-note); returns its
+        suffix, or '' for a plain (non-research) context that loaded no such override.
+        Never raises — an override-scan failure degrades to no suffix."""
+        ctx = {"fetch_tool": self._fetch_tool}
+        for name in getattr(self, "_loaded_bundles", ()):
+            try:
+                override = get_bundle(name).tool_output_override(self._fetch_tool, ctx)
+            except Exception:  # noqa: BLE001 - an override scan must never break a fetch
+                override = None
+            if override:
+                return override
+        return ""
+
+    def _node_history(
+        self,
+        convo: list[Mapping[str, Any]],
+        system: Optional[str],
+        *,
+        compact: bool = True,
+        reserve_predict: int = 0,
+        keep_recent: int = 6,
+    ) -> list[Mapping[str, Any]]:
+        """Bounded history for a per-node multi-turn loop (d263 — pin/SWA-tail REMOVED).
+
+        Returns the transport-ready history block to feed as ``Context(system=system,
+        history=…)``. d263 retired the failed pinned-head + SWA-tail re-injection (which
+        re-pasted the goal + bundle doctrine + task as always-in-view blocks on EVERY
+        turn): the goal now rides the loop's FIRST turn (``convo[0]``, the
+        :meth:`_compose_task` user turn) ONCE, the active doctrine arrives ONCE in the
+        ``get_bundles`` load observation, and the SHAPING system rides ``Context(system=…)``
+        ONCE — none of them re-pasted per turn. What remains here is the simple
+        middle-turn compaction this module always provided (``Conversation.compact``):
+        when ``compact`` is True and the window crosses num_ctx, the MIDDLE turns are
+        folded into an offline summary while ``convo[0]`` (the goal/task turn) is KEPT
+        verbatim and the most-recent ``keep_recent`` turns are preserved — so a long node
+        never blows the window AND never loses its goal. When ``compact`` is False (a loop
+        that already bounds its own convo, e.g. the write loop's :meth:`_bound_chat_convo`)
+        the convo is returned unchanged.
+
+        The summariser is the OFFLINE :func:`deterministic_summary` (no transport) on
+        purpose: compaction here is non-blocking context hygiene (d4), so it never fires
+        a live model round-trip inline on the event loop (the freeze hazard the rest of
+        this module is careful to offload)."""
+        history = list(convo)
+        # compact=False, or too short to have any compactible middle (goal turn + recent),
+        # → byte-identical passthrough.
+        if not compact or len(history) <= keep_recent + 1:
+            return history
+        num_ctx = int(self._call_opts.get("num_ctx") or _DEFAULT_WRITE_NUM_CTX)
+        reserve = int(reserve_predict) + 2048
+        if system:
+            reserve += estimate_tokens(system)
+        threshold = max(1, num_ctx - reserve)
+        # KEEP convo[0] (the goal/task turn) out of the compactible window — the goal-guard
+        # the retired pin used to provide, now done by simply not folding the first turn —
+        # and fold the MIDDLE of the rest via Conversation.compact (system=None, so its
+        # .messages is [running summary, *recent]).
+        head, rest = history[:1], history[1:]
+        conv = Conversation(
+            summarizer=deterministic_summary,
+            compaction_threshold=threshold,
+            keep_recent=keep_recent,
+            auto_compact=False,
+        )
+        conv.extend(rest)
+        conv.maybe_compact()
+        return head + conv.messages
+
+    def _scoped_source_block(self, *, full_index: bool = False) -> str:
+        """This node's sources, fed by ROLE (d170 calibration — bounded-but-NOT-starved).
+
+        The deep-research write phase has TWO source-consumer roles with OPPOSITE feeds,
+        because of the d49 reality (the raw-file WRITER cannot emit tool calls, so it CANNOT
+        pull source text on demand — only the REVIEWER, which dispatches ``load_source``, can):
+
+        * **WRITER** (``full_index=False``) — PUSH the FULL figure-bearing BODIES of this
+          section's assigned sources (``render_scoped_sources``: whole-doc summary + a
+          figure/date-rich verbatim excerpt per source). This is the good-run calibration
+          (trace bc7cef17: per-section writer inputs 20-39KB, ~80 figures). The d167 compact
+          ``load_source``-nudge LEADS (~2400 chars/src) STARVED the writer to a thin report —
+          same thinness as the d164 137KB over-feed, opposite cause. Now that ``max_sources``
+          caps the run and the planner SCOPES each section to ~2-4 sources, the full bodies of
+          those few sources are ~20-40KB — which FITS num_ctx un-truncated. The per-source
+          budget is the writer budget, and the TOTAL is capped to a fraction of the window so
+          even a many-source section stays bounded (thinner per source, never truncated). An
+          UNSCOPED single-section writer feeds ALL (``max_sources``-capped) sources the same
+          way. The d162 invariant holds by CONSTRUCTION: total source text <= window fraction.
+
+        * **REVIEWER** (``full_index=True``) — the COMPACT full INDEX MAP only (every ``[S#]``
+          for citation resolution, no bodies); it reads the live file by bounded region and
+          PULLS any source's verbatim text on demand via ``load_source`` (it CAN call tools).
+
+        Empty string when the run has no sources (caller degrades to the legacy path)."""
+        if not self._chain_sources:
+            return ""
+        ids = [i for i in (self.node.source_ids or []) if isinstance(i, int)]
+        if full_index:
+            # REVIEWER: compact full INDEX (map for [S#] resolution) — bodies pulled on demand.
+            block = render_scoped_source_index(
+                self._chain_sources, ids,
+                section_topic=self.node.task or "", full_index=True,
+            )
+            if block:
+                block += (
+                    "\n\nIf load_source returns a 'BUDGET REACHED' note, finish from what you "
+                    "have already loaded; cite only the [S#]/URLs shown; do not placeholder a "
+                    "citation you could not load."
+                )
+            return block
+        # WRITER (scoped per-section, or unscoped single-section): PUSH full figure-bearing
+        # bodies. Scoped → its 2-4 assigned ids; unscoped → all sources (max_sources-capped).
+        feed_ids = ids if ids else list(range(1, len(self._chain_sources) + 1))
+        if not feed_ids:
+            return ""
+        num_ctx = int(self._call_opts.get("num_ctx") or _DEFAULT_WRITE_NUM_CTX)
+        # TOTAL source-text budget = a fraction of the char envelope; split across the feed
+        # sources but capped per source at the writer budget — so the typical 2-4-source
+        # section gets near-full bodies (~good-run 20-40KB) while a many-source section stays
+        # bounded (the d162 no-truncation guarantee is structural, not an app cap).
+        total_cap = int(num_ctx * _CHARS_PER_TOKEN * _WRITE_SOURCE_WINDOW_FRACTION)
+        per_source = max(2500, min(resolve_writer_source_budget(), total_cap // len(feed_ids)))
+        return render_scoped_sources(
+            self._chain_sources, feed_ids,
+            excerpt_budget=per_source, section_topic=self.node.task or "",
+        )
+
+    # SoC ENGINE-THIN (SA-5/d254): the web URL/article/readability semantics
+    # (``NON_ARTICLE_EXT`` / ``looks_like_article_url`` / ``url_offered`` /
+    # ``is_readable_fetch``) used to live HERE. They now belong to the WEB bundle
+    # (``bundles.web_ingest``) — the engine imports the ``url_offered`` grounding predicate
+    # for the loop's defense-in-depth guard and DELEGATES the rest via ``_web_adapter``.
 
     # ------------------------------------------------------------------ #
     # AGENTIC RESEARCH loop (s9/c5, d49/d50 — retires flags #1/#3)
@@ -974,7 +1745,17 @@ class SubAgent:
         chain = Chain()
         chain.use(prompt_assembly())
         chain.use(call_stage(self.transport, **dict(opts)))
-        ctx = Context(system=system, history=list(convo), transport=self.transport)
+        # PER-NODE bounded memory (d263): window the research ReAct convo with the simple
+        # middle-turn compaction — the goal/task rides convo[0] ONCE and the doctrine rides
+        # the get_bundles load observation ONCE (the retired pinned head + SWA tail no longer
+        # re-paste them every turn); convo[0] is kept verbatim and older middle turns fold
+        # once the window crosses num_ctx, so a long node never blows the window or loses its
+        # goal. This is the canonical long multi-turn path the compaction subsystem drives.
+        history = self._node_history(
+            convo, system, compact=True,
+            reserve_predict=int(opts.get("num_predict", 0) or 0),
+        )
+        ctx = Context(system=system, history=history, transport=self.transport)
         ctx = await run_blocking_in_span(chain.run, ctx)
         return (ctx.raw_output or ""), getattr(ctx, "tool_calls", None)
 
@@ -1001,7 +1782,13 @@ class SubAgent:
         try:
             parsed = json.loads(blob)
         except (ValueError, TypeError):
-            return None
+            # d222 — retry after repairing E4B's common malformations (illegal \' escape /
+            # stray special token). The trace showed a research NOTE dropped TWICE to a
+            # ``\'`` escape — this recovers it so the note lands instead of being re-asked.
+            try:
+                parsed = json.loads(repair_model_json(blob))
+            except (ValueError, TypeError):
+                return None
         if not isinstance(parsed, Mapping):
             return None
         tool = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
@@ -1025,155 +1812,54 @@ class SubAgent:
     def _research_tool_specs(self, accepted: Sequence[str]) -> list[dict[str, Any]]:
         """Native tool schemas (s13) for the research ReAct tools the agent may call —
         keyed by the CONFIGURED tool names so a renamed search/fetch/note tool still maps.
-        Passed as ``tools=[...]`` so the model returns real ``message.tool_calls`` instead
-        of a "reply with ONLY JSON" prose turn the string parser could drop."""
-        specs: list[dict[str, Any]] = []
-        for name in accepted:
-            if name == self._search_tool:
-                specs.append(make_tool_spec(
-                    name,
-                    "STEP 1 — find candidate sources. Search the web for a focused "
-                    "question to IDENTIFY reliable primary sources before reading. "
-                    "Use query OPERATORS to sharpen results: \"exact phrase\", "
-                    "site:domain / -site:domain, OR, leading - to exclude, "
-                    "intitle:, filetype:pdf. Returns ranked {title,url,snippet} rows; "
-                    "Wikipedia is excluded automatically. Then web_fetch the most "
-                    "promising URLs.",
-                    {"query": {"type": "string"}}, ["query"]))
-            elif name == self._fetch_tool:
-                specs.append(make_tool_spec(
-                    name,
-                    "STEP 2 — read a source. Fetch ONE result URL and READ its full "
-                    "article text before you rely on it (never cite a page you have "
-                    "not read). If it FAILS the result says WHY — forbidden (403), "
-                    "not-found (404), timeout, or a denied domain — so pick a "
-                    "DIFFERENT source rather than re-trying a dead link.",
-                    {"url": {"type": "string"}}, ["url"]))
-            elif name == self._note_tool:
-                specs.append(make_tool_spec(
-                    name,
-                    "Record a SHORT control note about a source you just READ.",
-                    {"url": {"type": "string"}, "summary": {"type": "string"},
-                     "category": {"type": "string"}, "source_trust": {"type": "string"},
-                     "key_claims": {"type": "array", "items": {"type": "string"}},
-                     "relevance": {"type": "string"},
-                     "gaps_or_followups": {"type": "array", "items": {"type": "string"}}},
-                    ["url", "summary"]))
-        return specs
+
+        NOTE (d242): NOT wired into the loop anymore — under TRUE self-select the research
+        tools are offered ONLY after the node loads the 'research' bundle, via
+        :meth:`_offered_tool_specs` → ``compose_tool_specs``. Retained as the reference for
+        the per-phase native schema construction (the configured-name binding + ``accepted``
+        filtering); it is NOT a tool-pre-offer path.
+
+        DELEGATES to the ResearchBundle (d190/d212) — the bundle is the single source of
+        the schemas. The bundle exposes ONE ``tool_specs(ctx)`` catalog (no role-phase
+        method, d212 #2); the runtime SELECTS the subset it offers this phase by filtering
+        to exactly the ``accepted`` names, in ``accepted`` order — so the research ReAct
+        loop is byte-identical to the prior inline construction."""
+        bundle = get_bundle("research")
+        ctx = {
+            "search_tool": self._search_tool,
+            "fetch_tool": self._fetch_tool,
+            "note_tool": self._note_tool,
+            "emit_notes": True,
+        }
+        catalog = {s["function"]["name"]: s for s in bundle.tool_specs(ctx)}
+        return [catalog[name] for name in accepted if name in catalog]
 
     async def _dispatch_research_tool(
         self, tool: str, args: Mapping[str, Any],
         fetched: list[dict[str, str]], seen_urls: set[str],
+        offered_urls: Optional[set[str]] = None,
     ) -> str:
-        """Execute ONE model-chosen research tool call → an observation string.
+        """DELEGATE one model-chosen WEB tool call to the web bundle's gather adapter.
 
-        A ``web_search`` returns its top candidate rows (title/url/snippet); a
-        ``web_fetch`` returns the EXTRACTED article markdown (and the source is appended
-        to ``fetched`` so it can later ground a downstream node, d17). The hook publishes
-        tool_call/tool_result on each invoke, so the live trace shows the model's real
-        search/fetch decisions (the observability bar). A failed/dead/binary call yields
-        a short non-fatal note, never an exception (a research turn must not crash)."""
-        if tool == self._search_tool:
-            query = str(
-                args.get("query") or args.get("q") or args.get("search") or ""
-            ).strip()
-            if not query:
-                return "web_search needs a non-empty \"query\". Try again."
-            try:
-                res = await self.hook.invoke(self._search_tool, query=query)
-            except Exception as exc:  # noqa: BLE001 - a failed search must not crash the node
-                return f"web_search failed: {exc}. Try a different query or write your findings."
-            if not getattr(res, "ok", False):
-                return f"web_search returned no results ({getattr(res, 'error', '')}). Try another query."
-            rows = (res.value or {}).get("results") if isinstance(res.value, Mapping) else None
-            rows = rows or []
-            if not rows:
-                return "web_search returned 0 results. Try a broader query."
-            lines = ["SEARCH RESULTS (choose URLs to web_fetch and read):"]
-            for row in rows[:8]:
-                if not isinstance(row, Mapping):
-                    continue
-                url = str(row.get("url") or "").strip()
-                title = str(row.get("title") or "").strip() or "(untitled)"
-                snip = str(row.get("snippet") or "").strip()[:200]
-                lines.append(f"- {title} <{url}>\n  {snip}")
-            return "\n".join(lines)
-
-        # web_fetch
-        url = str(args.get("url") or args.get("link") or "").strip()
-        if not url:
-            return "web_fetch needs a non-empty \"url\". Choose one from the search results."
-        if url in seen_urls:
-            return f"Already read <{url}>. Fetch a DIFFERENT source or write your findings."
-        seen_urls.add(url)
-        if not self._looks_like_article_url(url):
-            return (
-                f"<{url}> is not a readable HTML article (PDF/file/binary). "
-                "Choose a different source."
-            )
-        try:
-            res = await self.hook.invoke(self._fetch_tool, url=url)
-        except Exception as exc:  # noqa: BLE001 - a dead link must not fail the node
-            return f"Could not fetch <{url}>: {exc}. Try another source."
-        if not getattr(res, "ok", False):
-            return f"Could not fetch <{url}>. Try another source."
-        val = res.value if isinstance(res.value, Mapping) else {}
-        # web_fetch surfaces a STRUCTURED failure (ok=False + a DISTINCT error_kind)
-        # so the agent reacts correctly to WHY a read failed: a 403/blocked/denied
-        # page will not yield to a retry (pick another source); a 404 is a dead link;
-        # a deny-listed domain (e.g. Wikipedia) must never be cited. Relay the exact
-        # reason instead of a single generic "try another source".
-        if val.get("ok") is False:
-            kind = str(val.get("error_kind") or "error")
-            detail = str(val.get("error") or "").strip()
-            return (f"Could not read <{url}> [{kind}]: {detail} "
-                    "Choose a DIFFERENT source from the search results.")
-        md = str(val.get("markdown") or "").strip()
-        if not md or not self._is_readable_fetch(val):
-            return f"<{url}> had no readable article text. Try another source."
-        title = str(val.get("title") or "").strip() or url.rsplit("/", 1)[-1]
-        final_url = str(val.get("final_url") or url)
-        record: dict[str, str] = {"title": title, "url": final_url, "markdown": md}
-        # READ the source into the window (N3): a long article is map/reduced into an
-        # in-window factual summary instead of being truncated to the first budget chars
-        # (which dropped the rest of the document); short sources pass through verbatim.
-        body, summary, read_signal = await self._read_fetched(md, title, final_url)
-        if summary is not None:
-            record["summary"] = summary  # additive; full ``markdown`` stays untouched
-        fetched.append(record)
-        # COVERAGE SIGNAL (MSF/d89-b, fixes seam ⑤): tell the model HOW MUCH of the
-        # source it actually has so it reasons about coverage instead of treating the
-        # sliver as the whole article. A whole-doc map/reduce summary (chunked-read ON)
-        # IS complete coverage; a flat truncation is NOT — say so and invite a follow-up.
-        full_chars = len(md)
-        if read_signal is not None:
-            # d109 HONEST signal: counts + provenance for the RELEVANCE-SELECT read —
-            # replaces the vague "there is MORE" nudge with the real M-found/X-read numbers
-            # and which sources are now in hand, across the node's fetched docs.
-            src_names = [
-                (f.get("title") or f.get("url") or "(source)") for f in fetched
-            ]
-            provenance = ", ".join(src_names[-3:])
-            read_note = (
-                f"FETCHED <{title}> <{final_url}> — found {read_signal['found']} relevant "
-                f"passages in this source; reading the top {read_signal['read']} "
-                f"({read_signal['chars']} chars) most relevant to your question. You have "
-                f"now read {len(fetched)} source(s): {provenance}. "
-            )
-        elif summary is not None:
-            read_note = (
-                f"FETCHED <{title}> <{final_url}> — you have now READ this WHOLE source "
-                f"(a grounded factual summary covering all {full_chars} chars). "
-            )
-        elif len(body) < full_chars:
-            read_note = (
-                f"FETCHED <{title}> <{final_url}> — showing the first {len(body)} of "
-                f"{full_chars} chars; this source has MORE. Note follow-ups or fetch it "
-                "again to cover the rest. "
-            )
-        else:
-            read_note = f"FETCHED <{title}> <{final_url}> — you have now READ this source. "
-        return read_note + READ_NOT_DESCRIBE + f"\n\n{body}"
+        SoC ENGINE-THIN (SA-5/d254): the web_search/web_fetch dispatch + all URL/article/
+        readability/record/coverage-note semantics are OWNED by the WEB bundle now
+        (:class:`~agent_runtime.bundles.web_ingest.WebGatherAdapter`). The engine no longer
+        hardcodes any of it — it hands the adapter THIS run's hook ``invoke`` closure, the
+        ``read_fetched`` read closure (which still holds the engine's embedder + budgets), and
+        the bundle-sourced web_fetch take-a-note suffix, and the adapter fires the web logic +
+        appends readable sources to ``fetched``. Behaviour is byte-identical to the prior
+        engine method (the served web path is the contrastive byte-comparable gate); only the
+        OWNER moved from the engine into the bundle that owns the web tools."""
+        return await self._web_adapter.dispatch(
+            tool, args,
+            invoke=self.hook.invoke,
+            fetched=fetched,
+            seen_urls=seen_urls,
+            offered_urls=offered_urls,
+            read_fetched=self._read_fetched,
+            emit_article_notes=self._emit_article_notes,
+            fetch_note_suffix=self._fetch_output_override(),
+        )
 
     def _read_content_budget(self) -> int:
         """Per-source char budget for the d109 RELEVANCE-SELECT read (FX0 token-bounded).
@@ -1192,7 +1878,12 @@ class SubAgent:
         )
         total = read_content_char_budget()  # ~20k tokens × 4 chars/token
         per_source = total // max(1, fetch_cap)
-        return max(self._fetched_char_budget, min(per_source, total))
+        # d157: bound each per-source research read to a compact relevant CHUNK
+        # (``RESEARCH_READ_CHUNK_CHARS``) so a multi-turn react loop's ACCUMULATED input stays
+        # small and per-node latency drops — the full verbatim body is still stored for the
+        # writer's citation / load_source path, and the relevance-select picks the MOST
+        # relevant passages so the cap trims raw bulk, not the useful content.
+        return max(self._fetched_char_budget, min(per_source, total, RESEARCH_READ_CHUNK_CHARS))
 
     async def _read_fetched(
         self, md: str, title: str, url: str
@@ -1291,30 +1982,48 @@ class SubAgent:
         return (
             f"Note recorded for <{note.title or note.url}> (trust: {note.source_trust}). "
             f"Open follow-ups: {followups}. Continue: read another source, search a new "
-            "angle for those follow-ups, or write your FINDINGS."
+            "angle for those follow-ups, or — once every read source is noted — write your "
+            "FINDINGS as SUBSTANTIVE PROSE (the actual facts, figures, dates, and quotes you "
+            "found, with their sources). Do NOT reply with a meta-sentence such as 'the report "
+            "is complete' or 'research is done' — that is not findings; write the findings "
+            "themselves."
         )
 
     async def _run_research_loop(self, inputs: Mapping[str, Any]) -> "SubAgentResult":
-        """Run a ``web_search`` node as a TRUE AGENT (d49/d50) — RETIRES flags #1/#3.
+        """The UNIFIED WORKER LOOP (SB-RR, d273/d292/d293) — every hooked tool-less WORKER.
 
-        The deterministic search-then-read EXECUTOR (a web_search node auto-following
-        through to ``web_fetch`` whenever ``read_search_max_fetch`` > 0) is replaced by
-        a ReAct loop in which the WORKER ITSELF decides to search and which sources to
-        read. Each turn the model emits EITHER a lightweight tool call
-        (``{"tool":"web_search","args":{"query":...}}`` /
-        ``{"tool":"web_fetch","args":{"url":...}}`` — small args the small model emits
-        reliably, unlike content-laden JSON, d49) OR its FINDINGS as RAW prose (no
-        ``format=<schema>``; content RAW, d50.1). The loop EXECUTES each call against the
-        real hook, feeds the REAL observation back, and ends when the model writes
-        findings (or a NON-FLOW bound trips). ``read_search_max_fetch`` survives ONLY as
-        the fetch CAP here (a cost/safety bound on how many web_fetch calls the agent may
-        make), NOT a gate that forces the flow.
+        ONE self-select ReAct loop now serves what used to be three separate paths: the
+        GATHER node (the retired ROLE_RESEARCHER), the LINEAR/chat worker, and the bare
+        producer. The node starts TOOL-LESS and the WORKER ITSELF decides — driven by its
+        SPECIALIZATION, never a role — which bundle(s) to self-select, and the SELECTED bundle
+        determines behavior:
 
-        Readable sources the agent chose to read are attached to the result
-        ``tool_value`` as ``{"fetched": [...]}`` so a downstream synthesizer/writer node
-        still grounds in the real article text via the inter-node SOURCES & FINDINGS feed
-        (d17, rendered by :meth:`_render_tool_value`). The findings prose is the node
-        ``output``. The result-validator gate runs as in :meth:`run`."""
+        * a node carrying the research-METHODOLOGY spec self-selects the ``research`` bundle
+          and GATHERS — each turn it emits a lightweight tool call
+          (``{"tool":"web_search","args":{"query":...}}`` / ``web_fetch`` — small args the
+          small model emits reliably, d49) OR its FINDINGS as RAW prose (no ``format=<schema>``,
+          d50.1). ``read_search_max_fetch`` survives ONLY as the fetch CAP (a cost/safety bound),
+          never a flow gate; the GATHER-specific gates below key on the SELF-SELECTED research
+          bundle, not a role.
+        * a research FOLLOW-UP self-selects ``research_read`` and answers from prior sources.
+        * a TRIVIAL node self-selects NO actionable bundle and writes its answer in ONE
+          emission (the old single-shot worker — its prose IS the output).
+
+        The loop EXECUTES each call against the real hook, feeds the REAL observation back, and
+        ends when the model writes its prose (or a NON-FLOW bound trips). Readable sources the
+        agent chose to read are attached to ``tool_value`` as ``{"fetched": [...]}`` so a
+        downstream node grounds in the real article text (d17, :meth:`_render_tool_value`); a
+        non-gathering worker attaches none. The prose is the node ``output``; the result-
+        validator gate runs as in :meth:`run`."""
+        # NODE-SELF-SELECT (d242 — TRUE self-select): the worker starts TOOL-LESS (only
+        # get_bundles + finish). To GATHER it MUST self-select the 'research' bundle (search/
+        # fetch/note + the web_fetch take-a-note override) and, to read a fetched source,
+        # 'research_read'; to answer from prior session research it self-selects 'research_read'
+        # alone; a trivial worker self-selects nothing. There is NO role->bundle prime and NO
+        # pre-mounted domain tool; the tools + doctrine + ctx all arrive on LOAD (the catalog is
+        # advertised in the system prompt). The offered tools and the ``accepted`` set are
+        # recomputed each turn from the bundles loaded so far (:meth:`_offered_tool_specs`),
+        # exactly as the planner self-selects.
         system = self._compose_system()
         # The fetch CAP is a NON-FLOW bound: the agent decides WHETHER/WHICH to fetch;
         # the cap only bounds total fetches. A caller that wired none (0) gets a sane
@@ -1324,34 +2033,69 @@ class SubAgent:
             else RESEARCH_DEFAULT_FETCH_CAP
         )
         # Reasoned tool calls survive without a wire schema (d34); strip any inherited
-        # format so a turn is free to be a tool call OR raw findings.
+        # format so a turn is free to be a tool call OR raw findings. The tool surface is
+        # set PER TURN inside the loop (it grows as the node self-selects), not once here.
         opts = dict(self._call_opts)
         opts.pop("format", None)
-        # s13 NATIVE tool-call path: offer the research tools as real schemas so the model
-        # answers with ``message.tool_calls`` (drop-immune) instead of a "reply with ONLY
-        # JSON" prose turn. ``accepted`` mirrors :meth:`_parse_research_call` (the fallback).
-        accepted = (self._search_tool, self._fetch_tool)
-        if self._emit_article_notes:
-            accepted = accepted + (self._note_tool,)
-        tool_specs = self._research_tool_specs(accepted)
-        if tool_specs:
-            opts["tools"] = tool_specs
+        accepted: tuple[str, ...] = ()
 
-        # The per-article CONTROL-note clause is appended ONLY when notes are enabled
-        # (N2); default OFF keeps the instruction (and the whole loop) byte-identical.
-        instruction = _RESEARCH_LOOP_INSTRUCTION.format(fetch_cap=fetch_cap)
-        if self._emit_article_notes:
-            instruction += _RESEARCH_NOTE_CLAUSE
+        # d229 DOCTRINE DE-DUP (token hygiene; NO flags): the research DOCTRINE
+        # (``RESEARCH_LOOP_INSTRUCTION`` — the 'Workflow: search…' loop how-to) is carried
+        # ONCE, in the ``get_bundles`` LOAD observation the model gets when it self-selects the
+        # 'research' bundle (the bundle's ``own_doctrine``, carried forward by the convo
+        # window). d229/d263: it is NEVER re-pasted into the per-turn task message — doing so
+        # duplicated the same ~400-500 tokens of doctrine in every prompt (trace forensic
+        # 620d38fa, ~11-14% of early-turn tokens = PURE duplication), and d263 retired the
+        # pinned-head copy that re-injected it every turn. The per-turn task therefore carries
+        # ONLY the node task plus the per-RUN operational bits the shared doctrine cannot hold:
+        # the CONCRETE fetch CAP (the bundle doctrine shows the literal ``{fetch_cap}``
+        # placeholder, since the bundle text is shared and run-agnostic), and the article-note
+        # clause when note emission is enabled (N2 — a separate operational instruction).
         base_user = self._compose_task(inputs, None)
+        # SB-RR (d293): the operational suffix is ROLE-NEUTRAL + TASK-DRIVEN — the SAME unified
+        # worker loop now serves gather / research-follow-up / trivial nodes, so it must not
+        # force a 'research' load. A node whose SPEC/task is to GATHER reads the 'to gather …'
+        # clause and self-selects research; a follow-up self-selects research_read; a trivial
+        # node reads 'if your task needs no tool, just write your answer' and answers in one
+        # turn. You start with no domain tools until you self-select them.
+        operational = (
+            "Self-select the bundle(s) your task needs via get_bundles before using their "
+            "tools — you start with no domain tools until you load them. To GATHER evidence "
+            "from the live web, FIRST call get_bundles(name=\"research\") for your search/fetch "
+            "tools, then search, read the real sources, and write your FINDINGS; call "
+            "get_bundles(name=\"research_read\") to read a fetched source or notes you saved "
+            "earlier this session. If your task needs no tool, just write your answer directly. "
+            f"When gathering you may web_fetch up to {fetch_cap} of the source URLs you find "
+            "this round."
+        )
+        if self._emit_article_notes:
+            operational += _RESEARCH_NOTE_CLAUSE
         convo: list[dict[str, Any]] = [{
             "role": "user",
-            "content": base_user + "\n\n" + instruction,
+            "content": base_user + "\n\n" + operational,
         }]
         fetched: list[dict[str, str]] = []
         notes: list[dict[str, Any]] = []  # per-article CONTROL notes (N2; additive)
+        # SoC ENGINE-THIN (SA-4/d254): a NON-WEB gather node's generic source-like artifacts
+        # (one per self-selected loaded-tool call), shaped by :meth:`_gather_record`. Mirrors
+        # ``fetched`` for a different source; harvested into the writer's chain_sources by
+        # :func:`collect_fetched_sources_full`. Empty on the web path (byte-identical).
+        records: list[dict[str, str]] = []
         seen_urls: set[str] = set()
+        # s15/a25 LEVER 3 (d186): the REAL URLs web_search surfaced this node — the grounding
+        # set a web_fetch url is validated against. The small model fabricates plausible-but-dead
+        # URLs instead of copying a real one; an un-offered fetch returns a role:tool error so the
+        # model RE-GROUNDS (robust tool feedback, not a hard seatbelt).
+        offered_urls: set[str] = set()
         searches = fetches = unproductive = 0
         gather_more = 0  # N5: how many times we forced a 0-fetch stage to gather (bounded)
+        # s15/a27 — NOTE-GATE state: how many times we forced a fetched-but-un-noted source to be
+        # noted before accepting findings, bounded by note_gate_max (~fetch_cap so every read
+        # source can be reached), and the salvaged findings the model already wrote (used if a
+        # gate-driven model never re-emits them, so the gate never DISCARDS real findings).
+        note_gate = 0
+        note_gate_max = max(2, fetch_cap) if self._emit_article_notes else 0
+        pending_findings = ""
         findings = ""
 
         # The turn ceiling rises proportionally with the fetch cap so a high-breadth
@@ -1361,9 +2105,11 @@ class SubAgent:
         # note turns do not starve the fetch budget — still a NON-FLOW ceiling, and OFF
         # (note_budget=0) it is the exact N1 formula.
         note_budget = fetch_cap if self._emit_article_notes else 0
+        # +2 SELF-SELECT headroom (d242): the node spends a turn (or two) loading its
+        # bundle(s) before it gathers, so the ceiling must not clip the gather budget.
         max_turns = max(
             RESEARCH_MAX_TURNS, fetch_cap + RESEARCH_SEARCH_HEADROOM + note_budget
-        )
+        ) + 2
 
         tracer = get_tracer("agent_runtime.research")
         with tracer.start_as_current_span("research.react") as span:
@@ -1371,25 +2117,69 @@ class SubAgent:
             span.set_attribute("research.fetch_cap", fetch_cap)
             span.set_attribute("research.max_turns", max_turns)
             for turn in range(max_turns):
+                # d242 TRUE self-select: offer get_bundles + finish + the tools of every
+                # bundle loaded so far; recompute each turn so a freshly-loaded bundle's
+                # tools become callable next turn. Before any load it is only get_bundles +
+                # finish — no gather tool is pre-mounted.
+                opts["tools"] = self._offered_tool_specs()
+                accepted = self._offered_tool_names()
                 raw, tool_calls = await self._research_emit(system, convo, opts)
                 # s13: prefer the NATIVE tool call (it rides its own channel, so leading
                 # prose can never swallow it); fall back to the balanced-brace string parser
-                # for a non-native reply. NEITHER → the model wrote its FINDINGS as prose.
-                call = first_native_call(tool_calls, accepted) or self._parse_research_call(raw)
+                # for a non-native reply (the research parser for gather calls, then the
+                # generic lightweight parser for get_bundles/finish). NEITHER → the model
+                # wrote its FINDINGS as prose.
+                call = (first_native_call(tool_calls, accepted)
+                        or self._parse_research_call(raw)
+                        or self._parse_lightweight_call(raw, accepted))
                 convo.append({"role": "assistant", "content": raw or (
                     json.dumps({"tool": call[0], "args": call[1]}) if call else "")})
+                # SELF-SELECT turn: a get_bundles call LOADS a bundle (its tools appear next
+                # turn); it is not a gather action, so handle + continue. Fed role:'user' so
+                # the live model grounds on the 'tools now available' ack (d199).
+                if call is not None and call[0] == "get_bundles":
+                    obs = await self._handle_self_select(call[0], call[1])
+                    span.set_attribute(f"research.turn.{turn + 1}.tool", "get_bundles")
+                    convo.append({"role": "user", "content": obs or ""})
+                    continue
+                # A finish call is the model signalling done → fold into the 'no tool call'
+                # path so the findings-acceptance logic runs (research output is RAW prose).
+                if call is not None and call[0] == "finish":
+                    call = None
+                # TRUE self-select guard (d242): a gather tool the node has NOT yet loaded is
+                # not callable — the string parser can name one before its bundle is loaded,
+                # so nudge the model to self-select first instead of dispatching it.
+                if call is not None and call[0] not in accepted:
+                    span.set_attribute(f"research.turn.{turn + 1}.tool", "unloaded")
+                    convo.append({"role": "user", "content": (
+                        f"You have not loaded the tool '{call[0]}' yet. Self-select its bundle "
+                        "first via get_bundles (e.g. get_bundles(name=\"research\") for "
+                        "web search/fetch tools), then use it.")})
+                    continue
                 if call is None:
                     # No tool call → the model wrote its FINDINGS (RAW prose) = done.
                     findings = _strip_synth_fence(raw or "").strip()
                     if findings:
-                        # N5 no-fab GATHER-MORE: substantive findings with ZERO real
-                        # fetches = answered FROM MEMORY (E4B does this on the bare ReAct
-                        # path) — a no-fabrication FAILURE. Force the stage to actually
-                        # search+read a real source before accepting, bounded so an
-                        # unfetchable topic cannot loop forever. Default OFF (verify_lane
-                        # False) → this block is skipped, the branch is byte-identical.
+                        # NO-FAB GATHER-MORE: substantive findings with ZERO real fetches =
+                        # answered FROM MEMORY (E4B does this on the bare ReAct path) — a
+                        # no-fabrication FAILURE. Force the stage to actually search+read a real
+                        # source before accepting, bounded so an unfetchable topic cannot loop
+                        # forever. RP-3c (d330): DE-FLAGGED — this is a no-fab research GROUNDING
+                        # ORCHESTRATION (it forces a real fetch; it never edits the model's
+                        # bytes), the SAME KEEP-class as the re-emission guard (RP-2 ruling). It
+                        # no longer hangs off a ``verify_lane`` boolean; the served-route→always-
+                        # on expansion is the correct flag-free end-state (d65: flag-off gating
+                        # was BUILD SCAFFOLDING). It stays narrowly signal-gated on OUTPUT-AGNOSTIC
+                        # conditions only, so a legitimate non-gathering worker is never touched.
                         if (
-                            self._verify_lane
+                            # SB-RR (d293): the no-fab GATHER-MORE gate fires ONLY for a node
+                            # that actually self-selected the GATHER bundle. The unified worker
+                            # loop also serves trivial/follow-up workers that legitimately
+                            # answer WITHOUT fetching — they must NEVER be force-gathered. Gating
+                            # on the SELF-SELECTED ``research`` bundle (not a role) is what makes
+                            # "answered from memory with zero fetches" a failure only when the
+                            # node was supposed to gather.
+                            BUNDLE_RESEARCH in self._loaded_bundles
                             and gather_more < _RESEARCH_GATHER_MORE_MAX
                             and research_answered_from_memory(findings, fetches)
                         ):
@@ -1403,6 +2193,34 @@ class SubAgent:
                                 "content": _RESEARCH_GATHER_MORE.format(fetch_cap=fetch_cap),
                             })
                             continue
+                        # s15/a27 NOTE GATE: a structured note must LAND for (nearly) every
+                        # fetched source before the findings are accepted (the d199 follow-on:
+                        # the role/chain fix made noting POSSIBLE; this makes it HAPPEN). A note
+                        # carries source_id = its 1-based position in ``fetched``; any fetched
+                        # source whose position has no note yet is un-noted. Force the FIRST such
+                        # source to be noted (naming it explicitly), bounded by note_gate_max.
+                        # Salvage the findings the model wrote so a re-prompted model that keeps
+                        # noting never loses them. OFF (note_gate_max == 0) → skipped entirely.
+                        if note_gate < note_gate_max:
+                            noted_ids = {int(n.get("source_id") or 0) for n in notes}
+                            missing = [
+                                (i, f) for i, f in enumerate(fetched, start=1)
+                                if i not in noted_ids
+                            ]
+                            if missing:
+                                note_gate += 1
+                                pending_findings = findings  # salvage; never discard real findings
+                                findings = ""
+                                _, src = missing[0]
+                                span.set_attribute(
+                                    f"research.turn.{turn + 1}", "note_gate"
+                                )
+                                convo.append({"role": "user", "content": _RESEARCH_NOTE_GATE.format(
+                                    title=src.get("title") or src.get("url") or "the source",
+                                    url=src.get("url") or "",
+                                    remaining=len(missing),
+                                )})
+                                continue
                         span.set_attribute(f"research.turn.{turn + 1}", "findings")
                         break
                     unproductive += 1
@@ -1417,31 +2235,97 @@ class SubAgent:
                     # NOT touch the fetch/search budget (it is not a gather call).
                     obs = self._record_article_note(args, fetched, notes)
                     span.set_attribute(f"research.turn.{turn + 1}.tool", "note")
+                    # s15/a25 (d199, SUPERSEDES a18/d189 for this model): the note ack carries
+                    # the open follow-ups the model must ACT on (steer the next search). Live
+                    # Gemma (:11434) uses a '{{ .Prompt }}' chat template with NO role handling,
+                    # so role:'tool' content is IGNORED — fed as 'tool' the model never reads the
+                    # ack and fabricates. Feed it role:'user' so the model actually grounds on it.
                     convo.append({"role": "user", "content": obs})
                     continue
-                if tool == self._fetch_tool and fetches >= fetch_cap:
-                    convo.append({"role": "user", "content": (
-                        f"Fetch limit ({fetch_cap}) reached. Write your FINDINGS now "
-                        "from the sources you have read."
-                    )})
+                # SoC ENGINE-THIN (SA-4/d254 — the Tier-2 gap fix): a self-selected gather tool
+                # that is NOT the configured web search/fetch/note is a NON-WEB bundle's tool
+                # (codebase / vector-db / bash / future). The engine does NOT hardcode its
+                # semantics or mis-dispatch it as a web_fetch — it FALLS THROUGH to the GENERIC
+                # by-name on-load hook dispatch (:meth:`_invoke_loaded_tool`), captures a generic
+                # source-like RECORD so a downstream reader/writer pulls it via the SAME
+                # chain_sources harvest web ``fetched`` uses, feeds the observation back, and
+                # continues. The web search/fetch branch below is UNREACHED for a non-web tool,
+                # so it stays byte-identical (contrastive gate, SA-4 (a)).
+                if tool not in (self._search_tool, self._fetch_tool, self._note_tool):
+                    obs, value = await self._invoke_loaded_tool(tool, args)
+                    if value is not None:
+                        records.append(self._gather_record(tool, args, value))
+                    span.set_attribute(f"research.turn.{turn + 1}.tool", tool)
+                    # role:'user' for the observation (d199 — this prompt-only model grounds
+                    # only on user turns), mirroring the web search/fetch observation feed.
+                    convo.append({"role": "user", "content": obs})
                     continue
-                obs = await self._dispatch_research_tool(tool, args, fetched, seen_urls)
+                if tool == self._fetch_tool:
+                    # s15/a25 grounding guard (d186; d199-consistent): VALIDATE the chosen url is
+                    # one web_search actually offered. The small model invents plausible-but-dead
+                    # URLs (live: every fetch failed, 0 sources); when it targets a url NOT in
+                    # ``offered_urls`` (and the node HAS been offered some), return an ERROR
+                    # observation listing the real candidates so it RE-GROUNDS and retries — robust
+                    # feedback, NOT a hard seatbelt, and it does NOT burn the fetch cap (a fabricated
+                    # attempt never reached the network). Fed role:'user' per d199 (this model only
+                    # grounds on user turns; a role:'tool' correction would be ignored). Bounded by
+                    # ``max_turns``. The LOAD-BEARING grounding lever is role:'user'-for-observations
+                    # below; this guard is defense-in-depth on top.
+                    want = str(args.get("url") or args.get("link") or "").strip()
+                    if offered_urls and want and not _url_offered(want, offered_urls):
+                        span.set_attribute(
+                            f"research.turn.{turn + 1}.tool", "fetch_ungrounded"
+                        )
+                        cand = "\n".join(f"- {u}" for u in list(offered_urls)[:8])
+                        convo.append({"role": "user", "content": (
+                            f"<{want}> was NOT in the search results — do not invent or guess a "
+                            "URL. web_fetch ONLY a url COPIED VERBATIM from the search results. "
+                            f"Choose one of:\n{cand}"
+                        )})
+                        continue
+                    if fetches >= fetch_cap:
+                        convo.append({"role": "user", "content": (
+                            f"Fetch limit ({fetch_cap}) reached. Write your FINDINGS now "
+                            "from the sources you have read."
+                        )})
+                        continue
+                obs = await self._dispatch_research_tool(
+                    tool, args, fetched, seen_urls, offered_urls
+                )
                 if tool == self._search_tool:
                     searches += 1
                 else:
                     fetches += 1
                 span.set_attribute(f"research.turn.{turn + 1}.tool", tool)
+                # s15/a25 (d199, SUPERSEDES a18/d189 for this model — the LOAD-BEARING fix): the
+                # web_search RESULTS (the URLs to choose from) and the web_fetch BODY are
+                # observations the model must GROUND on — pick a real url, then read the article.
+                # Live Gemma (:11434) uses a '{{ .Prompt }}' chat template with NO role handling,
+                # so role:'tool' content is IGNORED: fed as 'tool' the model never reads the offered
+                # URLs and FABRICATES the fetch url (the exact FAIL_2 — 0 sources/notes). Feed the
+                # result back role:'user' so the model actually sees and grounds on it. a18 moved
+                # this to role:'tool' to stop a runaway loop, but that runaway was the WRITE loop
+                # echoing its OWN output, NOT this research observation (d199).
                 convo.append({"role": "user", "content": obs})
 
             # Fallback: the model never wrote findings (kept calling tools / stalled) →
-            # salvage ONE final emission grounded in whatever it has read.
+            # salvage ONE final emission grounded in whatever it has read. s15/a27: if the NOTE
+            # GATE held findings the model already wrote (it spent its remaining turns recording
+            # notes), reuse them verbatim instead of forcing another generation — the gate must
+            # never cost the model its real findings.
+            if not findings and pending_findings:
+                findings = pending_findings
             if not findings:
                 convo.append({"role": "user", "content": _RESEARCH_FINALIZE})
                 final_raw, _ = await self._research_emit(system, convo, opts)
                 findings = _strip_synth_fence(final_raw or "").strip()
             span.set_attribute("research.searches", searches)
             span.set_attribute("research.fetches", fetches)
-            span.set_attribute("research.sources", len(fetched))
+            # SA-4 (the as3 lesson): SOURCES counts BOTH web fetched AND non-web records, so a
+            # non-web gather's leaf-capture is visible in the trace (fetches==0 with records>0
+            # is a real gather, not a regression); ``research.records`` is the distinct count.
+            span.set_attribute("research.sources", len(fetched) + len(records))
+            span.set_attribute("research.records", len(records))
             span.set_attribute("research.notes", len(notes))
             span.set_attribute("research.gather_more", gather_more)  # N5 no-fab forces
             span.set_attribute("research.chars", len(findings))
@@ -1453,16 +2337,29 @@ class SubAgent:
         # research node (N4) and weights provenance (N5). No notes (default OFF, or the
         # model emitted none) → no ``article_notes`` key → byte-identical to before.
         tool_value: Any = None
-        if fetched:
-            tool_value = {"fetched": fetched, "fetched_count": len(fetched)}
-            if notes:
-                tool_value["article_notes"] = notes
+        if fetched or records:
+            tv: dict[str, Any] = {}
+            if fetched:
+                tv["fetched"] = fetched
+                tv["fetched_count"] = len(fetched)
+                if notes:
+                    tv["article_notes"] = notes
+            # GENERIC records-emission (SA-4/d254): a non-web gather attaches its artifacts
+            # under the source-agnostic ``records`` key (mirrors web ``fetched``) so the
+            # writer's chain_sources harvest pulls them the SAME way. When only ``fetched`` is
+            # present (the web path) ``tv`` is byte-identical to the prior dict (no records key).
+            if records:
+                tv["records"] = records
+            tool_value = tv
         result = SubAgentResult(
             node_id=self.node.id,
             spec=self.node.primary_spec,
             specs=self.spec_names,
             output=findings,
-            tool_used=self._search_tool,
+            # SB-RR (d293): only report the search tool as used when the worker ACTUALLY
+            # gathered (fetched/recorded a source). A trivial/follow-up worker that selected no
+            # gather bundle reports the node's own tool (``None``), not a phantom search.
+            tool_used=self._search_tool if (fetched or records) else self.node.tool,
             tool_value=tool_value,
             role=self.node.role,
         )
@@ -1502,12 +2399,34 @@ class SubAgent:
         turn, with the shaping framing + ruleset (+ role) below it."""
         role = self.node.role
         framing = role_framing(role) if role else None
+        # NODE-SELF-SELECT (d221): advertise the bundle catalog in every ROLE-carrying
+        # node's system prompt (the in-plan agent roles: researcher/worker/reviewer +
+        # the terminal synthesizer) so the model can REASON about which capability
+        # bundle(s) its task needs and LOAD them at runtime with get_bundles (the planner
+        # sets only role + spec; the node selects its own tools). A role-less plain
+        # producer step is not an agent that self-selects tools, so it is left untouched
+        # (back-compat). Appended LAST so it sits closest to the task.
+        catalog = self._bundle_catalog_advert() if role else ""
         if not self.spec_body:
             # bare step (identity only) or bare-role call (identity + framing).
-            return with_identity(framing)
+            body = "\n\n".join(p for p in (framing, catalog) if p) or None
+            return with_identity(body)
         base = f"{_SHAPING_FRAMING}\n\n{self.spec_body}"
         shaping = f"{base}\n\n{framing}" if framing else base
+        if catalog:
+            shaping = f"{shaping}\n\n{catalog}"
         return with_identity(shaping)
+
+    def _bundle_catalog_advert(self) -> str:
+        """The 'List of bundles:' advertisement embedded in every node prompt (d221).
+
+        Delegates to :func:`agent_runtime.bundles.bundles_catalog_text` (single source
+        of truth) so the catalog the model reasons over stays in lockstep with the
+        registered bundles. Never raises — a catalog failure degrades to no advert."""
+        try:
+            return bundles_catalog_text().strip()
+        except Exception:  # noqa: BLE001 - the advert must never break a node
+            return ""
 
     async def run(self, inputs: Optional[Mapping[str, Any]] = None) -> "SubAgentResult":
         """Execute the node: optional tool call, then a scoped phi call.
@@ -1516,32 +2435,57 @@ class SubAgent:
         validator rejects raises :class:`InvalidStepError` (both self-heal
         classes). A transport-level error propagates unchanged."""
         inputs = inputs or {}
-        # ROUTE-INDEPENDENCE (d50): a terminal FILE-DELIVERY node (tool=file_write/
-        # write_file) is a TRUE AGENT — it authors the deliverable via the SAME raw-
-        # content read-back loop the synthesizer uses (:meth:`_run_raw_file_loop`),
-        # NOT a single deterministic content-dump or a schema-serialized content arg.
-        # So file output is reliable on the acyclic web_search->file_write TOOL path
-        # exactly as it is for the deep-research synthesizer node — content stays
-        # RAW on every route (d50/d49). A SYNTHESIZER node owns its own file loop
-        # (dispatched below); a no-hook/offline caller falls through to the legacy
-        # path.
+        # SB-6 (a)/d299/d301 — the served REPORT WRITE node is now TOOL-LESS (the engine no longer
+        # stamps tool=file_write / role=None; ``_normalize_write_dag`` retired its structure
+        # authoring). Route it to the EXISTING served writer (:meth:`_run_file_delivery` ->
+        # :meth:`_run_raw_file_loop`, which SELF-SELECTS 'file'+'research_read') by DELIVERY-CONTEXT
+        # DATA: the runtime's ``deliverable_path`` (set ONLY on the write runtime). This is the
+        # WRITE-PHASE-EXCLUSIVE signal — NOT ``chain_sources``, which a follow-up READER also
+        # carries to resolve prior sources (routing on chain_sources alone was OVER-BROAD: it forced
+        # a non-writer follow-up worker to write a file — d301, caught by
+        # test_bundle_self_select_d221). It is structural DATA (this runtime is delivering one file)
+        # plus the review/synthesizer carve-outs — NOT a spec-name/role-name/tool-name conditional,
+        # so it passes the d293 anti-fabrication grep gate. The write METHODOLOGY rides the
+        # ``section-html-writer`` SPEC BODY (read via ``_compose_system``) + the FILE bundle doctrine
+        # (surfaced on self-select) — never an engine stamp; the planner authors the section topology
+        # + chain by reasoning (d10/d246). Soundness rests on the ALL-WRITERS INVARIANT: only writers
+        # run in a runtime with deliverable_path set (research/gather/follow-up run in a SEPARATE
+        # runtime with no deliverable_path → they fall through to the unified loop below).
+        if (
+            self.hook is not None
+            and self.node.role != ROLE_SYNTHESIZER
+            and self._deliverable_path
+        ):
+            return await self._run_file_delivery(inputs)
+        # ROUTE-INDEPENDENCE (d50): the legacy acyclic ``web_search``->``file_write`` terminal
+        # node (an EXPLICIT planner/user-authored file tool, NO chain_sources) authors the
+        # deliverable via the SAME raw-content read-back loop the synthesizer uses
+        # (:meth:`_run_raw_file_loop`).
         if (
             self.hook is not None
             and self.node.role != ROLE_SYNTHESIZER
             and (self.node.tool or "") in ("file_write", "write_file")
         ):
             return await self._run_file_delivery(inputs)
-        # AGENTIC RESEARCH (s9/c5, d49/d50): a ``web_search`` node is a TRUE AGENT. It
-        # DECIDES to search and which sources to read via lightweight tool calls — the
-        # deterministic search-then-read EXECUTOR (flags #1/#3: ``read_search_max_fetch``
-        # > 0 forcing ``_read_search_results`` auto-fetch) is RETIRED in favour of the
-        # ReAct loop (:meth:`_run_research_loop`). ``read_search_max_fetch`` survives
-        # only as a NON-FLOW fetch CAP inside that loop, not a flow gate. (Flag #2, the
-        # role-research gate, was already retired with the research role in B2/d48.)
+        # UNIFIED WORKER LOOP (d273/d292/d293 — SB-RR retires ROLE_RESEARCHER): every spawned
+        # node is a WORKER (d273); gather is a SELF-SELECTED specialization, never a role. A
+        # WORKER that did not bind a terminal tool (the common case: gather nodes, research
+        # follow-ups, and plain producers are all tool-less) enters ONE self-select loop
+        # (:meth:`_run_research_loop`) and the SELF-SELECTED BUNDLE drives behavior — load
+        # ``research`` to GATHER (search/fetch/note), ``research_read`` to read prior sources,
+        # or select NO actionable bundle to just answer in a single emission (the old
+        # trivial/linear/bare-producer path folds in here). There is NO role gate: a node is
+        # not branched on its worker-ness (d273), and the retired ROLE_RESEARCHER /
+        # ROLE_WORKER-routing / role=None producer branches are all collapsed into this one
+        # loop. The gather-specific gates inside the loop key on the SELF-SELECTED research
+        # bundle, not a role. A legacy explicit ``web_search`` node folds in (tool ==
+        # search_tool). Offline (no hook) callers and explicit non-search single-tool nodes fall
+        # through to the bounded produce path below. (Terminal SYNTHESIZER delivery (d215) is
+        # the ONLY structural role dispatch that survives — handled above/below.)
         if (
             self.hook is not None
             and self.node.role != ROLE_SYNTHESIZER
-            and self.node.tool == self._search_tool
+            and (self.node.tool == self._search_tool or not self.node.tool)
         ):
             return await self._run_research_loop(inputs)
         tool_value: Any = None
@@ -1561,8 +2505,14 @@ class SubAgent:
                 # legacy emitter accepting only ``node`` still works (the runtime's
                 # own SchemaToolArgEmitter accepts the kwargs).
                 try:
+                    # The run's overall USER GOAL rides along (live catch: a node task
+                    # that drops a user-stated detail — a time, a recipient — otherwise
+                    # leaves the arg model anchoring on a schema example).
                     emitted = self._tool_arg_emitter(
-                        self.node, inputs=inputs, tool_values=self._upstream_tool_values
+                        self.node,
+                        inputs=inputs,
+                        tool_values=self._upstream_tool_values,
+                        goal=self._overall_goal,
                     )
                 except TypeError:
                     emitted = self._tool_arg_emitter(self.node)
@@ -1618,10 +2568,16 @@ class SubAgent:
                 parsed=parsed,
             )
         else:
-            # WORKER (d48) or a bare (role=None) producer step: the role-execution
-            # SWITCH (flag #5) is retired — a worker emits RAW free-text (no per-role
-            # output schema, no enum-verdict path; d50.1 content is RAW). Its behavior
-            # comes from its SPEC(s) + the task framing + reasoning, NOT a code switch.
+            # PRODUCE fall-through. After SB-RR (d293) every HOOKED, tool-less WORKER — gather,
+            # research follow-up, or trivial producer — is routed to the unified worker loop
+            # ABOVE (self-select decides its behavior), so this path is NOT a role=None /
+            # ROLE_WORKER routing branch. It is reached ONLY by (a) an OFFLINE node (no hook —
+            # it has no tool surface to self-select, so it stays a single bounded chain call,
+            # back-compat) or (b) an explicit non-search single-tool node that already invoked
+            # its one tool above and now produces prose from that ``tool_value``. The
+            # role-execution SWITCH (flag #5) stays retired — it emits RAW free-text (no per-role
+            # output schema, no enum-verdict path; d50.1 content is RAW); behavior comes from its
+            # SPEC(s) + task framing + reasoning, NOT a code switch.
             chain = Chain()
             chain.use(prompt_assembly())
             chain.use(call_stage(self.transport, **self._call_opts))
@@ -1673,6 +2629,11 @@ class SubAgent:
         as a ``file_write`` result so the chat artifact name is correct (parity with
         the synthesis role surfacing). The result-validator gate runs as in
         :meth:`run`."""
+        # NODE-SELF-SELECT (d242 — TRUE self-select): a file-delivery writer SELF-SELECTS its
+        # AUTHORING capability ('file') + read-a-source ('research_read') in the raw loop's
+        # self-select front (no prime, no role->bundle table) so its doctrine arrives by LOAD
+        # (in the load observation). The raw write phase then emits content (the loop drives
+        # the file tools).
         system = self._compose_system()
         user = self._compose_task(inputs, None)
         # c12 #5: carry the REAL fetched source URLs into the deliverable's citations on
@@ -1707,6 +2668,206 @@ class SubAgent:
                 )
         return result
 
+
+    # ------------------------------------------------------------------ #
+    # Pass-D (d216) — the TOOL-CALLING WRITE WORKER (the core ruling).
+    # The served write worker is a TRUE READER: it PULLS the verbatim text of
+    # the sources it needs with load_source (research_read bundle) and AUTHORS its
+    # section to the deliverable with file_write (file bundle), running the SAME
+    # proven ReAct loop the anchored reviewer uses — native tool call + balanced-
+    # brace string fallback, observations fed back as role:'tool'. This RETIRES the
+    # _inject_section_notes PUSH (a bounded push is still the verbatim dump the user
+    # rejected, d216): the writer reads its own grounding ON DEMAND instead of being
+    # handed it. Strong load_source/file tool descriptions + the TOP-N chunk return
+    # (source_tools) are the substance lever that keeps a raw-can't-pull small model
+    # from going thin — it pulls ENOUGH to be substantive.
+    # ------------------------------------------------------------------ #
+    _TOOL_WRITER_MAX_TURNS = 8
+    # The tail one file_read hands the writer so it can continue from what it has
+    # written without ever being fed the whole accumulating document.
+    _TOOL_WRITER_READ_TAIL = 1500
+
+    def _tool_calling_writer_tool_specs(self) -> list[dict[str, Any]]:
+        """NOTE (d242/d244): NOT wired anymore — under TRUE self-select the writer's tools are
+        offered only after it loads 'file'+'research_read', and d244 removed the per-role
+        curation entirely (``_offered_tool_specs()`` with NO ``only=`` subset, file_update
+        included). Retained only as the reference for the writer's phase-tuned tool
+        descriptions.
+
+        The write worker's native tool surface (d216): PULL a source's verbatim text +
+        APPEND the authored section to the deliverable + READ BACK the tail.
+
+        ``file_write`` here APPENDS one section per call (the runtime forces append onto the
+        single deliverable path); the writer composes the document section by section, READING
+        its grounding on the cost hierarchy first — ``read_notes`` (cheap gist) to see which
+        source has what, then ``load_source`` (expensive verbatim) for the exact figures it
+        cites. No ``file_update`` (that is the reviewer's surgical tool) — the writer only adds
+        content."""
+        return [
+            make_tool_spec(
+                "read_notes",
+                "CHEAP — use FIRST. Read the article-note gist of the fetched sources (each "
+                "[S#] source's summary, key_claims and gaps) to plan the section and see WHICH "
+                "source has the figures you need, WITHOUT pulling verbatim text. read_notes() "
+                "for all, or read_notes(sid='S3') for one. THEN load_source the [S#] you cite.",
+                {"sid": {"type": "string"}},
+                [],
+            ),
+            make_tool_spec(
+                "load_source",
+                "EXPENSIVE — use read_notes first. PULL the verbatim text of one fetched source "
+                "so you cite the REAL figure/quote, not memory. Pass sid='S3' to get its opening "
+                "AND next section (the cited passage with surrounding verbatim text), or "
+                "chunk='S3.c2' for one section. Returns the verbatim excerpt + its url; "
+                "'more':true means more is available by chunk id. Load a section's cited sources "
+                "before writing the figures; cite only [S#] in the INDEX.",
+                {"sid": {"type": "string"}, "chunk": {"type": "string"}},
+                ["sid"],
+            ),
+            make_tool_spec(
+                "file_write",
+                "Append the next section you have written to the deliverable. Pass 'content' = "
+                "that section's finished body (markdown or HTML as the task asks), grounded in "
+                "the sources you loaded and citing their [S#]. Write ONE section per call, then "
+                "call file_write again for the next section. Do NOT re-emit earlier sections.",
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                ["content"],
+            ),
+            make_tool_spec(
+                "file_read",
+                "Read the END (tail) of the deliverable so far to see what you have already "
+                "written and continue from it — never the whole file.",
+                {"path": {"type": "string"}, "tail": {"type": "integer"}},
+                ["path"],
+            ),
+        ]
+
+    async def _dispatch_writer_tool(
+        self, tool: str, args: Mapping[str, Any], path: str
+    ) -> str:
+        """Execute ONE write-worker tool call against the deliverable → an observation string.
+
+        The target ``path`` is FORCED to the single deliverable (the writer cannot aim a write
+        at another file). ``file_write`` APPENDS when the file already has content and CREATES it
+        on the first write (size probe), so sequential section nodes accumulate into one file. A
+        ``file_read`` is clamped to the tail. A failed call returns a corrective note, never
+        raises — a write turn must not crash the node into self-heal."""
+        a = dict(args)
+        if tool == "read_notes":
+            try:
+                res = await self.hook.invoke("read_notes", sid=a.get("sid"))
+            except Exception as exc:  # noqa: BLE001 - note read is non-fatal
+                return f"read_notes failed: {exc}."
+            if not getattr(res, "ok", False):
+                return f"read_notes unavailable: {getattr(res, 'error', '')}."
+            return f"NOTES: {res.value}"
+        if tool == "load_source":
+            sid = str(a.get("sid") or "")
+            if not sid:
+                return "load_source needs a [S#] sid from the SOURCE INDEX."
+            try:
+                res = await self.hook.invoke("load_source", sid=sid, chunk=a.get("chunk"))
+            except Exception as exc:  # noqa: BLE001 - load failure is non-fatal
+                return f"load_source failed: {exc}."
+            if not getattr(res, "ok", False):
+                return f"load_source unavailable: {getattr(res, 'error', '')}."
+            return f"SOURCE {sid}: {res.value}"
+        if tool == "file_write":
+            content = str(a.get("content") or a.get("text") or "")
+            if not content.strip():
+                return ("file_write needs non-empty 'content' — the finished section body. "
+                        "Load the sources you need, write the section, then file_write it.")
+            # d218 — coherence is the WRITER's DOCTRINE + the REVIEWER's reasoning, NOT
+            # deterministic surgery on the model's HTML (the retired d196 regex-assembly
+            # babysitting). The writer's doctrine (its tool/system prompt) instructs it to
+            # append ONLY a section FRAGMENT — never the page wrapper or a </body>/</html>
+            # close (the document stays open until done) — so there is no premature close to
+            # strip here; if one slips through, the plan's last-step REVIEWER reads the
+            # assembled HTML and fixes the fold by reasoning (no code edits the model's bytes).
+            size = 0
+            try:
+                rb0 = await self.hook.invoke("file_read", path=path, length=0)
+                if getattr(rb0, "ok", False) and isinstance(rb0.value, Mapping):
+                    size = int(rb0.value.get("size") or 0)
+            except Exception:  # noqa: BLE001 - size probe is best-effort
+                size = 0
+            append = size > 0
+            try:
+                res = await self.hook.invoke(
+                    "file_write", path=path, content=(("\n\n" + content) if append else content),
+                    append=append, overwrite=not append,
+                )
+            except Exception as exc:  # noqa: BLE001 - a write error is a retry signal, not a crash
+                return f"file_write failed: {exc}. Try again with the section content."
+            if not getattr(res, "ok", False):
+                return f"file_write failed: {getattr(res, 'error', '')}."
+            return (f"SECTION WRITTEN ({len(content)} chars appended). Continue with the next "
+                    "section (load its sources first), or reply DONE if the document is complete.")
+        if tool == "file_read":
+            try:
+                tail = int(a.get("tail")) if a.get("tail") not in (None, "") else self._TOOL_WRITER_READ_TAIL
+            except (TypeError, ValueError):
+                tail = self._TOOL_WRITER_READ_TAIL
+            try:
+                res = await self.hook.invoke(
+                    "file_read", path=path, tail=max(1, min(tail, self._TOOL_WRITER_READ_TAIL)),
+                )
+            except Exception as exc:  # noqa: BLE001 - a read error is non-fatal
+                return f"file_read failed: {exc}."
+            if not getattr(res, "ok", False):
+                return f"file_read failed: {getattr(res, 'error', '')}."
+            v = res.value if isinstance(res.value, Mapping) else {}
+            return f"FILE TAIL (last {v.get('bytes')} of {v.get('size')} chars):\n{v.get('text')}"
+        # d244 — FULL unrestricted self-select: the per-role writer_tools allow-list is GONE,
+        # so the writer may now call ANY tool it self-selects (file_update included). A tool
+        # this loop does not specially handle above is dispatched GENERICALLY through the
+        # on_load hook (:meth:`_dispatch_loaded_tool`, keyed on the TOOL — never a curated
+        # subset), so a writer calling file_update FIRES through the hook and WORKS instead of
+        # an 'unknown tool' no-op or a wrong-loop re-entry. A file_* write/edit is still FORCED
+        # to the single deliverable ``path`` (the single-deliverable invariant, applied
+        # uniformly to every loop, NOT a per-role restriction).
+        if tool.startswith("file_"):
+            a["path"] = path
+        return await self._dispatch_loaded_tool(tool, a)
+
+    def _parse_writer_call(self, raw: str) -> Optional[tuple[str, dict[str, Any]]]:
+        """Recover a lightweight ``(tool, args)`` WRITE call from a turn, or None.
+
+        The balanced-brace STRING fallback paired with :func:`first_native_call` for the
+        writer tools ``load_source`` / ``file_write`` / ``file_read``. A non-call turn
+        (DONE / prose) returns None → the loop ends. d244:
+        ``file_update`` is now recoverable too (the writer may self-select it under full
+        unrestricted self-select), so an E4B string-fallback file_update call also dispatches."""
+        accepted = ("read_notes", "load_source", "file_write", "file_update", "file_read")
+        s = _strip_synth_fence(raw or "").strip()
+        if not s.startswith("{"):
+            return None
+        blob = _first_json_object(s)
+        if not blob:
+            return None
+        try:
+            parsed = json.loads(blob)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+        tool = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
+        args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters")
+        if not (isinstance(tool, str) and tool.strip()):
+            for key, val in parsed.items():
+                if str(key).strip() in accepted:
+                    tool, args = str(key).strip(), val
+                    break
+        name = str(tool).strip() if isinstance(tool, str) else ""
+        if name not in accepted:
+            return None
+        if not isinstance(args, Mapping):
+            args = {
+                k: v for k, v in parsed.items()
+                if k not in ("tool", "name", "tool_name", "args", "arguments", "parameters")
+            }
+        return name, dict(args)
+
     async def _run_synthesis(
         self, system: Optional[str], user: str
     ) -> tuple[Optional[str], Any, Optional[str], int]:
@@ -1719,6 +2880,10 @@ class SubAgent:
         ``(raw_doc, {"output": doc, "written_path": path|None, "converged": bool},
         None, 0)`` so the downstream ``_render_parsed`` rendering is unchanged and
         ``run`` can surface the written path as a ``file_write`` result."""
+        # NODE-SELF-SELECT (d242 — TRUE self-select): the synthesizer SELF-SELECTS 'file'
+        # (author the deliverable) + 'research_read' (carry/cite the sources) in the raw
+        # loop's self-select front (no prime, no role->bundle table) so its doctrine
+        # arrives by LOAD (in the load observation). (The catalog advert already rides ``system``.)
         # PLAN-CHAINING (c1b): a continuation page appends to the file an upstream
         # writer started; otherwise the chosen filename is derived as before.
         out_path = self._chain_continue_path or derive_output_path(
@@ -1795,13 +2960,22 @@ class SubAgent:
             chain = Chain()
             chain.use(prompt_assembly())
             chain.use(call_stage(self.transport, **opts))
-            ctx = Context(system=system, history=list(convo), transport=self.transport)
+            # PER-NODE bounded memory (d263): compact=False — the write loop already windows
+            # its own convo via _bound_chat_convo (the file on disk is the ground truth, re-fed
+            # each turn), so the convo passes through unchanged. The goal rides convo[0] ONCE
+            # and the file/read doctrine rode the get_bundles load observation ONCE (the retired
+            # pinned head + SWA tail no longer re-paste them or re-summarise the file tail).
+            history = self._node_history(
+                convo, system, compact=False,
+                reserve_predict=int(opts.get("num_predict", 0) or 0),
+            )
+            ctx = Context(system=system, history=history, transport=self.transport)
             ctx = await run_blocking_in_span(chain.run, ctx)
             return ctx.raw_output or ""
 
         async def raw_emission() -> str:
             """ONE full schema-less emission (the fallback / no-hook path)."""
-            return _strip_synth_fence(
+            return strip_internal_scaffolding(_strip_synth_fence(
                 await emit(
                     [
                         {
@@ -1816,7 +2990,7 @@ class SubAgent:
                         }
                     ]
                 )
-            )
+            ))
 
         tracer = get_tracer("agent_runtime.synthesis")
         with tracer.start_as_current_span("synthesis.react_file") as span:
@@ -1835,26 +3009,30 @@ class SubAgent:
             span.set_attribute("synthesis.chain_continue", bool(continue_existing))
             span.set_attribute("synthesis.chain_final", bool(is_final))
 
+            # d242 SELF-SELECT FRONT: this raw-emission loop drives the file tools itself
+            # (the model emits content, never tool calls), so the model has no in-loop chance
+            # to self-select. Give it one HERE — load 'file' (+ 'research_read' to cite) so
+            # the file-authoring + read doctrine arrives for the write phase, by LOAD (in the
+            # load observation) not a prime. A model that loads nothing degrades to the object
+            # floor (raw emission
+            # still produces the deliverable).
+            await self._self_select_front(system, suggest=(
+                "You are authoring a deliverable FILE, so you will need the 'file' bundle "
+                "(to write it); if you must quote or cite already-fetched sources, also load "
+                "'research_read'."))
+            span.set_attribute(
+                "synthesis.loaded_bundles", ",".join(sorted(self._loaded_bundles))
+            )
+
             writes = 0
             unproductive = 0
             written_path: Optional[str] = None
             finished = False
             size: Any = 0
             # s13/P2.3 (d130/d132.C): the ROOT-CAUSE structural fix for the
-            # duplicate-tail — the section-write loop builds the document by an
-            # ANCHORED read->targeted-insert->write (each section inserted just before
-            # one unique terminal anchor) instead of a BLIND ``file_write(append=True)``
-            # that concatenates a re-emitted chunk AFTER the closed document. This flag
-            # tracks whether THIS node has done its first physical write yet (the write
-            # that plants the anchor); subsequent writes insert before it.
-            anchor_planted = False
-            # R2 (d79, MS3): the on-disk text ALREADY on the file when THIS node starts
-            # writing. A continuation page appends after it, so this node's OWN section is
-            # ``final_file[len(chain_prefix_text):]`` — the unit the per-section verify
-            # grounds (each section <9000 chars, so it is never bypassed by the whole-doc
-            # _VERIFY_REVISE_MAX_CHARS cap). Empty for a fresh first page (prefix = "").
-            chain_prefix_text = ""
-
+            # RP-1 (d319/d311): the anchored plant/insert write scheme is RETIRED — the
+            # engine appends each authored emission VERBATIM and never modifies the model's
+            # document (the model owns coherence; the write phase ships raw model output).
             # R1 (c1r): the chosen type drives the closing-tag well-formedness gate —
             # but ONLY on the FINAL page (c1b). A non-final page of a multi-page chain
             # must NOT close the document wrapper (more pages follow); the gate is
@@ -1887,8 +3065,11 @@ class SubAgent:
             md_continue_sent = False
             # The closing instruction is only given when this page may finish the
             # document; a non-final chain page is told to leave the wrapper open.
+            # FORMAT-NEUTRAL (d317/d319 flex): named in the format's own terms by the model
+            # (an HTML doc balances its tags; other formats have no wrapper to balance).
             _close_clause = (
-                "close every HTML tag you open." if is_final
+                "close/balance every structural element you open (e.g. every HTML tag)."
+                if is_final
                 else "do NOT close the document wrapper — later parts continue it."
             )
 
@@ -1904,20 +3085,38 @@ class SubAgent:
                     tail0 = str(rb0.value.get("text") or "")
                     size = rb0.value.get("size", size)
                     written_path = out_path
-                # R2 (d79): capture the FULL prior text so this node's own appended
-                # section can be isolated for the per-section grounding verify below.
-                rbp = await self.hook.invoke(
+                # DUPLICATION RCA (live runs 2/4): a continuation node saw ONLY the
+                # 1200-char tail, so it could not know which sections already exist
+                # above the window and re-authored them (duplicate section families /
+                # repeated Sources). Feed it the document's REAL section inventory —
+                # headings read from the actual bytes (d48-clean: read-to-inform,
+                # never edited) — so "do NOT repeat" is decidable by the model.
+                existing_heads: list[str] = []
+                rb_full = await self.hook.invoke(
                     "file_read", path=out_path, max_bytes=4_000_000
                 )
-                if rbp.ok and isinstance(rbp.value, Mapping):
-                    chain_prefix_text = str(rbp.value.get("text") or "")
+                if rb_full.ok and isinstance(rb_full.value, Mapping):
+                    existing_heads = _section_headings(
+                        str(rb_full.value.get("text") or "")
+                    )[:40]
+                heads_block = (
+                    "SECTIONS ALREADY ON THE FILE (do NOT write any of these again):\n- "
+                    + "\n- ".join(h.strip() for h in existing_heads if h.strip())
+                    + "\n"
+                    if existing_heads
+                    else ""
+                )
                 intro = (
                     "\n\n----\nA document is being written ACROSS PARTS; earlier "
-                    "pages/sections are ALREADY on the file. Its current end is:\n-----\n"
+                    "pages/sections are ALREADY on the file.\n"
+                    + heads_block
+                    + "Its current end is:\n-----\n"
                     f"{tail0}\n-----\nWrite the NEXT page/section NOW as RAW content in "
                     "the document's format (real HTML tags / markdown / plain text) — NO "
                     "JSON, no tool call, no preamble. Continue seamlessly from the end "
-                    "shown; do NOT repeat earlier content; " + _close_clause
+                    "shown; do NOT repeat earlier content or re-cover a listed section; "
+                    "if the file already has a sources/references section, NEVER add "
+                    "another; " + _close_clause
                     + " When THIS page/section is fully written, reply with EXACTLY "
                     + DONE_SENTINEL + "."
                 )
@@ -1934,27 +3133,83 @@ class SubAgent:
                     "reply with EXACTLY " + DONE_SENTINEL + " on the next turn."
                 )
             else:
+                # d163/d165 WRITE-PHASE MANDATE (the figures+table prong): the SOURCE INDEX
+                # below carries CONCRETE FIGURES/DATES PUSHED from the real sources — the
+                # writer must USE them verbatim, or the report is hollow/plain (the a15
+                # failure). FORMAT-NEUTRAL (d317/d319 flex): the mandate names the deliverable
+                # format's OWN tabular idiom; the format-specific styling craft (e.g. the
+                # zebra/striped <table> CSS) lives in the writer SPEC (html-writer), never here.
+                _figures_mandate = (
+                    " USE THE CONCRETE FIGURES: the SOURCE INDEX below carries specific "
+                    "numbers, $ amounts, quantity counts and DATED events from the real "
+                    "sources — state them VERBATIM (exact figures and dates), never vague "
+                    "phrasing like 'significant losses'; a detailed report with no concrete "
+                    "figures is INCOMPLETE. Present the key quantitative data in the "
+                    "deliverable format's OWN tabular/structured idiom (one row per data "
+                    "point) with each row's [S#] citation. CITE EACH source you use by its "
+                    "[S#] and draw on a MAJORITY of the provided sources, not just one or two."
+                )
+                # PROMPT-POSITION (live run-8 catch, d186): the FIRST imperative wins on
+                # this model — the document-shell instruction must BE the opening
+                # imperative for a multi-part first writer, not a rider 2000 chars later.
+                _open_imperative = (
+                    "Emit the FIRST section NOW as RAW content in the final format the "
+                    "task asks for (real HTML tags / markdown / plain text)"
+                    if is_final
+                    else
+                    "You are writing the document's FIRST part. START with the format's "
+                    "DOCUMENT SHELL per your specialization — for HTML that means "
+                    "<!DOCTYPE html>, <html>, <head> with a real title + styles, <body> — "
+                    "and THEN your first section's content, all in this same turn, as RAW "
+                    "content in the final format"
+                )
                 intro = (
                     "\n\n----\nWrite the deliverable to a file, built up ACROSS SEVERAL "
-                    "TURNS — one section per turn, not all at once. Emit the FIRST section "
-                    "NOW as RAW content in the final format the task asks for (real HTML "
-                    "tags / markdown / plain text) — NO JSON, no tool call, no preamble, "
+                    "TURNS — one section per turn, not all at once. " + _open_imperative +
+                    " — NO JSON, no tool call, no preamble, "
                     "just the content itself. Write ONE complete section this turn (start "
                     "with the headline + introduction), then STOP and wait: after each "
                     "section I WRITE IT to the file and show you the file's current end, so "
                     "you continue exactly where it left off (never repeat what is already "
                     "written). Do NOT put " + DONE_SENTINEL + " in a turn that contains "
-                    "content, and do NOT compress a detailed report into one short turn. "
-                    "CARRY THE SOURCES THROUGH: when the research above attributes facts to "
+                    "content, and do NOT compress a detailed report into one short turn."
+                    + _figures_mandate +
+                    " CARRY THE SOURCES THROUGH: when the research above attributes facts to "
                     "source URLs, cite them using the REAL source URLs provided VERBATIM — "
                     "never a fabricated publication name, date, or '[Name, 2025]'-style "
-                    "placeholder, and never a URL you were not given — and close with a "
-                    "SOURCES section listing the URLs you used (never drop them). Reply with EXACTLY "
-                    + DONE_SENTINEL + " and nothing else ONLY once the WHOLE deliverable is "
-                    "on the file — for a 'detailed'/'thorough'/'in-depth' report that means "
-                    "a substantive intro, the full body (timeline, figures/table), the "
-                    "fallout/analysis, AND the sources are all written, not a short "
-                    "summary; " + _close_clause + _REPORT_SEPARATION_GUIDANCE
+                    "placeholder, and never a URL you were not given. The DOCUMENT (not each "
+                    "part) closes with EXACTLY ONE sources/references section per your "
+                    "specialization's structure rules — write it ONLY if this part is the "
+                    "document's final part and it does not exist yet; NEVER add another if "
+                    "one is already on the file. Reply with EXACTLY "
+                    + DONE_SENTINEL + " and nothing else ONLY once "
+                    # SCOPE-FAITHFUL COMPLETION (live run-5 catch): in a MULTI-PART plan
+                    # the old whole-deliverable finish condition invited EVERY part to
+                    # write the whole report (n1 one-shot the full document; a later
+                    # node re-passed it). A non-final part finishes when ITS OWN
+                    # assigned section(s) are written; only the FINAL part owns the
+                    # whole-document completeness bar.
+                    + (
+                        "the WHOLE deliverable is on the file — for a 'detailed'/"
+                        "'thorough'/'in-depth' report that means a substantive intro, "
+                        "the full body (timeline, figures/table), the fallout/analysis, "
+                        "AND the sources are all written, not a short summary; "
+                        if is_final
+                        else
+                        # The FIRST part also OWNS the document OPEN (live run-6 catch:
+                        # with every part scoped to its own section, no part wrote the
+                        # doctype/head shell and the final close orphaned) — this fresh-
+                        # file branch IS the first writer, so it opens per its spec,
+                        # writes its part, and leaves the document open.
+                        "YOUR ASSIGNED section(s) — and ONLY those — are on the file. "
+                        "You are the document's FIRST part: BEGIN the document per your "
+                        "specialization's structure rules (its opening/head/title/styles "
+                        "for the format), then write YOUR part. Your TASK above names "
+                        "your part; write THAT part well and stop. Other sections, the "
+                        "sources list and the document's close belong to LATER parts — "
+                        "do NOT write them; "
+                    )
+                    + _close_clause + _REPORT_SEPARATION_GUIDANCE
                 )
 
             # SOURCE-SCOPING (s9/c13, d56): for a section node carrying source_ids,
@@ -1967,6 +3222,11 @@ class SubAgent:
             convo: list[dict[str, Any]] = [
                 {"role": "user", "content": user + intro + scoped_suffix}
             ]
+            # d156 GATE: the writer's FIRST user turn (the compact SOURCE INDEX + leads, no
+            # full-body dump). Bounded BECAUSE the bodies are pulled chunked via load_source —
+            # the live trace reads this to prove no served write input balloons (vs the
+            # b359a87f 81-85KB full-body dumps).
+            span.set_attribute("synthesis.user_turn_chars", len(convo[0]["content"]))
             max_turns = SYNTH_MAX_SECTIONS + 4
 
             async def closing_gap() -> list[str]:
@@ -2028,8 +3288,7 @@ class SubAgent:
                             "file_read", path=written_path, tail=900
                         )
                         if rb.ok and isinstance(rb.value, Mapping):
-                            # Hide the planted anchor sentinel from the model-facing tail.
-                            tail_text = strip_section_anchor(str(rb.value.get("text") or ""))
+                            tail_text = str(rb.value.get("text") or "")
                     convo.append(
                         {
                             "role": "user",
@@ -2060,67 +3319,53 @@ class SubAgent:
                         "Write whatever remains and CLOSE the document now (close every "
                         "tag you opened), then reply EXACTLY " + DONE_SENTINEL + "."
                     )
-                raw = await emit(convo)
+                # d162: emit against the WINDOWED convo (system + task/index turn + recent
+                # file-tail turns). The full per-section emissions accumulate in ``convo`` but
+                # are on disk and re-fed via the bounded tail, so each served call stays well
+                # under num_ctx without losing the document (which the model continues from
+                # the tail, not from history).
+                raw = await emit(self._bound_chat_convo(convo, system))
                 convo.append({"role": "assistant", "content": raw or ""})
                 done, content = split_done_signal(_strip_synth_fence(raw))
-                content = content.strip()
+                # s14/a8 (d149): strip any internal context-assembly scaffolding / tool-call
+                # text the writer echoed BEFORE it is written to the file, so no
+                # "SOURCES & FINDINGS …", "ACROSS PARTS", "TOOL OUTPUT (file_write): {path}"
+                # header or literal ``file_update(...)`` call can render into the deliverable.
+                content = strip_internal_scaffolding(content).strip()
                 if content and _is_html_ext:
                     # E4B intermittently ESCAPES a tag close as ``\>`` (e.g. ``</body\>``)
                     # — a model output artifact, never intended in HTML. De-escape it so
                     # the on-disk document is well-formed and the R1 close-tag gate reads
                     # the true tag balance (one stray backslash must not survive to disk).
                     content = content.replace("\\>", ">")
-                    # PLAN-CHAINING wrapper hygiene (c1b): a NON-FINAL page must not close
-                    # the document wrapper — the deferred-close contract closes it exactly
-                    # once on the terminal page. But the small model writes </body></html>
-                    # into every page it finishes, leaving a duplicate INTERIOR close
-                    # mid-document (c1br defect). Strip those wrapper closers from each
-                    # non-final page's RAW content BEFORE it is written, using the
-                    # chain_is_final signal already at the node — so exactly one trailing
-                    # </body></html> survives. Final page + single-file path untouched.
-                    if not is_final:
-                        content = strip_wrapper_closers(content)
+                    # RP-2 (d319/d311, borderline-1): the MAIN-loop multi-page wrapper
+                    # hygiene (strip_wrapper_closers on non-final pages) is REMOVED. The
+                    # writer spec now makes the MODEL author ONE well-formed self-contained
+                    # artifact, so the engine no longer strips per-page wrapper CLOSE tags.
+                    # The predicate-only re-emission guard below is KEPT (it decides whether
+                    # to persist a duplicate document — it never edits the model's bytes).
 
                 if content:
-                    # c10 #2 RE-EMISSION GUARD (HTML): a small model nudged to "continue"
-                    # an ALREADY-complete, closed top-level document responds by emitting a
-                    # FRESH <!DOCTYPE>…</html> document. Appending it concatenates a SECOND
-                    # document into the file — the duplicate-document defect that tag-BALANCE
-                    # (2 opens + 2 closes) does NOT catch. If this chunk BEGINS a new
-                    # document AND the real file already holds a complete, closed one, the
-                    # deliverable is done: DROP the re-emission and STOP (ground truth read
-                    # from the file, d48-clean — never the model's memory). A genuine next
-                    # section (which does not open a new <html>) is unaffected.
-                    if (
-                        _is_html_ext
-                        and written_path is not None
-                        and begins_html_document(content)
-                    ):
-                        rb_full = await self.hook.invoke(
-                            "file_read", path=written_path, max_bytes=4_000_000
-                        )
-                        prior = (
-                            str(rb_full.value.get("text") or "")
-                            if rb_full.ok and isinstance(rb_full.value, Mapping)
-                            else ""
-                        )
-                        if top_level_html_doc_count(prior) >= 1 and not html_close_gap(prior):
-                            finished = True
-                            break
-                    # c14 (d59) BODY-LEVEL re-emission guard: the long-report loop also
-                    # re-emits an ALREADY-WRITTEN section set WITHOUT a fresh <!DOCTYPE>
-                    # (so the document-level guard above misses it) — repeating the
-                    # <h1>/<h2> heading FAMILY the file already holds (c13r 4/4 long runs).
-                    # If THIS chunk carries headings whose families are ALL already on the
-                    # real file (ground truth, d48-clean) it adds no new section: DROP it
-                    # rather than appending a duplicate pass. Finish if the file is a
-                    # complete closed document; else count it unproductive and nudge for
-                    # the NEXT, not-yet-written section.
-                    if (
-                        _is_html_ext
-                        and written_path is not None
-                        and ("<h1" in content.lower() or "<h2" in content.lower())
-                    ):
+                    # RE-EMISSION GUARD (c10 #2 + c14/d59) — RP-3c (d330) OUTPUT-AGNOSTIC.
+                    # A small model nudged to "continue" an ALREADY-written deliverable often
+                    # RE-EMITS it instead of writing the next section: either it RESTARTS the
+                    # whole document/shell from the top, or it re-emits an already-written
+                    # section set. Appending that concatenates a duplicate into the file — the
+                    # defect tag-BALANCE (2 opens + 2 closes) does NOT catch. RP-3c RETIRED the
+                    # HTML-PINNED predicates (begins_html_document / top_level_html_doc_count /
+                    # the "<h1"/"<h2" string test) for FORMAT-NEUTRAL ones so the guard works
+                    # for ANY output format, not just HTML: ``document_restart`` (the new chunk
+                    # reproduces the real file's own opening) OR ``section_reemission`` (its
+                    # headings — HTML ``<h1>/<h2>`` OR Markdown ``#``/``##`` — are ALL already
+                    # on the file). This is the SAME orchestration DECISION the neuron ruled
+                    # KEEP (RP-2/d319): it only DECIDES persist/stop/nudge from the REAL file's
+                    # bytes (d48-clean) and NEVER edits the model's output. ``html_close_gap`` is
+                    # the already-output-neutral "unclosed structural container" completeness
+                    # check — [] for a balanced HTML document AND for any non-HTML/fragment file,
+                    # so a complete artifact in any format reads as done. A genuine next section
+                    # reproduces neither the opening nor an existing heading set, so it is never
+                    # dropped.
+                    if written_path is not None:
                         rb_dup = await self.hook.invoke(
                             "file_read", path=written_path, max_bytes=4_000_000
                         )
@@ -2129,10 +3374,17 @@ class SubAgent:
                             if rb_dup.ok and isinstance(rb_dup.value, Mapping)
                             else ""
                         )
-                        if section_reemission(content, prior_doc):
+                        if prior_doc and (
+                            document_restart(content, prior_doc)
+                            or section_reemission(content, prior_doc)
+                        ):
                             if not html_close_gap(prior_doc):
+                                # the real file already holds a complete, closed artifact →
+                                # the deliverable is done: DROP the re-emission and STOP.
                                 finished = True
                                 break
+                            # the file is not yet complete → this chunk re-emits written
+                            # content without adding the NEXT section: nudge for it, bounded.
                             unproductive += 1
                             if unproductive >= 2:
                                 break
@@ -2142,9 +3394,8 @@ class SubAgent:
                                     "content": (
                                         "Those sections are ALREADY written to the file — "
                                         "do not repeat them. Write the NEXT, not-yet-written "
-                                        "section's real content now as raw HTML, or reply "
-                                        "EXACTLY " + DONE_SENTINEL + " if the deliverable "
-                                        "is complete."
+                                        "section's real content now, or reply EXACTLY "
+                                        + DONE_SENTINEL + " if the deliverable is complete."
                                     ),
                                 }
                             )
@@ -2154,85 +3405,21 @@ class SubAgent:
                     # the ACTUAL on-disk state — read-back fires on every part, even when
                     # the model one-shots the whole document.
                     append = written_path is not None
-                    # c12 #2b: an APPENDED HTML section must contribute body content ONLY,
-                    # never RE-OPEN the document — strip any re-emitted document-wrapper
-                    # OPEN tags (a fresh <!DOCTYPE>/<html>/<head>/<body>) the small model
-                    # habitually prepends to each section, the stray-sibling-opens defect.
-                    # The FIRST write (append=False) keeps its opener — it establishes the
-                    # document; and wrapper CLOSES are left intact here so the final
-                    # section's legitimate </body></html> (and the deferred-close contract)
-                    # survives — a doubled-close TAIL from sections that each closed is
-                    # collapsed losslessly by the final single-document normaliser below.
-                    # Runs AFTER the re-emission guard above, so a full-document
-                    # re-emission onto an already-complete file still STOPS rather than
-                    # being silently appended.
-                    if append and _is_html_ext:
-                        content = strip_wrapper_openers(content)
-                        if not content.strip():
-                            # The whole chunk was wrapper scaffolding, no real section
-                            # content — nothing to add; nudge for the next part.
-                            unproductive += 1
-                            convo.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "That part contained only document-wrapper tags, "
-                                        "no new content. Write the NEXT section's real "
-                                        "content now as raw HTML, or reply EXACTLY "
-                                        + DONE_SENTINEL + " if the deliverable is complete."
-                                    ),
-                                }
-                            )
-                            if unproductive >= 2:
-                                break
-                            continue
-                    # s13/P2.3 (d130/d132.C): ANCHORED read->targeted-insert->write
-                    # REPLACES the blind ``file_write(append=True)``. The FIRST physical
-                    # write of this node creates (or first-appends, for a continuation
-                    # page) the content WITH the terminal anchor planted at the document
-                    # end; every LATER section is inserted JUST BEFORE that single unique
-                    # anchor via ``file_update``. Because nothing is ever blind-appended
-                    # PAST the document's end, a re-emitted chunk cannot form the
-                    # duplicate-tail / 2nd top-level document — the structural prevention.
-                    if not anchor_planted:
-                        res = await self.hook.invoke(
-                            "file_write", path=out_path,
-                            content=plant_section_anchor(content),
-                            append=append, overwrite=True,
-                        )
-                        if res.ok:
-                            anchor_planted = True
-                    else:
-                        target = written_path or out_path
-                        anchor = None
-                        rba = await self.hook.invoke("file_read", path=target, tail=8192)
-                        if rba.ok and isinstance(rba.value, Mapping):
-                            anchor = choose_section_anchor(
-                                str(rba.value.get("text") or ""), _is_html_ext
-                            )
-                        if anchor is not None:
-                            old, new = anchored_insert_args(anchor, content)
-                            res = await self.hook.invoke(
-                                "file_update", path=target, old=old, new=new, count=1,
-                            )
-                            if not res.ok:
-                                # The anchor vanished / is no longer unique: never lose
-                                # the section — guarded append + REPLANT the anchor so
-                                # the next section inserts cleanly again.
-                                res = await self.hook.invoke(
-                                    "file_write", path=target,
-                                    content=plant_section_anchor(content),
-                                    append=True, overwrite=True,
-                                )
-                        else:
-                            # No unique anchor present (e.g. a continuation page whose
-                            # prior node left the wrapper open and its sentinel stripped)
-                            # — append + replant rather than risk a wrong-span edit.
-                            res = await self.hook.invoke(
-                                "file_write", path=target,
-                                content=plant_section_anchor(content),
-                                append=True, overwrite=True,
-                            )
+                    # RP-2 (d319/d311, borderline-1): the MAIN-loop continuation-page
+                    # wrapper-OPENER strip (strip_wrapper_openers) is REMOVED. The writer
+                    # spec now makes the MODEL author ONE well-formed self-contained artifact,
+                    # so the engine no longer strips re-emitted document-wrapper OPEN tags.
+                    # RP-1 (d319/d311): the ANCHORED plant/choose/insert/strip machinery is
+                    # RETIRED — the engine no longer plants a sentinel or does structure-aware
+                    # inserts into the model's document. Each turn's authored content is
+                    # persisted VERBATIM by appending: the MODEL authors the whole document
+                    # across its turns and the engine only relays the bytes (never modifies
+                    # them). ``append`` is False only for the very first physical write of a
+                    # fresh deliverable; every later emission appends.
+                    res = await self.hook.invoke(
+                        "file_write", path=(written_path or out_path),
+                        content=content, append=(append or writes > 0), overwrite=True,
+                    )
                     if res.ok and isinstance(res.value, Mapping):
                         writes += 1
                         unproductive = 0
@@ -2241,9 +3428,7 @@ class SubAgent:
                         tail_text = ""
                         rb = await self.hook.invoke("file_read", path=written_path, tail=900)
                         if rb.ok and isinstance(rb.value, Mapping):
-                            # Hide the planted anchor sentinel from the tail shown back to
-                            # the model (it is internal bookkeeping, stripped at finalize).
-                            tail_text = strip_section_anchor(str(rb.value.get("text") or ""))
+                            tail_text = str(rb.value.get("text") or "")
                             size = rb.value.get("size", size)
                         if done:
                             # R1: accept finish only if the real file's top-level tags
@@ -2259,23 +3444,38 @@ class SubAgent:
                             # prose to the .csv). Accept the deliverable now.
                             finished = True
                             break
+                        # s15/a18 (d189): the file_write/file_read RESULT (saved-part state +
+                        # the on-disk tail) is a TOOL function-result — feed it role 'tool' so
+                        # the model treats the echoed file tail as an observation to continue
+                        # FROM, not a fresh USER turn to respond to / copy back (the
+                        # file_read-echo leak + the never-terminating multi-write loop root,
+                        # d189). The continuation DIRECTIVE that follows is a genuine
+                        # instruction and stays role 'user'.
+                        convo.append(
+                            {
+                                "role": "tool",
+                                "content": (
+                                    f"Saved part {writes}. The file is now {size} bytes; "
+                                    f"it ENDS with:\n-----\n{tail_text}\n-----"
+                                ),
+                            }
+                        )
                         convo.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Saved part {writes}. The file is now {size} bytes; "
-                                    f"it ENDS with:\n-----\n{tail_text}\n-----\nContinue "
-                                    "the deliverable from exactly there — write the NEXT "
-                                    "part as raw content (do NOT repeat anything shown "
-                                    "above). A detailed/thorough report is NOT complete "
-                                    "after a single section: keep going until the full body "
-                                    "(timeline, the key figures/table), the analysis/fallout, "
-                                    "AND a SOURCES section listing the source URLs are all on "
-                                    "the file — cite each claim's source as you go using the "
-                                    "REAL SOURCE URLS verbatim (never a fabricated '[Name, 2025]' "
-                                    "placeholder or a URL not in that list). Reply "
-                                    "with EXACTLY " + DONE_SENTINEL + " ONLY once the WHOLE "
-                                    "deliverable (all of those parts) is on the file."
+                                    "Continue the deliverable from exactly where the file "
+                                    "ENDS above — write the NEXT part as raw content (do NOT "
+                                    "repeat anything shown above). A detailed/thorough report "
+                                    "is NOT complete after a single section: keep going until "
+                                    "the full body (timeline, the key figures/table), the "
+                                    "analysis/fallout, AND a SOURCES section listing the "
+                                    "source URLs are all on the file — cite each claim's "
+                                    "source as you go using the REAL SOURCE URLS verbatim "
+                                    "(never a fabricated '[Name, 2025]' placeholder or a URL "
+                                    "not in that list). Reply with EXACTLY " + DONE_SENTINEL
+                                    + " ONLY once the WHOLE deliverable (all of those parts) "
+                                    "is on the file."
                                 ),
                             }
                         )
@@ -2317,27 +3517,9 @@ class SubAgent:
                 if unproductive >= 2:
                     break
 
-            # s13/P2.3 (d130/d132.C): FINALIZE — strip the planted anchor sentinel so it
-            # never reaches disk / the served document. Runs BEFORE the per-section verify
-            # and doc assembly below (which read the real file as ground truth), so they
-            # see the clean document. No-op (byte-identical) when no anchor was planted
-            # (e.g. a raw-fallback one-shot), and the rewrite only fires when the sentinel
-            # was actually present.
-            if anchor_planted and written_path is not None:
-                rb_fin = await self.hook.invoke(
-                    "file_read", path=written_path, max_bytes=4_000_000
-                )
-                if rb_fin.ok and isinstance(rb_fin.value, Mapping):
-                    raw_doc = str(rb_fin.value.get("text") or "")
-                    clean_doc = strip_section_anchor(raw_doc)
-                    if clean_doc != raw_doc:
-                        w_fin = await self.hook.invoke(
-                            "file_write", path=written_path,
-                            content=clean_doc, append=False, overwrite=True,
-                        )
-                        if w_fin.ok and isinstance(w_fin.value, Mapping):
-                            written_path = str(w_fin.value.get("path") or written_path)
-
+            # RP-1 (d319/d311): the FINALIZE anchor-sentinel strip is RETIRED — no sentinel
+            # is ever planted, so there is nothing to strip; the on-disk document is exactly
+            # the model's authored bytes.
             span.set_attribute("synthesis.writes", writes)
             span.set_attribute("synthesis.finished", finished)
             # R2 (c1r): SURFACE non-convergence — the loop hit the ceiling without the
@@ -2348,113 +3530,16 @@ class SubAgent:
             if not finished:
                 span.set_attribute("synthesis.non_convergence", True)
 
-            # R2 SECTION-SCOPED PER-PAGE VERIFY (d79, MS3): ground THIS node's OWN
-            # section against ITS scoped sources, INSIDE the write loop — so a long
-            # multi-section report is actively grounded section-by-section instead of
-            # relying on the whole-doc final verify, which is BYPASSED on >9000-char docs
-            # (_VERIFY_REVISE_MAX_CHARS). Each section is < that cap, so a single revise
-            # turn can safely re-emit it. REASONING-not-regex (verify_and_revise: the
-            # model judges groundedness and rewrites; d14/d48). Scoped to the node's
-            # planner-assigned source_ids (the d56 section→source map), falling back to
-            # the full chain source set for an unscoped node. Default OFF (verify_lane) →
-            # skipped, byte-identical short/headlines/csv path; the served deep-research
-            # route turns it ON (N6). The whole-doc final verify below then SKIPS this
-            # node (``section_verified``) so a clean report is not double-charged, and the
-            # MSF-fed per-source budget is reused so a raised-budget-grounded claim is not
-            # flagged by a starved verify excerpt.
-            section_verified = False
-            if (
-                self._verify_lane
-                and writes > 0
-                and written_path is not None
-                and self._chain_sources
-            ):
-                sec_full = ""
-                rbs = await self.hook.invoke(
-                    "file_read", path=written_path, max_bytes=4_000_000
-                )
-                if rbs.ok and isinstance(rbs.value, Mapping):
-                    sec_full = str(rbs.value.get("text") or "")
-                section_text = sec_full[len(chain_prefix_text):] if sec_full else ""
-                if section_text.strip():
-                    node_ids = [
-                        i for i in (self.node.source_ids or [])
-                        if isinstance(i, int) and 1 <= i <= len(self._chain_sources)
-                    ]
-                    section_sources = (
-                        [self._chain_sources[i - 1] for i in node_ids]
-                        if node_ids else list(self._chain_sources)
-                    )
-
-                    async def _sec_verify_turn(prompt: str) -> str:
-                        return await emit([{"role": "user", "content": prompt}])
-
-                    # s13/P1 (d118): the VERDICT rides NATIVE message.tool_calls — drop-
-                    # immune to leading prose — using the SAME native helper the decision
-                    # loop uses (_research_emit + REVIEWER_TOOL_SPECS). The RAW revise turn
-                    # stays the text emit above (corrected document is RAW, d50). A non-
-                    # native reply falls back to the kept balanced-brace parser.
-                    async def _sec_verify_native(prompt: str):
-                        opts = dict(base_opts)
-                        opts["tools"] = list(REVIEWER_TOOL_SPECS)
-                        return await self._research_emit(
-                            system, [{"role": "user", "content": prompt}], opts
-                        )
-
-                    sec_rev = await verify_and_revise(
-                        section_text, section_sources,
-                        verify=_sec_verify_turn,
-                        verify_native=_sec_verify_native,
-                        # FIX-C: the verify lane is the GENERIC REVIEWER — feed it the
-                        # producing node's SAME composed spec so it reviews against the
-                        # rules the section was built to satisfy (empty → spec-blind).
-                        spec=self.spec_body,
-                        goal=self._overall_goal or self.node.task or "",
-                        max_passes=2,  # verify → revise → RE-VERIFY
-                        excerpt_budget=self._writer_source_budget,
-                    )
-                    section_verified = True
-                    span.set_attribute("synthesis.section_verify", True)
-                    span.set_attribute("synthesis.section_verify_chars", len(section_text))
-                    span.set_attribute("synthesis.section_verify_grounded", bool(sec_rev.grounded))
-                    span.set_attribute("synthesis.section_verify_unbacked", len(sec_rev.unbacked))
-                    span.set_attribute("synthesis.section_verify_passes", sec_rev.passes)
-                    if (
-                        sec_rev.revised
-                        and sec_rev.document.strip()
-                        and sec_rev.document != section_text
-                    ):
-                        revised_section = sec_rev.document
-                        # Re-apply the loop's wrapper hygiene to the re-emitted section so
-                        # a continuation page never re-opens the document and a non-final
-                        # page never closes the wrapper early (the c1b/c12 invariants).
-                        if _is_html_ext:
-                            if chain_prefix_text:
-                                revised_section = strip_wrapper_openers(revised_section)
-                            if not is_final:
-                                revised_section = strip_wrapper_closers(revised_section)
-                        new_full = chain_prefix_text + revised_section
-                        if _is_html_ext:
-                            if has_duplicate_html_structure(new_full):
-                                new_full = enforce_single_html_document(new_full)
-                            new_full = collapse_duplicate_sections(new_full)
-                        # s13/P1-report: a revise turn capped at num_predict can come back
-                        # CUT MID-SENTENCE; never persist a rewrite that truncates content
-                        # the original did not — surface the verdict, keep the fuller file.
-                        _revise_truncates = (
-                            has_truncation_marker(new_full)
-                            and not has_truncation_marker(sec_full)
-                        )
-                        if new_full.strip() and not _revise_truncates:
-                            w = await self.hook.invoke(
-                                "file_write", path=written_path,
-                                content=new_full, append=False, overwrite=True,
-                            )
-                            if w.ok and isinstance(w.value, Mapping):
-                                written_path = str(w.value.get("path") or written_path)
-                        elif _revise_truncates:
-                            span.set_attribute("synthesis.section_verify_revise_skipped_truncation", True)
-                            span.set_attribute("synthesis.section_verify_revised", True)
+            # RP-3c (d330): the PER-SECTION model VERIFY/REVISE self-review lane (formerly
+            # flag-gated on ``self._verify_lane``) is RETIRED. The model self-review is NOT
+            # dropped — it MOVED to the DEFINITION LAYER: the writer specs' shared
+            # ``_COHERENT_ARTIFACT_DOCTRINE`` now carries a SELF-REVIEW-BEFORE-FINISH clause, so
+            # the model re-reads its OWN artifact against the coherence + no-ungrounded-source
+            # points and grounds-or-drops any unbacked claim as the LAST part of authoring. There
+            # is no engine-run verify turn and no ``verify_lane`` boolean (d311 no-hardcoded-
+            # flags; d319 the engine authors/decides/fixes nothing about the output). A node that
+            # still wants to fact-check a specific claim mid-gather self-selects the model-driven
+            # ``cross_verify`` research tool.
 
             # Assemble the deliverable from the REAL FILE (ground truth) — not from the
             # model's reported sections, so the chat surfaces exactly what was written.
@@ -2464,38 +3549,13 @@ class SubAgent:
                     "file_read", path=written_path, max_bytes=4_000_000
                 )
                 if rb.ok and isinstance(rb.value, Mapping):
-                    # Defensive: the finalize step above already stripped the planted
-                    # anchor sentinel from disk; strip again here so the assembled doc is
-                    # clean even if that rewrite was skipped/failed.
-                    doc = strip_section_anchor(str(rb.value.get("text") or ""))
+                    doc = str(rb.value.get("text") or "")
 
-            # c10 #2 / c12 #2b SINGLE-DOCUMENT GATE (safety net): the re-emission guard +
-            # the per-append wrapper strip prevent the common cases, but a model can still
-            # cram TWO complete <!DOCTYPE>…</html> documents into a SINGLE emission (or
-            # leave stray sibling <html>/<body> opens / a doubled close). Assert STRICT
-            # single-document-ness on the assembled bytes (d48-clean: real file, not
-            # memory) and, if duplicate top-level structure is present, normalise to
-            # exactly ONE <!DOCTYPE>/<html>/<head>/<body>…</body></html> and REWRITE the
-            # file so exactly one well-formed document reaches disk AND the chat artifact.
-            # c14 (d59): also collapse a re-emitted BODY-LEVEL report pass / repeated
-            # heading-FAMILY (a duplicate that carries no second <!DOCTYPE>, so
-            # has_duplicate_html_structure alone misses it). enforce normalises the
-            # document wrapper first; collapse then drops the duplicate section passes —
-            # both d48-clean (real bytes, no fabricated content), no-op on a clean file.
-            if _is_html_ext:
-                normalized = doc
-                if has_duplicate_html_structure(normalized):
-                    normalized = enforce_single_html_document(normalized)
-                normalized = collapse_duplicate_sections(normalized)
-                if normalized != doc and normalized.strip():
-                    w = await self.hook.invoke(
-                        "file_write", path=written_path or out_path,
-                        content=normalized, append=False, overwrite=True,
-                    )
-                    if w.ok and isinstance(w.value, Mapping):
-                        written_path = str(w.value.get("path") or written_path or out_path)
-                    doc = normalized
-                    span.set_attribute("synthesis.docs_deduped", True)
+            # RP-1 (d319/d311): the SINGLE-DOCUMENT GATE (enforce_single_html_document +
+            # collapse_duplicate_sections normalization of the assembled bytes) is RETIRED —
+            # the engine no longer fixes duplicate top-level structure / repeated sections.
+            # The document ships EXACTLY as the model authored it (raw model output; the
+            # model owns single-document coherence, hardened via the writer spec in RP-2).
 
             if not doc.strip():
                 # FALLBACK: the model never wrote a usable file — salvage ONE raw
@@ -2509,204 +3569,30 @@ class SubAgent:
                     if w.ok and isinstance(w.value, Mapping):
                         written_path = str(w.value.get("path") or out_path)
 
-            # N5 (d62/c15 part-e) — the REASONING no-fabrication VERIFICATION lane over
-            # the FINAL deliverable. Re-check every claim against the run's FETCHED
-            # sources via claim->source provenance and force the model to GROUND or
-            # REVISE/REMOVE any unbacked claim (the c13r B2 narrative-fabrication gap,
-            # e.g. the fabricated 17 USC 107(5) / CTEA-1998). REASONING, never a
-            # regex/string filter (d14/d48): the model judges groundedness AND rewrites;
-            # this loop only orchestrates the turns and persists the corrected file.
-            # Runs ONLY on the FINAL page of a deliverable that HAS fetched sources to
-            # check against — a source-less creative deliverable is never nagged/stripped
-            # (the steer's "do not strip valid content"). The whole-doc REWRITE is gated
-            # on a size a single revise turn can safely re-emit (the verdict still
-            # surfaces beyond it) + a retention floor in verify_and_revise, so a long
-            # report is never truncated/blanked. Default OFF → skipped, byte-identical
-            # c13 write side; the served deep-research route turns it ON (N6).
-            # R2 (d79, MS3): SKIP the whole-doc verify when the per-section verify above
-            # already grounded this node's content (``section_verified``). For a
-            # single-section report that IS the whole doc (no double-charge); for a long
-            # multi-section report every page was grounded by its own node's per-section
-            # pass, so the whole-doc rewrite (bypassed >9000 chars anyway) adds nothing.
-            # Falls through to the whole-doc lane only when no per-section verify ran
-            # (e.g. an unscoped/source-less final page) — the prior behaviour, unchanged.
-            if (
-                self._verify_lane
-                and is_final
-                and not section_verified
-                and doc.strip()
-                and self._chain_sources
-                and written_path is not None
-            ):
-                async def _verify_turn(prompt: str) -> str:
-                    return await emit([{"role": "user", "content": prompt}])
+            # RP-3c (d330): the whole-doc REASONING no-fabrication VERIFY/REVISE lane
+            # (formerly flag-gated on ``self._verify_lane``, is_final + chain sources) is
+            # RETIRED alongside the per-section pass above. The no-fabrication guarantee it
+            # enforced — every claim traces to a real fetched source; ground-or-drop any
+            # unbacked claim — MOVED to the DEFINITION LAYER as the SELF-REVIEW-BEFORE-FINISH
+            # clause of ``_COHERENT_ARTIFACT_DOCTRINE``: the model itself re-reads its final
+            # artifact and grounds-or-drops unbacked claims before it finishes. No engine verify
+            # turn, no ``verify_lane`` boolean, no engine rewrite of the model's bytes (d311/d319).
 
-                # s13/P1 (d118): native verdict turn (drop-immune to leading prose),
-                # same helper + reviewer tool surface as the per-section pass above.
-                async def _verify_native_turn(prompt: str):
-                    opts = dict(base_opts)
-                    opts["tools"] = list(REVIEWER_TOOL_SPECS)
-                    return await self._research_emit(
-                        system, [{"role": "user", "content": prompt}], opts
-                    )
-
-                rev = await verify_and_revise(
-                    doc, self._chain_sources,
-                    verify=_verify_turn,
-                    verify_native=_verify_native_turn,
-                    # FIX-C: spec-aware generic reviewer (empty spec → spec-blind).
-                    spec=self.spec_body,
-                    goal=self._overall_goal or self.node.task or "",
-                    max_passes=2,  # verify → revise → RE-VERIFY (confirm the fix grounded it)
-                    # MSF/d89 lockstep: Seam-B judges against the SAME per-source budget
-                    # the writer was fed, so a claim grounded in raised-budget text is not
-                    # flagged unbacked by a starved 700-char verify excerpt.
-                    excerpt_budget=self._writer_source_budget,
-                )
-                span.set_attribute("synthesis.verify_lane", True)
-                span.set_attribute("synthesis.verify_grounded", bool(rev.grounded))
-                span.set_attribute("synthesis.verify_unbacked", len(rev.unbacked))
-                span.set_attribute("synthesis.verify_passes", rev.passes)
-                # Persist a real rewrite only when it came back substantive and within a
-                # single-turn output budget (a long doc would truncate on one revise
-                # turn — surface the verdict, don't gut the file). The retention floor in
-                # verify_and_revise already rejects a catastrophically short rewrite.
-                if (
-                    rev.revised
-                    and rev.document.strip()
-                    and rev.document != doc
-                    and len(doc) <= _VERIFY_REVISE_MAX_CHARS
-                ):
-                    normalized = rev.document
-                    if _is_html_ext:
-                        if has_duplicate_html_structure(normalized):
-                            normalized = enforce_single_html_document(normalized)
-                        normalized = collapse_duplicate_sections(normalized)
-                    # s13/P1-report: never replace the file with a rewrite that ends
-                    # MID-SENTENCE (a num_predict cut) when the original did not — keep
-                    # the fuller verified file and surface the verdict, don't truncate it.
-                    _wd_truncates = (
-                        has_truncation_marker(normalized)
-                        and not has_truncation_marker(doc)
-                    )
-                    if normalized.strip() and not _wd_truncates:
-                        w = await self.hook.invoke(
-                            "file_write", path=written_path,
-                            content=normalized, append=False, overwrite=True,
-                        )
-                        if w.ok and isinstance(w.value, Mapping):
-                            written_path = str(w.value.get("path") or written_path)
-                        doc = normalized
-                        span.set_attribute("synthesis.verify_revised", True)
-                    elif _wd_truncates:
-                        span.set_attribute("synthesis.verify_revise_skipped_truncation", True)
-                elif rev.revised:
-                    # A rewrite was produced but the doc is too long to safely re-persist
-                    # in one turn — keep the verified-but-unrewritten file; surface it.
-                    span.set_attribute("synthesis.verify_revise_skipped_size", True)
-
-            # FINAL-DOCUMENT NO-FAB URL GUARD (d84/d89, MS3): a DETERMINISTIC post-pass
-            # over the assembled deliverable — every URL is checked against the run's
-            # FETCHED-source set (each source's URL + every URL embedded verbatim in the
-            # fetched article text), and any ungrounded/fabricated URL is REMOVED (its
-            # anchor unwrapped to the visible text, bare occurrences dropped). Makes the
-            # d60 no-fabrication guarantee deterministic rather than model-luck: even if
-            # the reasoning verify lane misses a hallucinated link, no fabricated URL can
-            # survive to the delivered file, for ANY model. Content-preserving (strips
-            # only the offending token, never invents prose) + idempotent (a clean report
-            # is byte-identical). Runs ONLY on the served report path (verify_lane on) +
-            # final page + with fetched sources to check against → default-safe; a
-            # source-less or short/headlines/csv deliverable is untouched.
-            if (
-                self._verify_lane
-                and is_final
-                and doc.strip()
-                and self._chain_sources
-                and written_path is not None
-            ):
-                guarded, removed_urls = strip_ungrounded_urls(doc, self._chain_sources)
-                span.set_attribute("synthesis.url_guard", True)
-                span.set_attribute("synthesis.url_guard_removed", len(removed_urls))
-                if removed_urls and guarded.strip() and guarded != doc:
-                    if _is_html_ext:
-                        if has_duplicate_html_structure(guarded):
-                            guarded = enforce_single_html_document(guarded)
-                        guarded = collapse_duplicate_sections(guarded)
-                    if guarded.strip():
-                        w = await self.hook.invoke(
-                            "file_write", path=written_path,
-                            content=guarded, append=False, overwrite=True,
-                        )
-                        if w.ok and isinstance(w.value, Mapping):
-                            written_path = str(w.value.get("path") or written_path)
-                        doc = guarded
-                        span.set_attribute("synthesis.url_guard_applied", True)
-
-            # DETERMINISTIC SOURCE-COVERAGE NET (s13/B5c, design §4C): a final pass UNDER
-            # the loop — appends an "Additional sources" reference block for every fetched
-            # source the PHASE-2 write planner assigned to NO section AND that is not
-            # already present (cited/listed) in the assembled doc, so a source the planner
-            # skipped cannot silently vanish (the d87 dropped-source risk; the
-            # ``_ensure_source_coverage`` d89 specified but never shipped, a1 Fact 4d).
-            # d60-safe: adds ONLY a title+URL reference for material the run ACTUALLY
-            # fetched — never invents content. Runs BEFORE the structure reconcile so a
-            # newly-added <h2> is folded into the re-derived ToC; the in-loop agent stays
-            # the PRIMARY coverage mechanism, this is only the net for the one it skipped.
-            # Gated by the run's chain sources (present ONLY on the report write path) +
-            # final page → default-safe; a source-less / short / headlines / csv
-            # deliverable has no chain sources and is untouched. Independent of the verify
-            # lane: coverage is a structural guarantee, not a no-fabrication concern.
-            if (
-                is_final
-                and doc.strip()
-                and self._chain_sources
-                and written_path is not None
-            ):
-                covered, added_sources = ensure_source_coverage(
-                    doc,
-                    self._chain_sources,
-                    self.node.source_ids or [],
-                    is_html=_is_html_ext,
-                )
-                span.set_attribute("synthesis.coverage_net", True)
-                span.set_attribute("synthesis.coverage_added", len(added_sources))
-                if added_sources and covered.strip() and covered != doc:
-                    w = await self.hook.invoke(
-                        "file_write", path=written_path,
-                        content=covered, append=False, overwrite=True,
-                    )
-                    if w.ok and isinstance(w.value, Mapping):
-                        written_path = str(w.value.get("path") or written_path)
-                    doc = covered
-                    span.set_attribute("synthesis.coverage_applied", True)
-
-            # FINAL DOC-STRUCTURE INTEGRITY BACKSTOP (s13/B5, design §4B): the LAST pass
-            # over the fully-assembled HTML — after every section write, the dedup/verify
-            # lanes and the URL guard, so it sees the document EXACTLY as it will be
-            # served. A real stdlib parser re-derives the ToC from the actual final
-            # h1..h3 set (so a late-appended section is navigable — the d93 ToC miss),
-            # renames any duplicate element id, and balances the wrapper. Deterministic +
-            # content-preserving (d48/d60-clean: re-derives navigation, never fabricates
-            # prose) + idempotent (a clean, complete-ToC doc is byte-identical). HTML only;
-            # a markdown/text/csv deliverable is returned untouched by the function itself.
-            if _is_html_ext and doc.strip():
-                # s13/P1-report: single-title (thematic duplicate-tail) enforcement runs
-                # ONLY on the sourced deep-research REPORT (where the B8a2 two-<h1> shell
-                # occurs); a multi-page file-delivery doc keeps its legitimate per-page
-                # <h1>s. The truncation trim inside reconcile is always safe and runs
-                # regardless. The report path is identified by its fetched chain sources.
-                reconciled = reconcile_doc_structure(
-                    doc, single_title=bool(self._chain_sources)
-                )
-                if reconciled != doc and reconciled.strip():
-                    w = await self.hook.invoke(
-                        "file_write", path=written_path or out_path,
-                        content=reconciled, append=False, overwrite=True,
-                    )
-                    if w.ok and isinstance(w.value, Mapping):
-                        written_path = str(w.value.get("path") or written_path or out_path)
-                    doc = reconciled
-                    span.set_attribute("synthesis.doc_reconciled", True)
+            # RP-1 (d319/d311): three engine output-fixing / structure-authoring passes are
+            # RETIRED here — the engine authors/fixes NOTHING; the deliverable ships EXACTLY
+            # as the model authored it:
+            #   * the NO-FAB URL GUARD (``strip_ungrounded_urls``) — it deleted/unwrapped every
+            #     model-written URL not in the fetched-source set (engine editing the model's
+            #     citations). The no-ungrounded-URL guarantee moves to the writer spec in RP-2
+            #     (the model cites ONLY real fetched URLs, never invents — d310 harden-the-spec).
+            #   * the SOURCE-COVERAGE NET (``ensure_source_coverage``) — it appended an engine-
+            #     authored "Additional sources" block for planner-skipped sources.
+            #   * the DOC-STRUCTURE RECONCILE backstop (``reconcile_doc_structure``) — it
+            #     re-derived the ToC/nav, renamed duplicate ids and rebalanced the wrapper.
+            # (RP-3c/d330: the write-phase engine verify/revise lane is RETIRED above; the model
+            # self-review is now DEFINITION-LAYER — the ``_COHERENT_ARTIFACT_DOCTRINE`` self-review-
+            # before-finish clause the model runs itself. The model-driven ``cross_verify`` research
+            # TOOL a node may self-select mid-gather is a SEPARATE, still-live capability, not this lane.)
 
             if written_path is not None:
                 span.set_attribute("synthesis.written_path", written_path)
@@ -2839,11 +3725,11 @@ class AgentRuntime:
         read_search_max_fetch: int = 0,
         emit_article_notes: bool = False,
         chunked_read: bool = False,
-        verify_lane: bool = False,
         fetched_char_budget: int = 2000,
         upstream_input_char_budget: int = 4000,
         writer_source_budget: Optional[int] = None,
         grower: Optional[Any] = None,
+        node_finalizer: Optional[Callable[[PlanNode, "SubAgentResult"], Any]] = None,
     ) -> None:
         self.transport = transport
         self.loader = loader
@@ -2865,12 +3751,10 @@ class AgentRuntime:
         # identical — the lanes only light up where a gather wires them (d65, no regression).
         self.emit_article_notes = bool(emit_article_notes)
         self.chunked_read = bool(chunked_read)
-        # NO-FAB VERIFICATION LANE (s9/N5, d62/c15 part-e): plumbed exactly like the N2/N3
-        # lanes so the deep-research / plan-chain gather can turn the reasoning
-        # claim->source verify ON for EVERY sub-agent it builds (research producer +
-        # synthesis + inline reviewer) — the served-route LIVE default (N6), not a dark
-        # constructor flag. Default False keeps every other shape byte-identical.
-        self.verify_lane = bool(verify_lane)
+        # RP-3c (d330): the ``verify_lane`` plumbing is RETIRED (the flag-gated engine
+        # verify/revise self-review lane it turned on is gone — the model self-review moved
+        # to the definition-layer writer doctrine; the no-fab gather-more gate is de-flagged
+        # to an output-agnostic signal gate). No boolean is threaded to the sub-agents.
         self.fetched_char_budget = max(400, int(fetched_char_budget))
         # INTER-NODE CONTEXT (o4 fix): per-upstream-dependency prose budget handed to
         # every node's sub-agent (producer + inline reviewer) so a downstream
@@ -3000,9 +3884,58 @@ class AgentRuntime:
         # single-pass drive, byte-identical. The grower is duck-typed: it exposes
         # ``max_layers`` and ``async grow(dag, cache, layer) -> (new_nodes, stop_reason)``.
         self._grower = grower
+        # ONE-DRIVE PHASE TRANSITION (RP-6c B1): the injected, OPTIONAL wiring that generalizes the
+        # growable drive from "grow research waves" to "drive an ordered sequence of PHASES the
+        # SHAPE declares, authoring the next phase's sub-DAG on transition". When set (a
+        # :class:`PhaseTransition`), :meth:`_drive_growable` — AFTER the research grow loop stops —
+        # consults the shape's declared ``next_plan(first_kind)``; if it names a further phase, it
+        # calls the MODEL-authoring ``author(...)`` hook (which authors the write sub-DAG via
+        # ``IncrementalPlanner.plan``), stamps the returned write-phase node(s) with their delivery
+        # target (O1 — so ONLY they take the writer route in this SHARED runtime), appends them to
+        # the LIVE dag, and drives them in the SAME run. None (every existing growable research
+        # run) → the drive stops at the research grow loop, byte-identical to pre-RP-6c. Duck-typed
+        # and additive: the research wave loop is UNCHANGED; only the post-stop behaviour branches.
+        self._phase_transition: Optional["PhaseTransition"] = None
         # The number of research layers the growable drive actually ran (seed=1 + grown),
         # for the run trace. 0 until a growable drive completes.
         self._grow_layers = 0
+        # BUDGET-RESERVING DISPATCH DEADLINE (live 6GB catch): when the growable drive
+        # sets this (the seed wave's SLICE of the wall-clock budget), a passed deadline
+        # stops LAUNCHING further nodes in _drive_dag — in-flight nodes finish and their
+        # findings stand, the un-launched rest are SKIPPED — so the grow/decision loop
+        # is never starved of budget by an over-wide seed wave (previously the outer
+        # run timeout cancelled the whole seed mid-flight and growth never ran). A
+        # NON-DECIDING resource ceiling (d240): it bounds WHEN gathering stops, never
+        # WHAT the model decides. None (the default) = no gate, byte-identical drive.
+        self._dispatch_deadline: Optional[float] = None
+        # ONE-DRIVE PHASE-TRANSITION TRACE (RP-6c B1): the plan kind the transition authored into
+        # the live drive on research stop (e.g. "write_plan"), and the ids of the write-phase
+        # node(s) it appended (each carrying a per-node ``deliverable_path`` — the O1 writer-route
+        # discriminator). Empty/"" when no transition fired (no phase wiring, or the shape's next
+        # phase was terminal). Read by the run trace + tests; never gates the drive.
+        self._phase_authored_plan: str = ""
+        self._phase_authored_node_ids: list[str] = []
+        # s15/a21 — the SURFACED grow-error: when a grow() round raises (previously a SILENT
+        # swallow that masqueraded as an early-stop), the drive loop records "<Type>: <msg>"
+        # here AND logs the full traceback to stderr, so the served grow_trace + the gate SEE
+        # the crash instead of reading a clean stop. None when no round raised.
+        self._grow_error: Optional[str] = None
+        # RP-6c B1 — the SURFACED phase-transition error: when the write-authoring hook raises,
+        # the transition stops GRACEFULLY (the research findings stand) but the error is RECORDED
+        # here + the full traceback logged to stderr (never a silent swallow, d186). None when no
+        # transition ran or the hook succeeded.
+        self._phase_error: Optional[str] = None
+        # UNIVERSAL FINALIZE WIRING (d285 SB-4): the injected per-node finalizer. The runtime
+        # holds NO Planner/factory, so the ORCHESTRATION supplies this — a coroutine
+        # ``finalizer(node, result) -> {"summary": str, "memory_index": str}`` that (served)
+        # opens/continues the node's research memory by its brief index via SB-1's
+        # ``resolve_brief_memory`` and asks SB-2's ``Planner.finalize_node`` for the NODE's own
+        # model digest (fed the node's real output as ``work_digest``). After each node
+        # finishes, :meth:`_run_node` calls it and stamps the ``(summary, memory_index)`` pair
+        # onto the cached :class:`SubAgentResult`; a downstream node then receives ONLY that
+        # pair as its inter-node context (``_compose_task``). None (offline/unit, or a route
+        # that does not opt in) => no pair is produced and the handoff is byte-identical.
+        self._node_finalizer = node_finalizer
 
     # ------------------------------------------------------------------ #
     # small helpers over the shared state
@@ -3135,6 +4068,31 @@ class AgentRuntime:
         self._resolved_scopes[node.id] = cleaned
         return cleaned
 
+    def _is_report_writer(self, node: PlanNode) -> bool:
+        """A TOOL-LESS section writer of the SINGLE report deliverable (SB-6/d299/d301).
+
+        DELIVERY-CONTEXT membership: on the report write runtime (``deliverable_path`` is set by
+        chat_app.run_section_write_phase), every non-review, non-synthesizer node authors a section
+        of the one deliverable. Used ALONGSIDE the module-level :func:`_is_writer_node` to keep the
+        writer-chain accumulation (continuation path + finality) working now that report write nodes
+        are tool-less (the engine no longer stamps tool=file_write). Keyed on ``deliverable_path``
+        (write-phase EXCLUSIVE — set only on the write runtime), NOT ``chain_sources`` (a follow-up
+        READER also carries chain_sources to resolve prior sources; keying on it would over-broadly
+        treat a non-writer as a writer — d301). Pure DATA, NOT a spec/role/tool-name conditional.
+        False on any runtime without deliverable_path (research/gather/follow-up), so those stay
+        byte-identical.
+
+        RP-6c B1 (O1) — RE-SCOPED to the SHARED runtime: the write-phase target is now ALSO carried
+        PER-NODE (``node.deliverable_path``, stamped by the one-drive phase transition). In a shared
+        runtime where research + write coexist, the runtime-global ``deliverable_path`` is UNSET, so
+        membership keys on the NODE's own target — ONLY the write-phase node(s) are report writers;
+        the research nodes (no per-node target) are not. The legacy dedicated write_runtime (global
+        set, per-node unset) is unchanged."""
+        return bool(
+            (getattr(self, "deliverable_path", None) or getattr(node, "deliverable_path", None))
+            and node.role != ROLE_SYNTHESIZER
+        )
+
     # ------------------------------------------------------------------ #
     # single-node execution (idempotent + node-level self-heal)
     # ------------------------------------------------------------------ #
@@ -3160,6 +4118,19 @@ class AgentRuntime:
             dep: self._cache[dep].tool_value
             for dep in node.depends_on
             if dep in self._cache and self._cache[dep].tool_value is not None
+        }
+        # UNIVERSAL FINALIZE HANDOFF (d285 SB-4): each DIRECT upstream's ``(summary, memory_index)``
+        # pair (stamped by the injected finalizer below when that dep finished). This is the SOLE
+        # inter-node context payload — ``_compose_task`` renders it and drops the dep's clipped
+        # prose + folded fetched bodies. Built from ``depends_on`` only (d15 direct-upstream-only);
+        # a dep with no summary (no finalizer wired) is absent => byte-identical pre-SB-4 handoff.
+        upstream_memory = {
+            dep: {
+                "summary": self._cache[dep].summary or "",
+                "memory_index": self._cache[dep].memory_index or "",
+            }
+            for dep in node.depends_on
+            if dep in self._cache and getattr(self._cache[dep], "summary", None)
         }
         heal_log = HealLog(label=node.id)
 
@@ -3213,6 +4184,9 @@ class AgentRuntime:
                 # grounds its paraphrased task in the real objective.
                 overall_goal=self._overall_goal,
                 upstream_tool_values=upstream_tool_values,
+                # d285 SB-4: the direct-upstream (summary, memory_index) pairs — the SOLE
+                # inter-node context payload (collapses the clipped-prose + fetched-fold channels).
+                upstream_memory=upstream_memory,
                 max_verdict_repairs=self.max_verdict_repairs,
                 read_search_max_fetch=self.read_search_max_fetch,
                 # d65 served-route wiring: the note + chunked-read grounding lanes the
@@ -3223,9 +4197,6 @@ class AgentRuntime:
                 # read ranks a long source's chunks by MiniLM similarity to the node's
                 # sub-question (single in-window read) instead of the 75-chunk map/reduce.
                 read_embedder=_load_read_embedder() if self.chunked_read else None,
-                # N5: the reasoning no-fab verify lane (research gather-more + deliverable
-                # claim->source check) runs on the producer when the gather turned it ON.
-                verify_lane=self.verify_lane,
                 fetched_char_budget=self.fetched_char_budget,
                 upstream_input_char_budget=self.upstream_input_char_budget,
                 # WRITER SOURCE BUDGET (MSF/d89): the producer section node is fed its
@@ -3239,6 +4210,22 @@ class AgentRuntime:
                 # set on the runtime by the per-section write phase. A section node
                 # with ``source_ids`` is fed only its assigned subset near the cursor.
                 chain_sources=getattr(self, "chain_sources", None),
+                # CHAIN-NOTES (SA-4): the run's served research NOTES the write runtime carries
+                # (set by agentic.write_report_spa), so a write/review node that self-selects
+                # research_read binds read_notes via ctx['notes'] — replacing the retired
+                # per-run read_notes pre-registration. None for every non-report runtime.
+                chain_notes=getattr(self, "chain_notes", None),
+                # SB-6/d301: the write phase's single deliverable path — the delivery-context signal
+                # the TOOL-LESS write node routes to the served writer on (not chain_sources, which a
+                # follow-up reader also carries). RP-6c B1 (O1): PREFER the NODE's own target (stamped
+                # by the one-drive phase transition) over the runtime-global, so in a SHARED runtime
+                # ONLY the write-phase node(s) route to the writer and research nodes (no per-node
+                # target) keep the research route. The legacy dedicated write_runtime (global set,
+                # per-node unset) is byte-identical. None elsewhere.
+                deliverable_path=(
+                    getattr(node, "deliverable_path", None)
+                    or getattr(self, "deliverable_path", None)
+                ),
             )
             return await agent.run(inputs)
 
@@ -3249,6 +4236,20 @@ class AgentRuntime:
         if heal_log.healed:
             st.healed = True
             await self._emit(EVENT_NODE_HEALED, {"node_id": node.id, "heal": heal_log.as_dict()})
+        # UNIVERSAL FINALIZE (d285 SB-4): now that the node has produced a result, ask the
+        # injected finalizer for the NODE's own ``(summary, memory_index)`` digest (SB-2) and
+        # stamp it onto the cached result, so a downstream node receives ONLY that pair as its
+        # inter-node context. Fail-safe: a finalize error never breaks the run — the pair just
+        # stays unset (the downstream handoff then degrades to the pre-SB-4 channels). No-op when
+        # no finalizer is wired (offline/unit) or the node produced no usable output.
+        if self._node_finalizer is not None and res is not None and res.output is not None:
+            try:
+                pair = await self._node_finalizer(node, res)
+                if isinstance(pair, Mapping):
+                    res.summary = str(pair.get("summary") or "").strip() or None
+                    res.memory_index = str(pair.get("memory_index") or "").strip() or None
+            except Exception:  # noqa: BLE001 - a finalize must never break a node's run
+                pass
         self._cache[node.id] = res
         return res
 
@@ -3327,9 +4328,6 @@ class AgentRuntime:
             # node reads via the SAME relevance-select path the producer did, so it corrects
             # against the same top-ranked passages, not a re-read.
             read_embedder=_load_read_embedder() if self.chunked_read else None,
-            # N5: the inline CODER=REVIEWER runs the SAME no-fab verify lane as the
-            # producer so it corrects against the same grounded state, not a memoryless re-read.
-            verify_lane=self.verify_lane,
             fetched_char_budget=self.fetched_char_budget,
             # INTER-NODE CONTEXT (o4 fix): the inline reviewer must compose the SAME
             # fuller-upstream user turn the producer did, so it corrects against the
@@ -3625,7 +4623,19 @@ class AgentRuntime:
         promptly SKIPs nodes blocked by an upstream failure."""
         dag.validate()
         node_by_id = dag.by_id
-        remaining = {n.id: n for n in dag.nodes if n.id not in self._cache}
+        # A node already SKIPPED or CANCELLED in a PRIOR drive of this same run (the
+        # growable engine re-drives the SAME dag per grown wave) is TERMINAL — it must
+        # not be re-collected as work: re-launching it is the illegal skipped→running
+        # transition (live run-3 catch: a budget-skipped seed facet crashed the grown
+        # wave's drive). The grower may still author a NEW gap node for that facet by
+        # reasoning; the skipped node itself stays skipped.
+        remaining = {
+            n.id: n
+            for n in dag.nodes
+            if n.id not in self._cache
+            and self._state(n.id).status
+            not in (NodeStatus.SKIPPED, NodeStatus.CANCELLED)
+        }
         # Nodes already in cache are DONE for this drive (idempotent short-circuit).
         for n in dag.nodes:
             if n.id in self._cache:
@@ -3635,6 +4645,8 @@ class AgentRuntime:
                     # PENDING → mark done via RUNNING-less path is illegal; set directly
                     st.status = NodeStatus.DONE
         running: dict[asyncio.Task, str] = {}
+        # Nodes actually LAUNCHED by this drive — the budget gate's at-least-one floor.
+        launched_this_drive = 0
 
         while remaining or running:
             # SHAPE-FAITHFUL DISPATCH (s3/b1): the deterministic, model-independent
@@ -3651,7 +4663,40 @@ class AgentRuntime:
                 running.values(),
                 mode=self.execution,
             )
-            for node in dispatch.nodes:
+            # BUDGET-RESERVING DISPATCH GATE (see _dispatch_deadline): with a deadline
+            # set (only the growable research drives set one) the drive runs SINGLE-FILE
+            # — one node at a time, since concurrent gathers on the one shared local GPU
+            # only serialize at the transport and then all die together at the outer
+            # timeout — and, once the slice is spent AND at least one node has launched,
+            # no further node launches: in-flight work finishes (its findings stand) and
+            # the un-launched rest are SKIPPED with an explicit budget reason. The
+            # at-least-one guarantee means a tiny budget still gathers SOMETHING (the
+            # graceful-partial contract). No deadline (every non-growable drive) →
+            # byte-identical dispatch.
+            gated = self._dispatch_deadline is not None
+            past_deadline = (
+                gated and asyncio.get_running_loop().time() > self._dispatch_deadline
+            )
+            if past_deadline and launched_this_drive > 0 and not running and remaining:
+                for nid in list(remaining):
+                    st = self._state(nid)
+                    if st.status == NodeStatus.PENDING:
+                        st.transition(NodeStatus.SKIPPED)
+                        st.error = "skipped: wall-clock slice spent (budget reserved for growth)"
+                        await self._emit(
+                            EVENT_NODE_SKIPPED, {"node_id": nid, "blocked_by": "budget"}
+                        )
+                    del remaining[nid]
+                break
+            launchable = dispatch.nodes
+            if gated:
+                if past_deadline and launched_this_drive > 0:
+                    launchable = []
+                elif running:
+                    launchable = []  # single-file under a deadline: one node in flight
+                else:
+                    launchable = dispatch.nodes[:1]
+            for node in launchable:
                 if node.id not in remaining:
                     continue
                 blocked = [d for d in node.depends_on if self._is_blocking(d)]
@@ -3664,6 +4709,7 @@ class AgentRuntime:
                     continue
                 st = self._state(node.id)
                 self._launch_seq += 1
+                launched_this_drive += 1
                 st.launch_seq = self._launch_seq
                 st.transition(NodeStatus.RUNNING)
                 # TRACING (s6/b2): open the node's child span HERE (under the
@@ -3774,8 +4820,12 @@ class AgentRuntime:
             if seed_nodes:
                 dag.nodes = list(seed_nodes)
                 # Recompute the writer-chain maps over the replaced node set (these are research
-                # nodes → no writers, but keep the maps consistent with the live DAG).
-                self._writer_ids = {n.id for n in dag.nodes if _is_writer_node(n)}
+                # nodes → no writers, but keep the maps consistent with the live DAG). SB-6/d299:
+                # the report-writer clause is inert here (research seed runtime has no chain_sources).
+                self._writer_ids = {
+                    n.id for n in dag.nodes
+                    if _is_writer_node(n) or self._is_report_writer(n)
+                }
                 self._dependent_ids = {}
                 for n in dag.nodes:
                     for dep in n.depends_on:
@@ -3800,27 +4850,49 @@ class AgentRuntime:
                 r = self._cache.get(n.id)
                 tv = getattr(r, "tool_value", None) if r is not None else None
                 if isinstance(tv, Mapping):
-                    total += len(tv.get("fetched") or [])
+                    # SOURCE-AGNOSTIC (as4 de-web): count web ``fetched`` OR a generic
+                    # ``records``/``chunks`` artifact, so the counter works for any gather source.
+                    total += len(tv.get("fetched") or tv.get("records") or tv.get("chunks") or [])
             return total
 
-        async def _emit_grow_layer(idx: int, dispatched: int, stop: Optional[str]) -> None:
+        async def _emit_grow_layer(
+            idx: int, dispatched: int, stop: Optional[str],
+            *, error: Optional[str] = None,
+        ) -> None:
             # P2-5c — advisory per-layer progress so a long live run is OBSERVABLE (layer index,
             # nodes dispatched this wave, cumulative nodes/sources, elapsed wall-clock, stop).
+            # s15/a21 — when a grow round RAISED, ``error`` carries the surfaced "<Type>: <msg>"
+            # so the event stream shows the crash (no longer a silent early-stop).
             # Best-effort: observability never gates or breaks the drive.
             try:
-                await self._emit(EVENT_GROW_LAYER, {
+                payload: dict[str, Any] = {
                     "layer": idx,
                     "nodes_dispatched": dispatched,
                     "nodes_total": len(dag.nodes),
                     "sources_so_far": _sources_so_far(),
                     "elapsed_s": round(loop_clock() - t0, 1),
                     "stop_reason": stop,
-                })
+                }
+                if error is not None:
+                    payload["error"] = error
+                await self._emit(EVENT_GROW_LAYER, payload)
             except Exception:  # noqa: BLE001 — observability only; never breaks the drive
                 pass
 
         # Seed wave (layer 1): the decomposed children (or the unrolled whole-goal seed).
-        await self._drive_dag(dag)
+        # The seed gets a bounded SLICE of the wall-clock budget (live 6GB catch: an
+        # over-wide seed used to consume the WHOLE budget and the outer run timeout then
+        # cancelled it mid-flight — growth never ran and stop_reason stayed empty). Past
+        # the slice, in-flight gathers finish and un-launched ones are SKIPPED (their
+        # facets stand un-gathered; the grow loop can still author them as gap nodes if
+        # the model reasons they matter). Fraction env-tunable; non-deciding (d240).
+        seed_slice = budget * _SEED_BUDGET_FRACTION if budget > 0 else 0.0
+        if seed_slice > 0:
+            self._dispatch_deadline = t0 + seed_slice
+        try:
+            await self._drive_dag(dag)
+        finally:
+            self._dispatch_deadline = None
         await _emit_grow_layer(1, len(dag.nodes), None)
         max_layers = max(1, int(getattr(grower, "max_layers", 1) or 1))
         layer = 1
@@ -3830,18 +4902,42 @@ class AgentRuntime:
             if budget > 0 and (loop_clock() - t0) >= budget:
                 budget_hit = True
                 break
-            # M1 (P2-5b-review) — wrap grow() so a transport exception MID-GROWTH stops growth
-            # GRACEFULLY with the partial findings already gathered, instead of propagating up
-            # and aborting the run (the seed + earlier waves' findings/sources stand).
+            # M1 (P2-5b-review) — wrap grow() so a failure MID-GROWTH stops growth GRACEFULLY with
+            # the partial findings already gathered, instead of propagating up and aborting the run
+            # (the seed + earlier waves' findings/sources stand).
+            #
+            # s15/a21 (d186 — NO swallowed crash): the previous wrap caught the exception SILENTLY
+            # (no traceback), so a layer-2 grow() crash masqueraded as an ordinary early-stop —
+            # grow_layers stuck at 1 — and cascaded into "under-measured" notes-graph / prune
+            # signals at the a14 gate. The behaviour stays graceful (a transient transport blip mid
+            # -growth must not abort the whole run), but it is NO LONGER SILENT: the FULL traceback
+            # is logged to stderr and the surfaced error is RECORDED on the runtime + grower + the
+            # grow-layer event, so the served grow_trace and the gate SEE the crash and route to the
+            # concrete fix (never to "accept the ceiling"). The spec rule — never swallow an
+            # exception — is honoured: it is surfaced, not hidden.
             try:
                 new_nodes, stop_reason = await grower.grow(dag, self._cache, layer)
-            except Exception:  # noqa: BLE001 — graceful-partial on mid-growth failure
+            except Exception as exc:  # noqa: BLE001 — graceful-partial, but SURFACED (never silent)
+                err_text = traceback.format_exc()
+                print(
+                    f"[grow-error] DagGrower.grow raised while expanding to layer {layer + 1} "
+                    f"(growth stops here; the seed + earlier waves' findings stand):\n{err_text}",
+                    file=sys.stderr, flush=True,
+                )
+                self._grow_error = f"{type(exc).__name__}: {exc}"
+                try:
+                    grower.grow_error = self._grow_error  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — duck-typed grower; advisory only
+                    pass
                 if getattr(grower, "stop_reason", None) is None:
                     try:
                         grower.stop_reason = "grow_error"
                     except Exception:  # noqa: BLE001 — duck-typed grower; advisory trace only
                         pass
-                await _emit_grow_layer(layer + 1, 0, getattr(grower, "stop_reason", "grow_error"))
+                await _emit_grow_layer(
+                    layer + 1, 0, getattr(grower, "stop_reason", "grow_error"),
+                    error=self._grow_error,
+                )
                 break
             if not new_nodes:
                 # agent_sufficient / no_expansion — the grower recorded the reason.
@@ -3849,8 +4945,16 @@ class AgentRuntime:
                 break
             # APPEND the next wave onto the live DAG (the relaxed invariant) and drive it.
             # validate() (run at _drive_dag entry) re-asserts acyclicity over the grown set.
+            # The grown wave honors the WHOLE remaining budget as its dispatch deadline
+            # (same budget-reserving gate as the seed slice) so it, too, ends gracefully
+            # inside the budget instead of being cancelled by the outer run timeout.
             dag.nodes.extend(new_nodes)
-            await self._drive_dag(dag)
+            if budget > 0:
+                self._dispatch_deadline = t0 + budget
+            try:
+                await self._drive_dag(dag)
+            finally:
+                self._dispatch_deadline = None
             layer += 1
             await _emit_grow_layer(layer, len(new_nodes), None)
         else:
@@ -3869,6 +4973,84 @@ class AgentRuntime:
                 pass
             await _emit_grow_layer(layer + 1, 0, "budget")
         self._grow_layers = layer
+        # ONE-DRIVE PHASE TRANSITION (RP-6c B1) — ADDITIVE post-research-stop step. The research
+        # grow loop ABOVE is BYTE-PRESERVED (P2-5b parity); ONLY this post-stop behaviour is new.
+        # When a PhaseTransition is wired, on research stop the drive authors the shape's declared
+        # NEXT phase's sub-DAG into this SAME live run (Bug B/Bug C dissolve — one drive, one write
+        # node, research rides as node context). No wiring → no-op (byte-identical research drive).
+        await self._author_next_phase(dag)
+
+    async def _author_next_phase(self, dag: PlanDAG) -> None:
+        """RP-6c B1 — the ONE-DRIVE phase-transition authoring step (see :class:`PhaseTransition`).
+
+        On research grow-loop stop, if a :class:`PhaseTransition` is wired AND the SHAPE's declared
+        phase order (``next_plan(first_kind)``) names a further phase, author that phase's sub-DAG
+        (MODEL-authored via the injected ``author`` hook — the engine authors NO structure), stamp
+        the write-phase delivery target onto each authored node (O1 — so ONLY these nodes take the
+        writer route in this SHARED runtime; research nodes carry none and keep the research route),
+        depend the deps-less authored nodes on the current research SINKS (growing visibility over
+        all of research), append them to the LIVE dag, and DRIVE them in the SAME run
+        (:meth:`_drive_dag` short-circuits the cached research nodes, so only the write phase runs).
+
+        No wiring, or a TERMINAL next phase (``"done"``) → no-op, byte-identical to a research-only
+        growable drive. A hook failure stops the transition GRACEFULLY (the research findings stand)
+        and is SURFACED on ``self._phase_error`` + stderr (never a silent swallow, d186)."""
+        pt = self._phase_transition
+        if pt is None:
+            return
+        try:
+            next_plan = pt.next_plan(pt.first_kind)
+        except Exception:  # noqa: BLE001 — a shape-order read must never break the drive
+            return
+        if not next_plan or next_plan in ("done", pt.first_kind):
+            # The shape declares no further phase after research → stop here (byte-identical).
+            return
+        # AUTHOR the next phase's sub-DAG (the MODEL authors the topology; the engine only INVOKES
+        # the authorer the shape's phase names). A hook failure is graceful-but-SURFACED.
+        try:
+            authored = await pt.author(self, dag, next_plan)
+        except Exception as exc:  # noqa: BLE001 — graceful-partial, but SURFACED (never silent)
+            print(
+                f"[phase-transition] author({next_plan!r}) raised (transition stops; the research "
+                f"findings gathered so far stand):\n{traceback.format_exc()}",
+                file=sys.stderr, flush=True,
+            )
+            self._phase_error = f"{type(exc).__name__}: {exc}"
+            return
+        new_nodes = [n for n in (authored or []) if isinstance(n, PlanNode)]
+        if not new_nodes:
+            return
+        # Current research SINKS = nodes nothing (in the pre-transition DAG) depends on — the write
+        # phase depends on these so it runs AFTER research with full visibility. Structural ORDERING
+        # data (write follows research), never content authoring.
+        new_ids = {n.id for n in new_nodes}
+        depended = {dep for n in dag.nodes for dep in n.depends_on}
+        sink_ids = tuple(n.id for n in dag.nodes if n.id not in depended and n.id not in new_ids)
+        # O1 — STAMP the per-node write-phase delivery target (frozen PlanNode → dataclasses.replace)
+        # so ONLY these nodes route to the writer; and wire deps-less nodes onto the research sinks.
+        stamped: list[PlanNode] = []
+        for n in new_nodes:
+            changes: dict[str, Any] = {}
+            if pt.deliverable_path and not n.deliverable_path:
+                changes["deliverable_path"] = pt.deliverable_path
+            if not n.depends_on and sink_ids:
+                changes["depends_on"] = sink_ids
+            stamped.append(replace(n, **changes) if changes else n)
+        # APPEND onto the live DAG (the relaxed invariant, exactly as the grow loop appends a wave).
+        dag.nodes.extend(stamped)
+        # Keep the writer-chain / dependent maps consistent with the grown node set (mirrors the
+        # seed_layer recompute above) so the appended write node(s) are seen as writers.
+        self._writer_ids = {
+            n.id for n in dag.nodes if _is_writer_node(n) or self._is_report_writer(n)
+        }
+        self._dependent_ids = {}
+        for n in dag.nodes:
+            for dep in n.depends_on:
+                self._dependent_ids.setdefault(dep, set()).add(n.id)
+        self._phase_authored_plan = next_plan
+        self._phase_authored_node_ids = [n.id for n in stamped]
+        # DRIVE the freshly-appended write phase in the SAME run (cached research short-circuits).
+        await self._drive_dag(dag)
 
     # ------------------------------------------------------------------ #
     # lifecycle: cancel + clean teardown
@@ -3986,7 +5168,17 @@ class AgentRuntime:
         # set of writer node ids + the dependents map are read once here (the
         # decomposition lives in the DAG topology, not in code) and consulted in
         # :meth:`_run_node` to decide each writer's continuation path + finality.
-        self._writer_ids = {n.id for n in dag.nodes if _is_writer_node(n)}
+        # SB-6/d299 — REPORT WRITERS are now TOOL-LESS, so ``_is_writer_node`` (keyed on
+        # tool=file_write / role=SYNTH) no longer recognizes them. Re-establish their writer-chain
+        # membership by DELIVERY-CONTEXT DATA: on the report write runtime (``chain_sources`` set),
+        # every non-review, non-synth node is a section writer of the SINGLE deliverable. This keeps
+        # the continuation-path + append-ordering accumulation BYTE-IDENTICAL to the pre-SB-6
+        # tool-stamped path (only the discriminator moves from the engine tool-stamp to the write
+        # phase's own DATA). On the research runtime (no chain_sources) the extra clause is inert.
+        self._writer_ids = {
+            n.id for n in dag.nodes
+            if _is_writer_node(n) or self._is_report_writer(n)
+        }
         self._dependent_ids = {}
         for n in dag.nodes:
             for dep in n.depends_on:
@@ -4044,6 +5236,18 @@ class AgentRuntime:
                         await asyncio.wait_for(driver, timeout=timeout)
                     except asyncio.TimeoutError:
                         out.timed_out = True
+                        # TRUTHFUL TRACE (live catch): a growable drive killed by the
+                        # OUTER run timeout used to leave stop_reason EMPTY, which the
+                        # trace then mis-read as a model stop. Record the budget stop.
+                        if (
+                            getattr(dag, "growable", False)
+                            and self._grower is not None
+                            and getattr(self._grower, "stop_reason", None) is None
+                        ):
+                            try:
+                                self._grower.stop_reason = "budget"
+                            except Exception:  # noqa: BLE001 — advisory trace only
+                                pass
                 else:
                     await driver
             finally:

@@ -1,0 +1,34 @@
+# =============================================================================
+# SCHEDULE-LEG shape (RP-4c/d341) — the SCHEDULE-ONLY authoring shape.
+# =============================================================================
+# The selector picks this shape for a purely RECURRING / SCHEDULED request
+# ('every morning at 8am …', 'daily …', 'schedule a weekly …'). UNLIKE the
+# generic `linear` shape, this one carries a `decompose_methodology` — the
+# SCHEDULE-ONLY AUTHORING doctrine the incremental planner substitutes into its
+# authoring procedure (mirroring how the deep-research shape's methodology drives
+# the tree decompose). That is what makes the planner author ONE cron_add node
+# and NOT the generic gather→combine→deliver run-now plan (RP-4c root cause: the
+# hardcoded generic recipe used to override the schedule mandate at authoring).
+# Behaviour lives HERE (definition layer); the engine only substitutes this text.
+
+name = "schedule-leg"
+description = """Schedule the WHOLE task to run on a repeating cadence and run \
+NOTHING now: author ONE cron_add step that stores the entire task as its prompt. \
+Choose this for a purely recurring/scheduled request ('every morning …', \
+'daily at 8am …', 'schedule a weekly …') — never a run-now research/gather shape."""
+
+# One node in flight (there is only one node anyway).
+execution = "sequential"
+
+# The SCHEDULE-ONLY authoring methodology — substituted into the incremental
+# authoring procedure, taking PRECEDENCE over the generic gather→deliver recipe.
+decompose_methodology = """This is a SCHEDULE-ONLY request: the user wants the whole task run on a \
+REPEATING schedule, and NOTHING runs now. Author EXACTLY ONE step, then finalize: a single step whose \
+`tool` is `cron_add` and whose `spec` is `recurring-scheduler`. Set that step's `task` to the ENTIRE \
+recurring action as a self-contained DO-THE-WORK instruction — exactly what a fresh agent must read to \
+do the COMPLETE job on each fire (e.g. 'research the latest AI news and email me a summary') — with the \
+scheduling wrapper STRIPPED: no 'schedule a recurring task to …' framing, and do NOT put the cadence/time \
+in the task (the cadence goes in the cron `schedule` argument, e.g. a daily 8am brief → '0 8 * * *'). Do \
+NOT author any run-now gather/search/fetch/read/write/email steps and no combine step — the scheduled \
+fire re-composes the whole task itself, so any extra run-now node is WRONG. ONE cron_add step, then \
+finalize_plan. (Author run-now steps too ONLY if the user EXPLICITLY asked for BOTH now AND recurring.)"""

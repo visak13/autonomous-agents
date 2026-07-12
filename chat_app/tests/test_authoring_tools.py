@@ -39,8 +39,6 @@ def _shape_reply(name: str, execution: str = "concurrent", description: str = "x
             "description": description,
             "execution": execution,
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
@@ -75,8 +73,6 @@ def test_shape_session_seed_refine_freeze(tmp_path):
             "description": "now iterate in deepening rounds with a critic",
             "execution": "deep-research",
             "max_iter": 6,
-            "round_roles": ["research", "critic"],
-            "final_roles": ["research", "synthesis", "verify"],
         }
     )
     transport = FakeTransport(

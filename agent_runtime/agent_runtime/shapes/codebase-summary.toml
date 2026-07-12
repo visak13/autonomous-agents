@@ -1,0 +1,57 @@
+# =============================================================================
+# CODEBASE-SUMMARY shape (s16/aflex — d239/d241 generic-spine FLEX probe)
+# =============================================================================
+# A NON-WEB execution DISCIPLINE the planner SELECTS when the task is to READ a
+# LOCAL codebase / directory of files and produce a written summary of it — NOT a
+# web investigation and NOT a quick chat answer.
+#
+# It is the live proof of the d239 spine claim: a new capability over a DIFFERENT
+# (non-web) gather source works by ADDING this shape + the `codebase` bundle + an
+# output spec ONLY — ZERO orchestration/engine edits. The planner AUTHORS the
+# topology by reasoning (no pre-baked node graph); this file only declares the
+# execution DISCIPLINE + the intent doctrine the planner reasons over.
+#
+# Mechanics (no web, no grower):
+#   * SEQUENTIAL dispatch — one node in flight at a time (read, then write, then
+#     the default reviewer), like `linear`.
+#   * The READ node is a WORKER (not a web researcher): it SELF-SELECTS the
+#     `codebase` bundle (list_dir / read_dir / read_file) and reads the real files,
+#     driven by the GENERIC self-select loop + loaded-tool dispatch — no web tools.
+#   * The WRITE node synthesizes the summary deliverable from the read node's
+#     findings (a format spec — e.g. codebase-summary / markdown-writer — shapes it).
+#   * The default last-step REVIEWER emits the plan status; the terminal synthesizer
+#     finalizes. There is NO deep-research growth and NO web search on this route.
+
+name = "codebase-summary"
+description = """Read a LOCAL codebase or directory of files and write a summary of \
+it (what the files/modules do, how they fit together), grounded in the real on-disk \
+source — NOT a web search and NOT a one-line chat reply. Choose this when the user \
+points at a local path/directory/repository and asks to read, analyze, document or \
+summarize the code there. AUTHOR EXACTLY TWO sequential steps, no web tool on either: \
+(1) a READ step with role "worker" and NO tool — it self-selects the "codebase" bundle \
+(get_bundles name="codebase") and READS the files with read_dir/read_file, producing \
+file-by-file findings attributed to each file path; (2) a WRITE step with tool \
+"file_write" that depends_on step 1 — it writes the Markdown summary to the requested \
+file, grounded in step 1's findings. Do not add a separate web search/gather step; the \
+codebase IS the source, read directly by the worker."""
+
+# Strict single-file dispatch — read, then write, then review; no fan-out, no web.
+execution = "sequential"
+
+# The READ→WRITE authoring methodology (RP-AUDIT F2 / d341). PROMOTED from the shape
+# DESCRIPTION into a `decompose_methodology` so the incremental planner substitutes it
+# into its authoring procedure with PRECEDENCE over the (neutral) generic fallback —
+# a DESCRIPTION only sits ALONGSIDE the fallback and cannot replace it; only a
+# decompose_methodology does (the F1/RP-4c mechanism in _system/_initial_user/
+# _finalize_user). This is what stops a non-web read→write task being mis-authored as a
+# gather→combine→deliver plan. Behaviour lives HERE (definition layer); the engine only
+# substitutes this text — no shape-name conditional, no engine-authored structure.
+decompose_methodology = """This is a READ-then-WRITE codebase task: the LOCAL codebase/directory IS the \
+source — there is NO web search and NO gather→combine fan-out. Author EXACTLY TWO sequential steps, then \
+finalize: (1) a READ step with role "worker", NO tool, and depends_on [] — it self-selects the "codebase" \
+bundle (call get_bundles with name="codebase") and READS the real on-disk files with read_dir/read_file, \
+producing file-by-file findings attributed to each file path; (2) a WRITE step with tool "file_write" and \
+spec "codebase-summary" that depends_on step 1 — it writes the Markdown summary to the requested file, \
+grounded ONLY in step 1's findings. Do NOT author any web search/fetch step, any extra gather step, or a \
+separate combine step — the worker reads the codebase directly in step 1 and step 2 writes the summary from \
+those findings. TWO steps (read → write), then finalize_plan."""

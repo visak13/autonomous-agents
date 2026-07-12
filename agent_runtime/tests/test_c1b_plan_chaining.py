@@ -27,7 +27,6 @@ from agent_runtime.runtime import AgentRuntime, _is_writer_node
 from agent_runtime.synth_tools import (
     DONE_SENTINEL,
     html_close_gap,
-    strip_wrapper_closers,
 )
 from llm_framework import FakeTransport
 from reactive_tools import EventPlane, ToolHook, register_agentic_tools
@@ -141,70 +140,12 @@ def test_multipage_html_defers_close_to_final_page(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# c1b DEFECT REPRO: the small model writes </body></html> into EVERY page it
-# finishes. A non-final page's wrapper closers must be STRIPPED so the assembled
-# file has exactly ONE trailing </body></html> (the c1br review's failure mode:
-# `</html><section …>` mid-document).
+# RP-AUDIT F3 (d319/d341): ``strip_wrapper_closers`` was a DEAD HTML-format-baked
+# output-MODIFIER (its MAIN-loop call site was retired by RP-2/d319; no shipped
+# caller remained). It has been DELETED from synth_tools along with its unit test
+# — the engine strips/rewrites nothing. (test_sf1_reactive_coherence_retired now
+# fails if it is re-defined or re-exported.)
 # --------------------------------------------------------------------------- #
-# Each page is a FULLY self-closed document the way E4B actually emits it.
-_HTML_SELFCLOSED_P1 = (
-    "<!DOCTYPE html><html><head><title>Doc</title></head><body>"
-    "<section id=\"intro\"><h1>Page 1</h1><p>intro</p></section></body></html>"
-)
-_HTML_SELFCLOSED_P2 = (
-    "<section id=\"more\"><h1>Page 2</h1><p>more</p></section></body></html>"
-)
-
-
-def test_strip_wrapper_closers_unit():
-    """The pure helper removes ONLY the document-wrapper closers, leaving head/body
-    content and other tags intact; case-insensitive; tidies trailing whitespace."""
-    assert strip_wrapper_closers("<p>x</p></body></html>") == "<p>x</p>"
-    assert strip_wrapper_closers("<p>x</p></BODY></HTML>\n\n") == "<p>x</p>"
-    # </head> and </section> are NOT wrapper closers — untouched.
-    kept = "<head><title>t</title></head><section>y</section>"
-    assert strip_wrapper_closers(kept) == kept
-    # interior (non-trailing) closers are removed too (dedupe to a single pair upstream).
-    assert strip_wrapper_closers("</body></html><section>z</section>") == "<section>z</section>"
-    # a fragment with no wrapper is returned unchanged (rstripped).
-    assert strip_wrapper_closers("<p>plain</p>") == "<p>plain</p>"
-
-
-def test_multipage_html_strips_nonfinal_wrapper_closers(tmp_path):
-    """c1br defect fix: page1 self-closes (</body></html>), but as a NON-final page
-    those closers are stripped before write — so the assembled doc has EXACTLY one
-    trailing </body></html>, is well-formed, and has no interior </html><section…>."""
-
-    def reply(messages, **opts):
-        convo = "\n".join(str(m.get("content") or "") for m in messages)
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        page = _HTML_SELFCLOSED_P2 if _CONT_MARK in convo else _HTML_SELFCLOSED_P1
-        return page if n == 0 else DONE_SENTINEL
-
-    dag = PlanDAG(
-        nodes=[
-            PlanNode(id="h1", task="Write page 1 of doc.html", tool="file_write",
-                     depends_on=()),
-            PlanNode(id="h2", task="Write page 2 of doc.html", tool="file_write",
-                     depends_on=("h1",)),
-        ],
-        goal="Write a multi-page HTML document to doc.html",
-    )
-    rt = AgentRuntime(transport=FakeTransport([reply]), hook=_hook(tmp_path),
-                      max_concurrency=1)
-    out = _run(rt.run(dag))
-    assert out.ok, out.failed
-
-    body = (tmp_path / "doc.html").read_text(encoding="utf-8")
-    assert "<h1>Page 1</h1>" in body and "<h1>Page 2</h1>" in body
-    # EXACTLY ONE trailing wrapper pair — page1's self-close was stripped.
-    assert body.count("</html>") == 1 and body.count("</body>") == 1
-    assert html_close_gap(body) == []
-    assert body.rstrip().endswith("</html>")
-    # no interior close mid-document (the exact c1br defect signature).
-    assert "</html><section" not in body and "</body><section" not in body
-
-
 def test_single_file_writer_is_unaffected_no_premature_close(tmp_path):
     """REGRESSION FLOOR: a lone writer (no upstream/downstream writer) keeps the exact
     pre-c1b behaviour — fresh overwrite, the close-gate fires (final), one document."""

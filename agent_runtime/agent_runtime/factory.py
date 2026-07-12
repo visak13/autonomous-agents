@@ -39,19 +39,29 @@ class PlanError(ValueError):
     """A plan/DAG is structurally invalid (bad refs, cycle, duplicate id)."""
 
 
-# Node ROLES (d48 3-role collapse). THREE roles, period — PLANNER, WORKER,
-# SYNTHESIZER — but PLANNER is the planning STAGE (shape selector + incremental
-# planner), not a per-node field, so at the NODE level there are only TWO:
-# ``worker`` and ``synthesizer``. Node BEHAVIOR comes from the node's SPEC(s) +
-# task framing + reasoning, NOT a per-role code switch (the 6-role enum
-# {research,critic,worker,reviewer,synthesis,verify} and its per-role output
-# schemas / verdict path are RETIRED). The deep-research per-round behaviors
-# (research/critic/verify) are now POSITIONS the shape declares
-# (``shapes.VALID_POSITIONS``), mapped onto worker nodes with the matching framing
-# injected into the task (prompting). Roles are NOT LLM-extensible (Q-A: bounded) —
-# this set is fixed. Defined HERE (pure data, no model) so ``factory`` stays lean
-# and ``roles`` can import it without a cycle.
-VALID_ROLES: frozenset[str] = frozenset({"worker", "synthesizer"})
+# Node ROLES = node types (d213/d215, re-expanded from the d48 collapse). The ROLE
+# lives in the node type; there are FIVE, sitting in three places:
+#   * PLANNER     — the planning STAGE (shape selector + incremental planner). It
+#                   drives the iterative loop; it is NOT an in-plan node, so it is
+#                   intentionally ABSENT from VALID_ROLES.
+#   * in-plan     — RESEARCHER, WORKER, REVIEWER: the ONLY roles the planner places
+#                   inside a plan via add_step (d215). REVIEWER is the default LAST
+#                   STEP of every plan and emits the plan's final status.
+#   * SYNTHESIZER — the TERMINAL stage, materialised as a single role=synthesizer
+#                   node that runs ONCE after the planner loop exits (d215). The
+#                   planner never add_steps it; the framework builds it. It stays a
+#                   legal PlanNode.role so that terminal node validates.
+# Node BEHAVIOR still comes from the node's SPEC(s) + task framing + reasoning, NOT a
+# per-role code switch (the 6-role enum {research,critic,worker,reviewer,synthesis,
+# verify} and its per-role output schemas / verdict path stay RETIRED — all five
+# roles emit RAW content). The deep-research per-round behaviors (research/critic/
+# verify) remain POSITIONS the shape declares (``shapes.VALID_POSITIONS``), composed
+# onto the in-plan nodes via the matching framing injected into the task (prompting).
+# Roles are NOT LLM-extensible (Q-A: bounded) — this set is fixed. Defined HERE (pure
+# data, no model) so ``factory`` stays lean and ``roles`` imports it without a cycle.
+VALID_ROLES: frozenset[str] = frozenset(
+    {"researcher", "worker", "reviewer", "synthesizer"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,13 +102,18 @@ class PlanNode:
         Optional kwargs for the primary tool call (what phi would emit alongside
         a tool hint). Kept JSON-shaped.
     role:
-        Optional NODE ROLE (d48) — one of :data:`VALID_ROLES` (``worker`` |
-        ``synthesizer``) or ``None``. The role does NOT change which specialization
-        loads (that is ``specs``); ``synthesizer`` routes to the terminal
-        raw-content file/answer loop, anything else (``worker``/``None``) is a plain
-        producer step whose behavior comes from its SPEC(s) + task + reasoning.
-        ``None`` = a plain producer step (byte-compatible with every existing
-        acyclic plan). Only a known role string is accepted.
+        Optional NODE ROLE = node type (d213/d215) — one of :data:`VALID_ROLES`
+        (``researcher`` | ``worker`` | ``reviewer`` | ``synthesizer``) or ``None``.
+        The role does NOT change which specialization loads (that is ``specs``); it
+        selects the node TYPE: ``researcher`` routes to the agentic research/gather
+        loop, ``reviewer`` is the default last-step that inspects+fixes the
+        deliverable and emits the plan's final status, ``synthesizer`` routes to the
+        terminal raw-content file/answer loop, ``worker``/``None`` is a plain
+        producer step whose behavior comes from its SPEC(s) + task + reasoning. The
+        planner only ever add_steps ``researcher``/``worker``/``reviewer`` (d215);
+        ``synthesizer`` is the framework-built terminal node. ``None`` = a plain
+        producer step (byte-compatible with every existing acyclic plan). Only a
+        known role string is accepted.
     needs_spec:
         Optional FREE-TEXT descriptor of a specialist this step REQUIRES when NO
         registered specialization in the planner's lookup fits (s4 RC8 / blueprint
@@ -122,6 +137,37 @@ class PlanNode:
     role: Optional[str] = None
     needs_spec: Optional[str] = None
     source_ids: tuple[int, ...] = ()
+    # MEMORY-BY-HANDLE (d221): the stable handle of the research memory this node is
+    # BOUND to. A research node carries the handle of the memory it WRITES into; a
+    # downstream write/review node carries the handle of the memory it READS from (via
+    # the read-via-tools surface — load_source / research_read — NEVER a verbatim dump,
+    # d192/d202). The runtime renders a "Binded research memory: <handle>" line into the
+    # node's context (:meth:`SubAgent._compose_task`) so the model knows which memory to
+    # read. ``None``/empty = the node is not bound to a research memory (the common case
+    # for a plain worker), and the context line is omitted (byte-identical to pre-d221).
+    research_memory_handle: Optional[str] = None
+    # MEMORY-INDEX (d285 SB-3): the planner's REASONED CHOICE, carried on the step BRIEF,
+    # of which research memory this step works in — an existing INDEX (→ CONTINUE the
+    # memory a prior step built, reasoning over the upstream summary+index) or the textual
+    # ``<<NEW>>`` sentinel (→ START a fresh, distinct research line). This is the AUTHORED
+    # choice (data the planner emits), distinct from ``research_memory_handle`` (the
+    # RESOLVED handle a node is bound to). It resolves THROUGH SB-1's store via
+    # :func:`~agent_runtime.research_tree.resolve_brief_memory` (an index continues that
+    # memory; <<NEW>> mints a fresh one). Empty string = unspecified (treated as <<NEW>>);
+    # the engine stamps NO index here (anti-fabrication, d10-clean — the planner chooses).
+    memory_index: str = ""
+    # WRITE-PHASE DELIVERY TARGET (RP-6c B1 / O1). The single-file path this node delivers, set
+    # by the one-drive phase-transition step (:class:`AgentRuntime._phase_transition`) on the
+    # write-phase node(s) it appends — decided from the shape's declared ``spec_role_for('write')
+    # == 'writer'`` (RP-6b), NOT a spec-name conditional. This RE-SCOPES the SB-6/d301 write-route
+    # discriminator from the runtime-global ``deliverable_path`` to the NODE: in a SHARED runtime
+    # where research nodes and the write node coexist, ONLY a node carrying this DATA routes to the
+    # served writer (:meth:`SubAgent._run_file_delivery`); research nodes (no ``deliverable_path``)
+    # keep the research route. ``None`` for every research/gather/follow-up node and every node on
+    # the legacy dedicated write_runtime path (which still keys on the runtime-global signal), so
+    # both are byte-identical. It is structural DELIVERY-CONTEXT DATA (this node delivers one file),
+    # not a spec/role/tool-name branch — it passes the d293 anti-fabrication grep gate.
+    deliverable_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -174,6 +220,21 @@ class PlanNode:
             if v > 0 and v not in clean_sids:
                 clean_sids.append(v)
         object.__setattr__(self, "source_ids", tuple(clean_sids))
+        # MEMORY-BY-HANDLE (d221): a blank/whitespace handle is no handle (None), so a
+        # stray empty string never renders an empty "Binded research memory:" line.
+        if self.research_memory_handle is not None:
+            h = str(self.research_memory_handle).strip()
+            object.__setattr__(self, "research_memory_handle", h or None)
+        # MEMORY-INDEX (d285 SB-3): keep the planner-authored choice as a clean string.
+        # A stray non-str / blank becomes "" (unspecified → the resolver treats it as
+        # <<NEW>>); no sentinel logic here — canonicalization lives at the authoring
+        # boundary (plan_tools) and the resolver (research_tree), so the node just carries.
+        object.__setattr__(self, "memory_index", str(self.memory_index or "").strip())
+        # WRITE-PHASE DELIVERY TARGET (RP-6c B1 / O1): a blank/whitespace path is no path
+        # (None), so a stray empty string never mis-routes a research node to the writer.
+        if self.deliverable_path is not None:
+            dp = str(self.deliverable_path).strip()
+            object.__setattr__(self, "deliverable_path", dp or None)
 
     @property
     def effective_specs(self) -> tuple[str, ...]:
@@ -212,6 +273,9 @@ class PlanNode:
             "role": self.role,
             "needs_spec": self.needs_spec,
             "source_ids": list(self.source_ids),
+            "research_memory_handle": self.research_memory_handle,
+            "memory_index": self.memory_index,  # d285 SB-3: planner-authored choice
+            "deliverable_path": self.deliverable_path,  # RP-6c B1/O1: write-phase delivery target
         }
 
 
@@ -244,6 +308,7 @@ class PlanDAG:
     growable: bool = False
     fan_out: int = 0      # per-layer expansion cap for the grower's Tree (0 => runtime default)
     max_layers: int = 0   # growth bound: max research layers incl. the seed (0 => runtime default)
+    max_sources: int = 0  # d163 ceiling: max fetched sources fed to the write phase (0 => uncapped)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -339,6 +404,22 @@ class PlanDAG:
 # tells phi WHAT a plan is and the exact JSON node schema to emit — NOT how to
 # solve any particular goal (no hard-coded task prompt, d6). phi reasons over
 # the goal + the lookup to author the nodes itself.
+#
+# ANTI-FAB THINNING (RP-AUDIT F4 / d341): this description carries ONLY the node
+# schema + the generic spec/tool SELECTION PRINCIPLE. It does NOT bake any
+# flow/format/schedule AUTHORING RECIPE. Two such recipes used to live here and
+# were removed because they duplicated definition-layer doctrine and rode on
+# EVERY goal regardless of the selected shape (the d341 hazard):
+#   • the SCHEDULE-ONLY recipe ("a recurring goal ⇒ one cron_add node …") now
+#     lives ONLY in schedule-leg.toml's `decompose_methodology` (RP-4c), which the
+#     incremental authorer substitutes with precedence; and
+#   • the OUTPUT-FORMAT-BINDING recipe ("an HTML request gets the HTML writer …")
+#     now lives in the WRITER SPEC descriptions (html-writer/markdown-writer say
+#     which format they produce), which the planner reasons over — plus the
+#     format-hygiene rule F2 keeps in the incremental `_system` guidance.
+# What stays here is generic and flow-neutral: how to pick a spec by MATCHING the
+# WORK a node produces vs each spec's advertised description (incl. the
+# format-bleed hygiene that a gather node never carries a document-format spec).
 FACTORY_DESCRIPTION = (
     "You are an autonomous planner. Decompose the GOAL into a DAG of logical "
     "steps — invent the steps yourself; there is no template.\n"
@@ -347,11 +428,18 @@ FACTORY_DESCRIPTION = (
     "- Specialization (SELECTION GUIDELINES, see docs/SELECTION_GUIDELINES.md): "
     "MATCH on the WORK a step PRODUCES vs each spec's description, not a shared "
     "keyword. Bind an output-style spec to the node that produces the deliverable, "
-    "a role/analysis spec to the reasoning node. OUTPUT FORMAT: when the goal names "
-    "a format for the deliverable (HTML, Markdown, a .html/.md file), bind the "
-    "output-style spec for THAT format — an HTML request gets the HTML writer, a "
-    "Markdown request the Markdown writer; never substitute a different format's "
-    "writer. If a registered specialization fits, set 'spec' to its name. Use "
+    "a role/analysis spec to the reasoning node. A node's specialization follows "
+    "what THAT node DOES, not the goal's final format: a RESEARCH / GATHER / "
+    "ANALYSIS step (it searches, fetches, reads, takes notes) takes a research or "
+    "analysis spec (e.g. research-analyst) or NONE — its job is to gather grounded "
+    "findings, not to produce the deliverable. A document-FORMAT spec (e.g. "
+    "html-writer, markdown-writer) describes the FINAL written deliverable, so bind "
+    "it ONLY to the node that WRITES that deliverable; NEVER put a document-format "
+    "spec on a research/gather node — doing so makes that leaf emit the formatted "
+    "document instead of gathering notes (format-bleed). Choose the spec whose "
+    "advertised description best MATCHES each node's work — the registered "
+    "specialization lookup (with each spec's description) is your guide. If a "
+    "registered specialization fits, set 'spec' to its name. Use "
     "'specs' (applied in order) ONLY when 2+ "
     "genuinely COMPOSE (e.g. an analysis spec + an output-format spec on the same "
     "node) — keep it to 2-3 and never stack two conflicting output styles; never "
@@ -377,8 +465,10 @@ NODE_SCHEMA: dict[str, str] = {
     "depends_on": "list of node ids that must finish first (may be empty)",
     "tool": "tool name from the tool list, or null",
     "tool_args": "object of arguments for the tool, or omitted",
-    "role": "node role, one of worker|synthesizer, or null (null = a plain "
-            "producer step; 'synthesizer' = the terminal output/writer node)",
+    "role": "in-plan node role, one of researcher|worker|reviewer, or null (null = a "
+            "plain producer step; 'researcher' = a gather node; make the LAST node a "
+            "'reviewer' that fixes the deliverable and emits the final status). Do NOT "
+            "use 'planner' or 'synthesizer' — those are stages, not in-plan nodes",
     "needs_spec": "free-text description of a REQUIRED specialist when NO listed "
                   "specialization fits, or null/omitted; set this (and leave "
                   "spec/specs empty) instead of guessing a name or running "
@@ -637,6 +727,16 @@ class AbstractPlanFactory:
                     # SOURCE-SCOPING (s9/c13, d56): the global SOURCE id(s) this
                     # section node owns; PlanNode normalises to positive-int tuple.
                     "source_ids": raw.get("source_ids") or (),
+                    # MEMORY-BY-HANDLE (d221): the research-memory handle this node is
+                    # bound to (read-via-tools); PlanNode normalises blanks to None.
+                    "research_memory_handle": (
+                        str(raw["research_memory_handle"])
+                        if raw.get("research_memory_handle") else None
+                    ),
+                    # MEMORY-INDEX (d285 SB-3): the planner-authored research-memory
+                    # CHOICE on the step brief (an index to continue, or <<NEW>>);
+                    # PlanNode keeps it as a clean string ("" = unspecified).
+                    "memory_index": str(raw.get("memory_index") or ""),
                 }
             )
         return out, rationale, shape
@@ -663,6 +763,8 @@ class AbstractPlanFactory:
                 role=d["role"],
                 needs_spec=d["needs_spec"],
                 source_ids=tuple(d.get("source_ids") or ()),
+                research_memory_handle=d.get("research_memory_handle"),
+                memory_index=str(d.get("memory_index") or ""),  # d285 SB-3
             )
             for d in node_dicts
         ]

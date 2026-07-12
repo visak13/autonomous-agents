@@ -40,31 +40,66 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Optional, Sequence
 
-# d48 ROLE COLLAPSE (s9/c5): the node-role vocabulary is bounded to {worker,
-# synthesizer} (the 6 ex-roles collapsed; behaviour now comes from SPECS, not a role
-# switch). A small model still occasionally emits a RETIRED legacy role from stale
-# prompting; map it to the surviving node role HERE at the authoring boundary so a
-# role-slip can never crash the DAG factory (which rejects an unknown role). The
-# mapping mirrors the documented collapse: research/critic/reviewer/verify => worker,
-# synthesis => synthesizer; any other unknown value => worker (the safe fallback the
+# ROLE NORMALISATION (d213/d215): the in-plan node-role vocabulary is
+# {researcher, worker, reviewer}; ``synthesizer`` is the framework-built terminal node
+# (the planner should not author it) and ``planner`` is the stage. A small model still
+# occasionally emits a RETIRED/legacy or stage role from stale prompting; map it to a
+# valid in-plan node role HERE at the authoring boundary so a role-slip can never crash
+# the DAG factory (which rejects an unknown role). The first-class in-plan roles pass
+# through; the deep-research POSITION words map to the closest in-plan role
+# (research -> researcher; critic/verify -> worker); synthesis/synthesize -> worker (a
+# write worker — the terminal SYNTHESIZER stage is framework-built, never add_step'd);
+# planner -> worker; any other unknown value -> worker (the safe fallback the
 # shape-unroll already uses for an unknown position).
 _LEGACY_ROLE_MAP: dict[str, str] = {
+    "researcher": "researcher",
     "worker": "worker",
+    "reviewer": "reviewer",
     "synthesizer": "synthesizer",
-    "research": "worker",
+    "research": "researcher",
     "critic": "worker",
-    "reviewer": "worker",
     "verify": "worker",
-    "synthesis": "synthesizer",
+    "synthesis": "worker",
+    "synthesize": "worker",
+    "planner": "worker",
 }
 
 
 def _normalize_role(raw: Any) -> Optional[str]:
-    """Map a model-emitted role to a valid node role, or None for a plain step."""
+    """Map a model-emitted role to a valid in-plan node role, or None for a plain step."""
     role = str(raw or "").strip().lower()
     if not role:
         return None
     return _LEGACY_ROLE_MAP.get(role, "worker")
+
+
+# ---------------------------------------------------------------------------- #
+# d285 SB-3 — the STEP-BRIEF research-MEMORY field (memory_index | <<NEW>>).
+# ---------------------------------------------------------------------------- #
+# The TEXTUAL sentinel a step brief carries to mean "start a FRESH research memory".
+# It is the DATA form of SB-1's ``NEW_MEMORY`` object: a brief is data the PLANNER
+# authors as TEXT (one tool-call arg), so the sentinel it writes is a string, never a
+# Python object. The :func:`~agent_runtime.research_tree.resolve_brief_memory` resolver
+# maps this string onto SB-1's ``open_memory(NEW_MEMORY)``. Defined HERE (a dependency-
+# free leaf module) so both the plan-step brief (this module) and the research brief
+# (research_tree.to_brief) share one contract without an import cycle.
+NEW_MEMORY_SENTINEL = "<<NEW>>"
+
+
+def normalize_brief_memory_index(value: Any) -> str:
+    """Canonicalize a step-brief ``memory_index`` field (d285 SB-3).
+
+    A brief carries EITHER an existing research-memory INDEX (→ CONTINUE that memory)
+    OR the textual NEW sentinel ``<<NEW>>`` (→ START a fresh, distinct memory). An
+    empty / whitespace / ``None`` value means the planner chose nothing → treated as
+    ``<<NEW>>`` (a fresh memory), never a silent blank handle. A real index is returned
+    verbatim-stripped (SB-1's store applies its own filesystem-safe normalization when
+    the index is actually opened). Pure-string + idempotent: the engine STAMPS no index
+    here — it only canonicalizes the planner-authored choice (anti-fabrication, d285)."""
+    s = "" if value is None else str(value).strip()
+    if not s or s == NEW_MEMORY_SENTINEL:
+        return NEW_MEMORY_SENTINEL
+    return s
 
 # The four plan-building tools, advertised to the planner in its system prompt.
 # Data (not code) so the prompt and the dispatcher agree on exactly one surface.
@@ -92,11 +127,23 @@ PLAN_TOOLS_SPEC: tuple[dict[str, Any], ...] = (
             "specs": "list of specialization names to COMPOSE on this step, or []",
             "needs_spec": "free text describing a REQUIRED specialist when none "
                           "listed fits, else \"\"",
-            "role": "worker (a normal step) or synthesizer (the terminal output "
-                    "step that writes the deliverable), or \"\" for a plain step",
-            "source_ids": "list of SOURCE NUMBERS (from AVAILABLE SOURCES) whose "
-                          "facts/URLs THIS section uses, e.g. [1,4]; [] when the "
-                          "step uses no specific source",
+            "role": "in-plan node role: researcher (a gather step), worker (a normal "
+                    "step, e.g. authors a section), or reviewer (make the LAST step a "
+                    "reviewer that fixes the deliverable + emits the final status); "
+                    "or \"\" for a plain step. Do NOT use planner/synthesizer (stages)",
+            "source_ids": "list of [S#] SOURCE NUMBERS from the SOURCE INDEX / "
+                          "AVAILABLE SOURCES whose facts/figures/URLs THIS step uses, "
+                          "e.g. [1,4]. When a SOURCE INDEX / source list is provided, any "
+                          "step that WRITES or PRESENTS content MUST set a NON-EMPTY list "
+                          "(assign every [S#] the section draws on). Use [] ONLY for a "
+                          "gather/search step or when no source list is provided",
+            "memory_index": "the RESEARCH MEMORY this step works in (d285): pass the "
+                            "INDEX a PRIOR step built (from the upstream summary + index "
+                            "you received) to CONTINUE that research, or \"<<NEW>>\" / "
+                            "leave empty to START a FRESH memory (a distinct new research "
+                            "line). Reason over the upstream summary+index: continue when "
+                            "this step extends that research, <<NEW>> when it begins a new "
+                            "line. A gather/research step that opens a new line uses <<NEW>>",
             "id": "optional id you want to reference later; the builder assigns the "
                   "canonical id and maps yours to it",
         },
@@ -188,14 +235,6 @@ class PlanBuilder:
     max_nodes:
         Hard cap on authored steps; ``add_step`` beyond it is rejected with an
         observation rather than silently growing.
-    inject_review:
-        FRAMEWORK-INJECTED REVIEW (P2.2, d129.3/d132.B). When True, :meth:`to_structured`
-        runs :func:`agent_runtime.review_injection.inject_reviews` over the authored
-        nodes — so every authored WORK step becomes a ``work -> review`` pair and a
-        FINAL review is appended (the planner only seeds the shape + context + specs;
-        the framework injects the review). Default False keeps the authored DAG
-        byte-identical (no regression on the proven deep-research path); a caller opts
-        in to the reviewed topology.
     """
 
     def __init__(
@@ -206,9 +245,7 @@ class PlanBuilder:
         shape_name: str = "",
         shape_description: str = "",
         max_nodes: int = 12,
-        inject_review: bool = False,
     ) -> None:
-        self.inject_review = bool(inject_review)
         self._spec_names = {str(s) for s in spec_names if str(s).strip()}
         self._tool_names = {str(t) for t in tool_names if str(t).strip()}
         self.shape_name = str(shape_name or "")
@@ -292,6 +329,9 @@ class PlanBuilder:
                     "tool": n.get("tool") or "",
                     "spec": n.get("spec") or (", ".join(n.get("specs") or []) or ""),
                     "source_ids": n.get("source_ids") or [],
+                    # d285 SB-3: echo the chosen memory line back so the planner SEES
+                    # which index each step works in and can CONTINUE it on a later step.
+                    "memory_index": n.get("memory_index") or NEW_MEMORY_SENTINEL,
                 }
             )
         return out
@@ -362,6 +402,11 @@ class PlanBuilder:
             # uses — the planner's REASONED source→section assignment. Cleaned to a
             # deduped positive-int list; PlanNode re-validates. [] = no scoping.
             "source_ids": _clean_source_ids(args.get("source_ids")),
+            # MEMORY-INDEX (d285 SB-3): the planner's REASONED choice of which research
+            # memory this step works in — an existing index to CONTINUE, or "<<NEW>>"
+            # to start fresh. Canonicalized (empty → <<NEW>>); resolved through SB-1's
+            # store at run time. The engine stamps NO index — this is the planner's.
+            "memory_index": normalize_brief_memory_index(args.get("memory_index")),
         }
         self.nodes.append(record)
         self._seen_tasks[norm] = nid
@@ -447,13 +492,7 @@ class PlanBuilder:
         """The ``{rationale, nodes, shape}`` dict the factory parses into a PlanDAG.
 
         Same shape the prior incremental authorer assembled, so
-        :meth:`AbstractPlanFactory.parse_dag` consumes it unchanged.
-
-        FRAMEWORK-INJECTED REVIEW (P2.2): when ``inject_review`` is set, the authored
-        WORK nodes are passed through :func:`review_injection.inject_reviews` so each
-        gets a spec-aware ``work -> review`` pair and a final review is appended,
-        BEFORE the factory parses the DAG — the framework (this builder), not the
-        planner, owns the review injection."""
+        :meth:`AbstractPlanFactory.parse_dag` consumes it unchanged."""
         structured = {
             "rationale": self.rationale
             or (
@@ -471,15 +510,14 @@ class PlanBuilder:
                     "depends_on": n["depends_on"],
                     "role": n.get("role"),
                     "source_ids": n.get("source_ids") or [],
+                    # d285 SB-3: the planner's chosen research-memory line for this step
+                    # (an index to continue, or <<NEW>>) — carried onto the PlanNode.
+                    "memory_index": n.get("memory_index") or NEW_MEMORY_SENTINEL,
                 }
                 for n in self.nodes
             ],
             "shape": self.shape_name,
         }
-        if self.inject_review:
-            from .review_injection import inject_reviews
-
-            structured = inject_reviews(structured)
         return structured
 
 
@@ -488,4 +526,6 @@ __all__ = [
     "PlanToolError",
     "PLAN_TOOLS_SPEC",
     "PLAN_TOOL_NAMES",
+    "NEW_MEMORY_SENTINEL",
+    "normalize_brief_memory_index",
 ]

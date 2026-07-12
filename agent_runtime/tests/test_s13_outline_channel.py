@@ -1,20 +1,21 @@
-"""s13 (design §3 / B3) — AGENT-DECIDED DOCUMENT DIRECTION: the outline channel.
+"""s13 (design §3 / B3) — the outline channel, RETIRED from the served decision surface (s14/a12).
 
-Fast OFFLINE gate (no GPU, no network) for the B3 enrichment — the FAITHFULNESS LINCHPIN
-that lets the research agent author the FINAL document's section plan and have it actually
-REACH the document. Same scripted-transport + injected-gather seam as the B2 s13 tests.
-Proves the full B3 chain:
+Fast OFFLINE gate (no GPU, no network). s13/B3 added low-arity ``add_section`` / ``drop_section``
+outline tools to the decision node. s14/a12 (d154) REMOVED them from the served surface: the
+generic engine discards the tree-authored outline (PHASE-2 runs ``outline_hint=None``, d56), so
+offering the outline tools gave the model a SECOND, silently-dropped surface to author
+``source_ids`` on — it routed source_ids there (dropped) instead of onto the consumed file_write
+write-planner. This module now proves the RETIREMENT and the kept inert plumbing:
 
-* the NEW low-arity ``add_section`` / ``drop_section`` tools are wired through the SAME
-  4-point seam as B2's ``stop_research`` — they PARSE (``parse_tree_call`` via ``TREE_TOOLS``),
-  DISPATCH on their OWN explicit branch in ``run_decision_node`` (NOT mis-routed into the
-  ``set_next_direction`` catch-all), and carry their ops on ``DecisionResult``;
-* the decision emits ``add_section`` x2 → the OutlinePlan is PERSISTED to the ResearchState
-  outline channel and READ BACK from disk (the anti-hallucination read-back), append-only
-  (a ``drop`` removes; later add refines), and surfaces on ``ResearchState.read_outline()``;
-* an EMPTY outline → the PHASE-2 write goal stays findings-driven (d56 — no hard-coded /
-  fabricated sections), and a NON-empty outline REACHES ``write_goal`` as the PRIMARY
-  scaffold ABOVE the findings (not a trailing aside).
+* ``add_section`` / ``drop_section`` are NO LONGER OFFERED — absent from ``TREE_TOOLS`` and
+  ``TREE_TOOL_SPECS``, rejected by ``parse_tree_call``, and ``run_decision_node`` emits NO
+  outline ops even when the model tries to call them;
+* the lower-level outline plumbing is KEPT, inert and unit-tested in isolation: ``Tree``'s
+  outline methods are append-only, and the ``ResearchState`` outline channel still persists +
+  reads back from disk (so the channel can be re-enabled without a code change);
+* the PHASE-2 write goal stays findings-driven on an EMPTY outline (d56), and a NON-empty
+  ``outline_hint`` still REACHES ``write_goal`` as the PRIMARY scaffold above the findings — the
+  write-side mechanic is unchanged; the generic served path simply always feeds it ``None``.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from agent_runtime.research_tree import (
     Tree,
     TreeConfig,
     TREE_TOOLS,
+    TREE_TOOL_SPECS,
     parse_tree_call,
     run_decision_node,
 )
@@ -89,23 +91,27 @@ GOAL = "Write a detailed sourced report on the June 2025 US-Iran conflict."
 
 
 # =========================================================================== #
-# B3 — add_section / drop_section PARSE via TREE_TOOLS (on-surface, low-arity).
+# s14/a12 (d154) — add_section / drop_section are REMOVED from the offered surface:
+#   absent from TREE_TOOLS + TREE_TOOL_SPECS, and parse_tree_call rejects them.
 # =========================================================================== #
-def test_s13_parse_accepts_add_and_drop_section():
-    assert "add_section" in TREE_TOOLS and "drop_section" in TREE_TOOLS
+def test_s14_outline_tools_removed_from_decision_surface():
+    assert "add_section" not in TREE_TOOLS and "drop_section" not in TREE_TOOLS
+    spec_names = {s["function"]["name"] for s in TREE_TOOL_SPECS}
+    assert "add_section" not in spec_names and "drop_section" not in spec_names
+    # a model reply that still names the retired tool is NOT recognized as a tool call
+    # (parse_tree_call gates on TREE_TOOLS) → it is treated as prose, never dispatched.
     assert parse_tree_call(
         '{"tool":"add_section","args":{"title":"Damage","covers":"S1,S2"}}'
-    ) == ("add_section", {"title": "Damage", "covers": "S1,S2"})
-    # bare-key slip is recovered too (mirrors the stop_research parse)
-    assert parse_tree_call('{"drop_section": {"title": "Aftermath", "reason": "off-thesis"}}') \
-        == ("drop_section", {"title": "Aftermath", "reason": "off-thesis"})
+    ) is None
+    assert parse_tree_call('{"drop_section": {"title": "Aftermath", "reason": "off"}}') is None
 
 
 # =========================================================================== #
-# B3 — the decision node emits add_section x2 on their OWN branch (NOT mis-routed
-#       into set_next), carries the ops, and refines via drop_section (append-only).
+# s14/a12 — the decision node no longer routes the retired outline tools: even when
+#   the model emits add_section/drop_section, NO outline ops are produced (the dead
+#   source_id channel is gone). The replies fall through as prose (loop ends cleanly).
 # =========================================================================== #
-def test_s13_decision_emits_add_section_x2_carried_not_misrouted():
+def test_s14_decision_node_does_not_route_outline_tools():
     transport = _ScriptedTransport([
         '{"tool":"add_section","args":{"title":"Background","covers":"S1 origins"}}',
         '{"tool":"add_section","args":{"title":"Strike damage","covers":"S2,S3 figures"}}',
@@ -116,32 +122,26 @@ def test_s13_decision_emits_add_section_x2_carried_not_misrouted():
         transport, goal=GOAL, state_render="notes", tree=tree,
         config=TreeConfig(decide_max_turns=10), parent_depth=0,
     ))
-    # both sections landed in the effective outline, in order
-    assert [s["title"] for s in tree.outline()] == ["Background", "Strike damage"]
-    assert tree.outline()[1]["covers"] == "S2,S3 figures"
-    # the ops are carried on the DecisionResult for the layer loop to persist (2 adds)
-    assert [(o["op"], o["title"]) for o in res.outline_ops] == [
-        ("add", "Background"), ("add", "Strike damage"),
-    ]
-    # add_section is NOT a next-direction (catch-all not hit) and NOT a stop
+    # the retired tools authored NOTHING — no effective outline, no carried ops
+    assert tree.outline() == []
+    assert res.outline_ops == []
+    # and the run still terminates normally (no expansion / no spurious next-direction)
     assert res.next_direction is None and res.stop_research is None
 
 
-def test_s13_drop_section_is_append_only_and_removes():
-    # add A, add B, drop A → effective outline = [B]; the op log keeps all three (append-only)
-    transport = _ScriptedTransport([
-        '{"tool":"add_section","args":{"title":"A","covers":"x"}}',
-        '{"tool":"add_section","args":{"title":"B","covers":"y"}}',
-        '{"tool":"drop_section","args":{"title":"A","reason":"redundant"}}',
-        "FINAL PLAN.",
-    ])
+# =========================================================================== #
+# s14/a12 — the lower-level Tree outline methods are KEPT (inert plumbing) and stay
+#   append-only: a DIRECT method call still upserts/drops, so the channel can be
+#   re-enabled without a code change. (These are no longer reachable via the model.)
+# =========================================================================== #
+def test_s14_tree_outline_methods_still_append_only():
     tree = Tree(fan_out=5)
-    res = asyncio.run(run_decision_node(
-        transport, goal=GOAL, state_render="notes", tree=tree,
-        config=TreeConfig(decide_max_turns=10), parent_depth=0,
-    ))
+    tree.add_section({"title": "A", "covers": "x"})
+    tree.add_section({"title": "B", "covers": "y"})
+    tree.drop_section({"title": "A", "reason": "redundant"})
+    # effective outline folds (add upserts, drop removes); op log keeps all three (append-only)
     assert [s["title"] for s in tree.outline()] == ["B"]
-    assert [o["op"] for o in res.outline_ops] == ["add", "add", "drop"]
+    assert [o["op"] for o in tree.outline_ops] == ["add", "add", "drop"]
 
 
 # =========================================================================== #
@@ -179,21 +179,14 @@ def test_s13_empty_outline_renders_propose_prompt(tmp_path):
 
 
 # =========================================================================== #
-# B3 — the decision node's outline ops PERSIST to the ResearchState channel and
-#       READ BACK from disk (the (findings, sources, OUTLINE) hand-off to PHASE-2).
-#       (Migrated off the retired run_research_tree layer loop: that loop simply
-#       fed DecisionResult.outline_ops into ResearchState.append_outline_ops and
-#       surfaced ResearchState.read_outline() on its result. We drive the kept
-#       primitives — run_decision_node + the ResearchState outline channel — directly.)
+# s14/a12 — the decision node hands NO outline ops to the channel now (the tools are
+#   retired), so persisting its result is a no-op; the ResearchState outline channel
+#   itself still persists + reads back DIRECT ops from disk (the kept inert plumbing).
 # =========================================================================== #
-def test_s13_decision_outline_persists_to_state_and_reads_back(tmp_path):
-    # layer-1 decision authors the document direction (2 sections) then writes prose with no
-    # expansion. The ops it carries are persisted to the outline channel and read back from
-    # disk — exactly the hand-off the retired loop performed.
+def test_s14_decision_emits_no_ops_but_channel_persists_direct(tmp_path):
     state = ResearchState(tmp_path / "s.jsonl")
     transport = _ScriptedTransport([
         '{"tool":"add_section","args":{"title":"Background","covers":"S1 origins"}}',
-        '{"tool":"add_section","args":{"title":"Strike damage","covers":"S2 Fordow"}}',
         "FINAL PLAN: the report covers background then strike damage.",
     ])
     tree = Tree(fan_out=5)
@@ -201,13 +194,13 @@ def test_s13_decision_outline_persists_to_state_and_reads_back(tmp_path):
         transport, goal=GOAL, state_render="notes", tree=tree,
         config=TreeConfig(decide_max_turns=10), parent_depth=0,
     ))
-    # the decision carried the 2 add ops; the agent did NOT expand (final prose, no branches)
-    assert res.new_branches == []
-    assert res.outline_ops[0] == {"op": "add", "title": "Background", "covers": "S1 origins"}
-    # persist this layer's ops to the channel (what the loop did) ...
+    # the retired tools produced NO ops → persisting the decision is a no-op (channel empty)
+    assert res.outline_ops == []
     state.append_outline_ops(res.outline_ops)
-    # ... then read the agent-decided outline BACK from disk (anti-hallucination read-back)
-    assert [s["title"] for s in state.read_outline()] == ["Background", "Strike damage"]
+    assert state.read_outline() == []
+    # the channel plumbing still works when fed ops DIRECTLY (re-enable without a code change)
+    state.append_outline_ops([{"op": "add", "title": "Background", "covers": "S1 origins"}])
+    assert [s["title"] for s in state.read_outline()] == ["Background"]
 
 
 def test_s13_empty_outline_when_agent_proposes_none(tmp_path):
@@ -237,7 +230,7 @@ def test_s13_outline_hint_reaches_write_goal_as_primary_scaffold():
     goal = _compose_write_goal(
         "Report on the conflict", "report.html",
         "FINDINGS_BODY_MARKER", "AVAILABLE SOURCES: ...",
-        is_html=True, outline_hint=outline,
+        outline_hint=outline,
     )
     # both section titles reach the goal
     assert "Background" in goal and "Strike damage" in goal
@@ -252,9 +245,11 @@ def test_s13_empty_outline_keeps_write_goal_findings_driven():
     for empty in (None, []):
         goal = _compose_write_goal(
             "Report", "report.md", "FINDINGS_BODY", "SOURCES",
-            is_html=False, outline_hint=empty,
+            outline_hint=empty,
         )
         assert "PRIMARY scaffold" not in goal and "DOCUMENT OUTLINE" not in goal
-        assert "FINDINGS_BODY" in goal and "Decompose it into the sections it needs" in goal
+        # RP-1 (d319/d311): the 'Decompose it into the sections it needs' single-document
+        # framing is RETIRED — the goal stays findings-driven and output-agnostic.
+        assert "FINDINGS_BODY" in goal
     # a hint of only blank titles also degrades to the findings-driven goal
     assert _render_outline_hint([{"title": "  ", "covers": "x"}]) == ""

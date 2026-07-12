@@ -194,7 +194,7 @@ class ShapeAuthorService:
             reloaded = load_shape(spec.name, shapes_dir=self._shapes_dir)
             if (
                 reloaded.execution != spec.execution
-                or reloaded.is_unrollable != spec.is_unrollable
+                or reloaded.is_deep_research != spec.is_deep_research
             ):
                 raise ShapeError(
                     f"authored shape {spec.name!r} did not round-trip the loader "

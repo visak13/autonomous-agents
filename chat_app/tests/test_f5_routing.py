@@ -106,17 +106,27 @@ def test_search_allowed_keeps_web_surface_intact(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 2) named spec — honored on the deep-research route (not the hardcoded default)
+# 2) SPEC-ROUTING BY THE SHAPE'S DECLARED PHASE (RP-6b d359/d361 — Bug A d355/d356)
 # --------------------------------------------------------------------------- #
-def test_deep_research_reuses_user_named_spec(tmp_path):
+def test_research_seed_carries_research_role_spec_never_a_writer(tmp_path):
+    """RP-6b: the deep-research shape declares the research phase's ``spec_role`` (``research``),
+    so the RESEARCH SEED carries the research-analysis spec — a user-named WRITER/output spec is
+    NEVER pulled onto the research node (the old F5 "first requested spec wins" put a writer spec
+    on a research node = Bug A). The named writer routes to the WRITE phase (see the sibling test
+    ``test_named_spec_threaded_into_incremental_authorer`` — the write authorer keeps it)."""
+    from agent_runtime.shapes import load_shape
+
     reg = _seeded_registry(tmp_path)
-    # the user explicitly named markdown-writer → it is the reused spec ...
-    assert _deep_research_spec(reg, [_MD_SPEC]) == _MD_SPEC
-    # ... a request naming none falls back to the research-analyst default ...
-    assert _deep_research_spec(reg, []) == DEEP_RESEARCH_SPEC
-    assert _deep_research_spec(reg, None) == DEEP_RESEARCH_SPEC
-    # ... and an UNregistered name is ignored (never reaches binding).
-    assert _deep_research_spec(reg, ["no-such-spec"]) == DEEP_RESEARCH_SPEC
+    dr = load_shape("deep-research")
+    # the shape genuinely declares the research phase's spec-role (definition-layer routing) ...
+    assert dr.spec_role_for("research") == "research"
+    assert dr.spec_role_for("write") == "writer"
+    # ... so the research seed carries the research-analysis spec, whatever the user named — a
+    # writer spec (markdown-writer) is NOT composed onto the research node (Bug A dissolved) ...
+    assert _deep_research_spec(reg, shape=dr) == DEEP_RESEARCH_SPEC
+    assert _deep_research_spec(reg, shape=dr) != _MD_SPEC
+    # ... and a shape-less fallback still yields the research-analysis role (never a writer).
+    assert _deep_research_spec(reg) == DEEP_RESEARCH_SPEC
 
 
 def test_named_spec_threaded_into_incremental_authorer(tmp_path):

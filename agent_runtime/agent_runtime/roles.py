@@ -1,26 +1,35 @@
-"""Node ROLE templates + the deep-research POSITION framings (d48 3-role collapse).
+"""Node ROLE templates + the deep-research POSITION framings (d213/d215 node types).
 
-THREE roles, period (d48/d51 — the user's definitive architecture). At the NODE
-level there are now only TWO node roles (the third, PLANNER, is the planning STAGE
-— the shape selector + the incremental planner — not a per-node field):
+ROLE = node type (d213). There are FIVE, sitting in three places (d215):
 
-* :data:`ROLE_WORKER` — a node that follows its 1+ specs (as combined guidelines)
-  to hit its goal from a defined input → output. Behavior comes from the node's
-  SPEC(s) + the task framing + reasoning, NOT a per-role code switch. A worker
-  emits RAW free-text content (no ``format=<schema>`` wrapper — d50.1: content is
-  RAW, never serialized).
-* :data:`ROLE_SYNTHESIZER` — the terminal output stage: it writes the deliverable
-  (to a file via the shared raw read-back loop, or to chat) — B1's domain, left
-  intact. Also schema-less + RAW.
+* PLANNER — the planning STAGE (shape selector + incremental planner). It drives
+  the iterative loop; NOT a per-node field, so it has no framing here.
+* In-plan node roles — the roles the planner may place inside a plan via add_step:
+  * :data:`ROLE_RESEARCHER` — RETIRED from the engine as a routing/dispatch discriminator
+    (SB-RR, d292/d293): research is a SELF-SELECTED specialization, not a role. The symbol +
+    its framing are KEPT only for BACK-COMPAT (a stale-prompted planner authoring this role
+    degrades gracefully — a tool-less node routes through the SAME unified worker loop and
+    gathers via its self-selected bundle). New gather nodes are WORKERS carrying the
+    research-methodology spec (the self-select lever); no engine branch keys on this role.
+  * :data:`ROLE_WORKER` — a node that follows its 1+ specs (as combined guidelines)
+    to hit its goal from a defined input → output (e.g. a write worker authoring a
+    section). Behavior comes from the node's SPEC(s) + task framing + reasoning.
+  * :data:`ROLE_REVIEWER` — the DEFAULT LAST STEP of every plan: inspects+fixes the
+    deliverable in place and emits the plan's FINAL STATUS (which the planner reads to
+    decide the next plan).
+* :data:`ROLE_SYNTHESIZER` — the TERMINAL stage: a single framework-built node that
+  runs ONCE after the planner loop exits to deliver the result (file via the shared
+  raw read-back loop, or chat). NOT add_step'd by the planner.
 
-The 6-role enum that preceded this ({research, critic, worker, reviewer, synthesis,
-verify}) is GONE: research/critic/reviewer/verify collapse into WORKER (their
-distinct behavior now comes from a SPEC and/or the deep-research POSITION framing
-below), and synthesis becomes SYNTHESIZER. There is no longer a per-role OUTPUT
-SCHEMA or an enum-verdict judgment path — the role-execution switch (flag #5) and
-the role-research fetch gate (flag #2) are retired (s9/c2, d48). Roles are NOT
-LLM-extensible (Q-A: bounded) — :data:`~agent_runtime.factory.VALID_ROLES` is the
-fixed two-element node-role vocabulary.
+ALL FIVE emit RAW free-text content (no ``format=<schema>`` wrapper — d50.1: content
+is RAW, never serialized). The 6-role enum that preceded this ({research, critic,
+worker, reviewer, synthesis, verify}) is GONE: critic/verify remain deep-research
+POSITIONS (prompting, below), and research/reviewer/synthesis became first-class node
+types again (d213). There is no per-role OUTPUT SCHEMA or enum-verdict judgment path —
+the role-execution switch (flag #5) and the role-research fetch gate (flag #2) stay
+retired (s9/c2, d48). Roles are NOT LLM-extensible (Q-A: bounded) —
+:data:`~agent_runtime.factory.VALID_ROLES` is the fixed node-role vocabulary
+(researcher/worker/reviewer/synthesizer; planner is the stage, not a node role).
 
 THE DEEP-RESEARCH POSITIONS. The deep-research SHAPE still runs ~10 rounds of
 {research + critic} then a final {research + synthesis + verify}. Those per-round
@@ -38,10 +47,14 @@ from typing import Any, Mapping, Optional
 
 from .factory import VALID_ROLES
 
-# The TWO node-role constants (mirror VALID_ROLES) — use these instead of bare
-# strings so a typo is a NameError, not a silent miss. PLANNER is a stage, not a
-# node role, so it is intentionally NOT here.
+# The node-role constants (mirror VALID_ROLES) — use these instead of bare strings
+# so a typo is a NameError, not a silent miss. PLANNER is the planning STAGE, not a
+# per-node role, but its name is kept here so the planning stage can look up its bundle
+# set the same way (it is intentionally NOT in VALID_ROLES). d213/d215.
+ROLE_PLANNER = "planner"
+ROLE_RESEARCHER = "researcher"
 ROLE_WORKER = "worker"
+ROLE_REVIEWER = "reviewer"
 ROLE_SYNTHESIZER = "synthesizer"
 
 
@@ -58,7 +71,8 @@ READ_NOT_DESCRIBE = (
 
 
 # --------------------------------------------------------------------------- #
-# Node-role prompt TEMPLATES (worker + synthesizer ONLY)
+# Node-role prompt TEMPLATES — one per node type (researcher / worker / reviewer /
+# synthesizer; planner is the STAGE, no per-node framing). d213/d215.
 # --------------------------------------------------------------------------- #
 #
 # Appended AFTER the shaping-framed spec body (the SAME composed ruleset for the
@@ -73,6 +87,34 @@ ROLE_FRAMINGS: dict[str, str] = {
         "specialization ruleset(s) as combined guidelines and using the inputs and "
         "any tool findings provided. Produce the deliverable itself — no "
         "meta-commentary, no preamble."
+    ),
+    ROLE_RESEARCHER: (
+        "ROLE: RESEARCHER. You GATHER grounded evidence to answer your assigned "
+        "concern, using the search / fetch / note tools your bundle gives you. "
+        "Work the canonical loop: DECOMPOSE the concern, SEARCH it, READ the most "
+        "relevant chunks of the real sources you fetch, and — your PRIMARY act after "
+        "each read — take a NOTE that records what you learned AND the GAPS it left. "
+        + READ_NOT_DESCRIBE + " Cover the breadth of the concern before drilling one "
+        "part; expand a sub-concern only by actually running another search/read/note "
+        "round, and STOP once every concern is settled-in-a-note or collapsed. Report "
+        "concrete FINDINGS attributed to the real [S#]/URL you read them from, plus the "
+        "OPEN QUESTIONS that remain — never write from memory and never cite a page you "
+        "did not fetch."
+    ),
+    ROLE_REVIEWER: (
+        "ROLE: REVIEWER — the DEFAULT LAST STEP of the plan. The deliverable is "
+        "ALREADY produced by the upstream nodes; do NOT re-emit it. Inspect it by "
+        "BOUNDED REGION (file_read a slice/tail — never the whole file at once) and "
+        "GROUND your checks in the sources you can pull on demand (load_source against "
+        "the SOURCE INDEX). Where you find a gap, an unsupported claim, a citation that "
+        "does not resolve to a real [S#], or a coherence/structure defect, FIX it IN "
+        "PLACE with a single anchored file_update (ground-or-remove; never fabricate a "
+        "source). Make only targeted edits — never rewrite the whole document. THEN emit "
+        "the plan's FINAL STATUS: a short, honest summary of what the plan accomplished, "
+        "whether it met its goal, and — when the goal still needs a further plan — WHAT "
+        "the next plan should produce (kind + shape, derived from the work just done, "
+        "e.g. the desired sectioned output a write plan should author). Reply with that "
+        "status as plain prose — never a verdict or findings object."
     ),
     ROLE_SYNTHESIZER: (
         "ROLE: SYNTHESIZER. You produce the FINAL DELIVERABLE itself — the actual "
@@ -162,6 +204,34 @@ def position_framing(position: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# BUNDLE NAME CONSTANTS (d212/d213). A bundle is a TOOL WRAPPER, NOT a role (d212):
+# it carries one CAPABILITY DOMAIN's tools + doctrine. These mirror
+# ``agent_runtime.bundles``'s BUNDLE_* constants and stay here as plain strings so this
+# module is import-cycle-free.
+#
+# NODE-SELF-SELECT (d221): there is NO hardcoded role/position/tool -> bundle TABLE
+# anymore. The planner sets ONLY a node's ROLE + SPECIALIZATION (never bundles, d194);
+# each in-plan node SELF-SELECTS the bundle(s) its task needs AT RUNTIME by reasoning
+# over the advertised ``get_bundles`` catalog and loading them (the runtime's
+# ``get_bundles`` tool + the per-node ``_loaded_bundles`` set). The base ``object``
+# bundle (finish + the universal loop) is the ONLY always-on floor. The retired
+# ``ROLE_BUNDLES`` / ``POSITION_BUNDLES`` / ``_TOOL_BUNDLES`` tables + the deterministic
+# ``bundles_for_node`` / ``bundles_for_position`` assignment are GONE — selection is
+# REASONED (d14/d60/d65/d190), and selection reliability on the small model is a
+# tool-DESCRIPTION lever (d186), never a reason to hardcode.
+# --------------------------------------------------------------------------- #
+BUNDLE_OBJECT = "object"
+BUNDLE_PLANNING = "planning"
+BUNDLE_RESEARCH = "research"
+BUNDLE_RESEARCH_READ = "research_read"
+BUNDLE_FILE = "file"
+
+# (ROLE_PLANNER / ROLE_RESEARCHER / ROLE_WORKER / ROLE_REVIEWER / ROLE_SYNTHESIZER are
+# defined once near the top of the module, before ROLE_FRAMINGS, so the framings table
+# can reference them.)
+
+
+# --------------------------------------------------------------------------- #
 # Schemas / verdicts — RETIRED (d48). Kept as EMPTY tables + no-op helpers so the
 # (few) importers still resolve while every role is now schema-less + RAW.
 # --------------------------------------------------------------------------- #
@@ -172,10 +242,13 @@ def position_framing(position: str) -> str:
 # tables are empty and the helpers are inert (return the permissive default).
 ROLE_SCHEMAS: dict[str, dict[str, Any]] = {}
 
-# BOTH node roles are schema-less by design (RAW emission). Exempt them so the
-# import-time completeness guard stays meaningful (it now just asserts every node
-# role has a framing).
-SCHEMALESS_ROLES: frozenset[str] = frozenset({ROLE_WORKER, ROLE_SYNTHESIZER})
+# ALL node roles are schema-less by design (RAW emission, d48/d213). Exempt them so
+# the import-time completeness guard stays meaningful (it now just asserts every node
+# role has a framing). Researcher + reviewer joined the in-plan vocabulary (d213/d215);
+# they emit RAW content too (findings prose / corrected content + a plain-prose status).
+SCHEMALESS_ROLES: frozenset[str] = frozenset(
+    {ROLE_WORKER, ROLE_SYNTHESIZER, ROLE_RESEARCHER, ROLE_REVIEWER}
+)
 
 # No judgment roles remain (research/critic/verify/reviewer collapsed into worker,
 # which emits RAW free-text). These stay defined + empty so verify.py / runtime.py
@@ -247,6 +320,14 @@ __all__ = [
     "POSITION_WORKER",
     "POSITION_FRAMINGS",
     "position_framing",
+    "BUNDLE_OBJECT",
+    "BUNDLE_PLANNING",
+    "BUNDLE_RESEARCH",
+    "BUNDLE_RESEARCH_READ",
+    "BUNDLE_FILE",
+    "ROLE_PLANNER",
+    "ROLE_RESEARCHER",
+    "ROLE_REVIEWER",
     "ROLE_SCHEMAS",
     "SCHEMALESS_ROLES",
     "ROLE_VERDICTS",

@@ -276,43 +276,51 @@
   font-size: 0.92em;
 }
 
-/* --- deep-research bounded unroll --- */
-.shapes-rounds {
+/* --- shape chat (s17 — the conversational draft-based authoring panel) --- */
+.shapes-chat-transcript {
   list-style: none;
-  margin: 0;
+  margin: 0 0 var(--space-2);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: var(--space-1);
+  max-height: 220px;
+  overflow-y: auto;
 }
-.shapes-round {
-  display: grid;
-  grid-template-columns: 100px 1fr;
+.shapes-chat-turn {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  border: 1px solid var(--border-subtle);
+}
+.shapes-chat-user {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.shapes-chat-assistant {
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+}
+.shapes-chat-actions {
+  display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* --- deep-research discipline + doctrine (s17 redesign — the round-by-round
+   unroll preview is retired; the planner authors topology at runtime) --- */
+.shapes-doctrine {
+  margin: var(--space-2) 0 0;
   padding: var(--space-2) var(--space-3);
   background: var(--bg-surface-2);
   border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--accent);
   border-radius: var(--radius-md);
-}
-.shapes-round-final {
-  border-color: var(--accent);
-}
-.shapes-round-elide {
-  grid-template-columns: 100px 1fr;
-  color: var(--text-muted);
-  background: transparent;
-  border-style: dashed;
-}
-.shapes-round-elide-text {
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-}
-.shapes-round-label {
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 .shapes-role-chain {
   display: flex;

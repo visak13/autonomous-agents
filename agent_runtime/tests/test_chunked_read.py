@@ -185,7 +185,9 @@ class _SmartTransport:
     test can assert which source content reached the window."""
 
     def __init__(self, agent_turns: list[str]) -> None:
-        self._turns = list(agent_turns)
+        # d242 TRUE self-select: the research node starts TOOL-LESS, so the script loads the
+        # 'research' bundle first (its opening move) before any web_search/web_fetch.
+        self._turns = ['{"tool": "get_bundles", "args": {"name": "research"}}'] + list(agent_turns)
         self.agent_calls: list[str] = []
         self.summarize_calls = 0
 

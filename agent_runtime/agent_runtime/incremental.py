@@ -28,9 +28,17 @@ and the runtime all consume the DAG unchanged — only HOW the DAG was authored 
 
 Context-scoping (d10) is preserved: the planner reasons over the SAME body-free
 factory context (factory description + the specialization LOOKUP index + the lean tool
-catalog) — never a compiled spec body — asserted body-free before the loop. The F2
-default-research-spec and F5 requested-spec finalization passes run over the authored
-node set exactly as before.
+catalog) — never a compiled spec body — asserted body-free before the loop.
+
+RP-3b (d311/d319/d328): the three engine-authored STRUCTURE repairs (the F2 default-
+research-spec pass, the d28 terminal-research-edge pass, the b5 output-format pass) are
+RETIRED — the planner authors the gather-node spec, the writer<-research edge, and the
+terminal format writer ITSELF (measured 100% reliable on live E4B). The engine authors
+NO DAG/spec/format structure; reliability is a definition-layer property (the planner
+prompt + the selected shape). Only F5 (honours a user-NAMED spec) + the d7 dangling-edge
+backstop remain over the authored node set. RP-AUDIT F5 RETIRED the d50 filename echo —
+filename-honoring is carried by ``PlanDAG.goal`` → ``derive_output_path`` (no engine-
+authored task text, no baked file-writer sink).
 """
 from __future__ import annotations
 
@@ -45,7 +53,6 @@ from .identity import with_identity
 from .plan_tools import PLAN_TOOL_NAMES, PLAN_TOOLS_SPEC, PlanBuilder
 from .planner import PlanResult
 from .selfheal import MalformedOutputError
-from .synth_tools import explicit_filename
 from .tracing import get_tracer, run_blocking_in_span
 
 # Hard bound on the number of authored NODES — the planner's "stop calling add_step"
@@ -60,34 +67,6 @@ DEFAULT_MAX_NODES = 12
 # fills the budget and the JSON ``content`` truncates to EMPTY). temp 0 holds the tool
 # call tight; this is headroom for the CoT, not a larger payload.
 DEFAULT_NODE_NUM_PREDICT = 4096
-
-# The tool names that mark a node as a RESEARCH/GATHER node (F2). A node that fires
-# one of these reads the web — and the QUALITY of what it produces is governed by a
-# research ruleset (d13: report the REAL findings by READING the fetched articles,
-# never describe the search-results / source list). These are the nodes that, left
-# spec-less by the per-node authorer, degrade to the source-list-summary anti-pattern
-# (the empty/thin emailed news section). Delivery tools (send_mail/file_write) are
-# deliberately NOT here: a delivery node is null-spec BY DESIGN — its content is
-# grounded deterministically in upstream node text (d11), not researched — so the
-# research ruleset does not apply to it. Generic + role-structural, never per-scenario.
-DEFAULT_RESEARCH_TOOLS = ("web_search", "web_fetch")
-
-# OUTPUT-FORMAT writers (s8/b5). When the GOAL explicitly names a deliverable
-# format, the terminal write/synthesize node MUST carry that format's output-style
-# spec so the deliverable comes back in the requested form (the d13/B2 fix: an HTML
-# request must produce HTML, a Markdown request Markdown). The PROMPT tells the
-# model to bind it (factory description + the per-turn final-step instruction), but
-# E4B intermittently binds the analysis spec (research-analyst) on a "synthesize"
-# node instead of the format writer — measured ~1/3 of runs, either direction. So,
-# exactly like the F5 requested-spec guarantee, a finalization pass STAMPS the
-# format writer when the model left it off. ``name -> (writer spec, goal regex)`` —
-# the writer is only stamped when it is an actually-registered specialization, so a
-# project without these seeds is a clean no-op. Mutually exclusive (an HTML request
-# never keeps a Markdown writer and vice-versa).
-_OUTPUT_FORMAT_WRITERS: tuple[tuple[str, str, str], ...] = (
-    ("html", "html-writer", r"\bhtml\b|\.html\b|\bweb\s?page\b"),
-    ("markdown", "markdown-writer", r"\bmarkdown\b|\.md\b"),
-)
 
 
 class IncrementalPlanner:
@@ -132,35 +111,37 @@ class IncrementalPlanner:
         tool_names: Sequence[str] = (),
         shape_name: str = "",
         shape_description: str = "",
-        default_research_spec: str = "",
+        shape_decompose_methodology: str = "",
         requested_specs: Sequence[str] = (),
-        research_tools: Sequence[str] = DEFAULT_RESEARCH_TOOLS,
         max_nodes: int = DEFAULT_MAX_NODES,
         node_num_predict: int = DEFAULT_NODE_NUM_PREDICT,
         max_repair_attempts: int = 2,
         call_opts: Optional[dict[str, Any]] = None,
-        inject_review: bool = False,
+        authoring_directive: str = "",
     ) -> None:
         self.transport = transport
         self.factory = factory
-        # P2.2/P2.5 (d132.B) — FRAMEWORK-INJECTED REVIEW. When True, the authored plan
-        # is passed through :func:`review_injection.inject_reviews` at build time (the
-        # :class:`PlanBuilder` opt-in), so the FRAMEWORK (not the planner) turns each work
-        # node into a work-then-review pair and appends a final review. Default False keeps
-        # the authored plan byte-identical. The served flagship report route turns this ON
-        # only behind the reversible P2.5 generic-report flag (parity-gated).
-        self.inject_review = bool(inject_review)
+        # AUTHORING DIRECTIVE (s14/a9) — a phase-specific instruction surfaced on EVERY
+        # per-turn authoring prompt (initial / observation / finalize), not just buried in
+        # the goal. The write phase passes the SOURCE-ID mandate here so the per-turn lever
+        # (the strongest one for E4B) actually reminds the model to set source_ids on each
+        # section step. Empty for the research/gather planner → byte-identical behaviour.
+        # This is PROMPT TEXT only — the model still decides which [S#] each section uses;
+        # it is NOT a deterministic seatbelt (d148: reliability via prompt quality).
+        self.authoring_directive = str(authoring_directive or "").strip()
         self.spec_names = [str(s) for s in spec_names if str(s).strip()]
         self.tool_names = [str(t) for t in tool_names if str(t).strip()]
         self.shape_name = str(shape_name or "")
         self.shape_description = str(shape_description or "")
-        # F2 DEFAULT RESEARCH SPEC: the generic, role-appropriate research
-        # specialization stamped onto any null-spec GATHER node (see
-        # :data:`DEFAULT_RESEARCH_TOOLS`). The NAME is supplied by the caller (the
-        # live route passes ``specialization.seed.DEEP_RESEARCH_SPEC`` —
-        # ``research-analyst``), so this generic authorer hard-codes no spec name.
-        # Applied only when the name is an actually-registered specialization.
-        self.default_research_spec = str(default_research_spec or "").strip()
+        # SHAPE-DEFINED AUTHORING METHODOLOGY (RP-4c/d341). When the SELECTED shape supplies a
+        # ``decompose_methodology`` (e.g. the schedule-leg shape's SCHEDULE-ONLY doctrine), it is
+        # substituted into the authoring procedure and TAKES PRECEDENCE over the hardcoded generic
+        # gather→combine→deliver recipe (which becomes a FALLBACK only for shapes with no
+        # methodology). This mirrors research_tree's shape-methodology substitution (d161/d170):
+        # behaviour lives in the SHAPE (definition layer); the substitution is generic +
+        # shape-agnostic (no spec-name/flow conditional). Empty → byte-identical to the pre-d341
+        # generic authoring procedure.
+        self.shape_decompose_methodology = str(shape_decompose_methodology or "").strip()
         # F5 USER-REQUESTED SPECIALIZATIONS: the spec name(s) the user EXPLICITLY
         # named (extracted by the model-driven ShapeSelector, enum-constrained to
         # registered names). The authorer is TOLD about them (so the tool calls bind
@@ -172,9 +153,6 @@ class IncrementalPlanner:
             for s in (requested_specs or [])
             if str(s).strip() and str(s).strip() in set(str(n) for n in spec_names)
         ]
-        self.research_tools = {
-            str(t).strip().lower() for t in (research_tools or ()) if str(t).strip()
-        }
         self.max_nodes = max(1, int(max_nodes))
         self.node_num_predict = int(node_num_predict)
         self.max_repair_attempts = max_repair_attempts
@@ -208,13 +186,56 @@ class IncrementalPlanner:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _tool_catalog_text() -> str:
-        """Render the four plan-building tools + their args for the system prompt."""
-        lines = ["PLAN-BUILDING TOOLS (call ONE per reply):"]
-        for spec in PLAN_TOOLS_SPEC:
-            lines.append(f"- {spec['name']}: {spec['description']}")
-            for arg, meaning in spec["args"].items():
-                lines.append(f"    {arg}: {meaning}")
-        return "\n".join(lines)
+        """Render the four plan-building tools + their args for the system prompt.
+
+        DELEGATES to the PlanningBundle (d190) — the bundle owns the plan-tool catalog
+        rendering (sourced from the same PLAN_TOOLS_SPEC), so the planner system prompt
+        is byte-identical while the bundle is the single source of truth."""
+        from .bundles import get_bundle
+
+        return get_bundle("planning").plan_tool_catalog_text()
+
+    @staticmethod
+    def _upstream_memory_block(
+        prior_memory: Optional[Sequence[Mapping[str, Any]]],
+    ) -> str:
+        """Render the UPSTREAM RESEARCH MEMORY the planner reasons over (d285 SB-3).
+
+        ``prior_memory`` is the (summary, memory_index) pairs the planner RECEIVED from
+        upstream nodes' finalize (SB-2) — the DATA it reasons over to choose, per step,
+        whether to CONTINUE a prior research line (reuse its index) or start a FRESH one
+        (``<<NEW>>``). d10-clean: this is DATA (a summary + an index), never a spec body.
+
+        Empty string when there is no upstream (the SEED authoring — every step then
+        opens a fresh ``<<NEW>>`` line), so the seed planner's turns stay byte-identical.
+        SB-3 only surfaces this block as a SEAM; SB-4 wires the served handoff that
+        POPULATES it from compose-task (a test injects it directly to prove the choice)."""
+        pairs = [p for p in (prior_memory or []) if isinstance(p, Mapping)]
+        rows = []
+        for p in pairs:
+            idx = str(p.get("memory_index") or "").strip()
+            summ = str(p.get("summary") or "").strip()
+            if not idx and not summ:
+                continue
+            rows.append(f"  - index={idx or '(unset)'}: {summ or '(no summary)'}")
+        if not rows:
+            return ""
+        return (
+            "\n\nUPSTREAM RESEARCH MEMORY (what earlier steps already gathered — each a "
+            "(summary, index) pair). When a NEW step EXTENDS one of these research lines, "
+            "set that step's 'memory_index' to the matching index to CONTINUE it; when a "
+            "step starts a DISTINCT line, use \"<<NEW>>\". Reason over the summaries to "
+            "decide:\n" + "\n".join(rows) + "\n"
+        )
+
+    def _directive_block(self) -> str:
+        """The phase-specific authoring directive, rendered for a per-turn user prompt.
+
+        Empty (no trailing text) when no directive was set — so the research/gather
+        planner's turns stay byte-identical. The write phase sets it to the SOURCE-ID
+        mandate so every authoring turn (initial / observation / finalize) carries the
+        reminder, not just the goal (s14/a9 — the per-turn lever is the strongest for E4B)."""
+        return f"{self.authoring_directive}\n\n" if self.authoring_directive else ""
 
     def _system(self, goal: str) -> str:
         """The body-free SEED context shared by every tool-call turn (asserted d10)."""
@@ -249,10 +270,66 @@ class IncrementalPlanner:
                 "output-style specialization, the step that produces the final "
                 "deliverable; do not drop it in favour of another."
             )
+        # PRECEDENCE (d341): when the SELECTED shape supplies a decompose_methodology, it DEFINES
+        # the steps to author and REPLACES the generic gather→combine→deliver flow guidance below
+        # (which becomes a fallback for methodology-less shapes). The model reasons over the
+        # methodology; the engine authors nothing. Empty → byte-identical to the pre-d341 prompt.
+        methodology = self.shape_decompose_methodology
+        methodology_block = ""
+        # NEUTRAL FALLBACK (RP-AUDIT F2) — this generic authoring guidance applies ONLY when the
+        # selected shape supplies NO decompose_methodology. It is deliberately TOPOLOGY-NEUTRAL: it
+        # tells the model to author the steps the GOAL actually needs and wire real dependencies,
+        # WITHOUT baking a gather→combine→deliver mold. A read→write, single-step, or non-gather
+        # goal is therefore NOT pushed into a gather shape. (The pre-F2 version hardcoded "a
+        # modular-parallel plan is INDEPENDENT sub-tasks FOLLOWED BY one FINAL step that combines
+        # their outputs" — a gather-specific assumption every methodology-less shape inherited; d341
+        # forbids the engine baking a fixed flow. A shape whose flow IS gather→combine now carries
+        # that in its own decompose_methodology, which takes precedence below.)
+        flow_guidance = (
+            "- Author the SMALLEST correct set of steps for THIS goal: decompose it into the "
+            "distinct pieces of work its OWN outcome requires — no more, no fewer. Some goals "
+            "need a single step; some need a step that reads or produces something and a later "
+            "step that uses it; some name several independent sub-tasks. Do NOT force the goal "
+            "into a fixed gather-then-combine shape.\n"
+            "- Wire dependencies by REASONING: a step that needs an earlier step's result lists "
+            "that step's id in depends_on; steps that need nothing from each other share NO edge "
+            "(depends_on []) and may run at the same time. Never author a step that duplicates "
+            "one already authored.\n"
+            "- RESEARCH MEMORY (memory_index): a step that searches/fetches/reads works in a "
+            "research memory. Set 'memory_index' to \"<<NEW>>\" to OPEN a fresh research line (the "
+            "default for a new gather step), or to an existing INDEX to CONTINUE the research a "
+            "prior step built — choose by reasoning over any UPSTREAM RESEARCH MEMORY you were "
+            "given (continue the index whose summary this step extends).\n"
+        )
+        final_combine_guidance = (
+            "- Make the LAST step the one that DELIVERS the goal's outcome; when it uses several "
+            "earlier steps, its depends_on lists each of their ids. After authoring the "
+            "delivering step, call finalize_plan.\n\n"
+        )
+        if methodology:
+            methodology_block = (
+                f"\n\nAUTHORING METHODOLOGY (selected shape '{self.shape_name}') — FOLLOW THIS. It "
+                "DEFINES exactly which steps to author and TAKES PRECEDENCE over the generic "
+                "gather/combine/deliver guidance below:\n" + methodology + "\n"
+            )
+            flow_guidance = ""
+            final_combine_guidance = (
+                "- After authoring the step(s) the methodology above calls for, call "
+                "finalize_plan.\n\n"
+            )
+        # FORMAT-NEUTRAL BINDING (RP-AUDIT F6 / d352): the spec/tool selection GUIDANCE below
+        # carries NO per-format example (no "an HTML request gets the HTML writer, a Markdown
+        # request the Markdown writer" pin). The engine states the GENERIC rule — bind the writer
+        # spec whose ADVERTISED format matches the goal's requested format — and the format→writer
+        # MAPPING lives ONLY in the writer SPEC descriptions (html-writer / markdown-writer /
+        # section-html-writer advertise which format each produces). The model reasons over those
+        # descriptions to pick the writer; the engine pins no format (d317). The format-bleed
+        # HYGIENE rule (never a document-format writer on a gather step) stays, kept format-neutral.
         return with_identity(
             ctx["factory"]["description"]
             + shape_line
             + requested_line
+            + methodology_block
             + "\n\nBUILD THE PLAN BY CALLING TOOLS, one per reply. First reason about "
             "which SHAPE fits and which INPUT / PROCESSING / OUTPUT specializations "
             "to use, then issue tool calls to construct the DAG. Each reply is "
@@ -262,52 +339,107 @@ class IncrementalPlanner:
             + self._tool_catalog_text()
             + "\n\nGUIDANCE:\n"
             "- Call seed_plan FIRST, then add_step for each step, then finalize_plan.\n"
-            "- Author the SMALLEST correct set of steps. A modular-parallel plan is "
-            "INDEPENDENT sub-task steps (each depends_on=[], run at the same time) "
-            "FOLLOWED BY one FINAL step that combines their outputs and delivers.\n"
-            "- A gather/search step is a SOURCE: depends_on=[]. Never author a step "
-            "that duplicates one already authored.\n"
-            "- If a step's action is one an available tool performs (search, fetch, "
+            + flow_guidance
+            + "- If a step's action is one an available tool performs (search, fetch, "
             "read/write a file, send email), set 'tool' to that tool's exact name.\n"
-            "- Pick spec/specs only when a listed specialization genuinely fits. "
-            "When the goal names an output FORMAT (HTML, Markdown, a .html/.md "
-            "file), bind the output-style spec for THAT format on the final step — "
-            "an HTML request gets the HTML writer, a Markdown request the Markdown "
-            "writer; never the other.\n"
+            "- Pick spec/specs only when a listed specialization genuinely fits the "
+            "work THAT step does. A research/gather step (it searches, fetches, "
+            "reads, takes notes) takes a research/analysis spec (e.g. "
+            "research-analyst) or NONE — NEVER a document-format spec: putting "
+            "a document-format writer on a gather step makes it emit the document "
+            "instead of gathering notes. When the goal names a specific output FORMAT, "
+            "bind — ONLY on the final WRITE step — the output-style writer spec whose "
+            "ADVERTISED format matches the goal's requested format (read the writer "
+            "specializations' own descriptions and pick the one that produces the "
+            "requested format); never bind a document-format writer to a gather step.\n"
             "- DELIVERY: by default present the result in chat, or save it with "
             "file_write. Use send_mail ONLY when the goal EXPLICITLY asks to be "
             "emailed — never email unprompted.\n"
-            "- The FINAL combine step's depends_on lists EVERY sub-task id it "
-            "combines; after authoring it, call finalize_plan.\n\n"
-            "REGISTERED SPECIALIZATIONS (lookup — names + descriptions only):\n"
+            + final_combine_guidance
+            + "REGISTERED SPECIALIZATIONS (lookup — names + descriptions only):\n"
             + json.dumps(ctx["specializations"], indent=2)
             + "\n\nAVAILABLE TOOLS (names + descriptions only):\n"
             + json.dumps(ctx["tools"], indent=2)
         )
 
-    def _initial_user(self, goal: str) -> str:
-        """The first turn: the goal + the decision procedure for building the plan."""
+    def _initial_user(
+        self, goal: str,
+        prior_memory: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> str:
+        """The first turn: the goal + the decision procedure for building the plan.
+
+        ``prior_memory`` (d285 SB-3) is the upstream (summary, index) pairs the planner
+        reasons over to choose each step's ``memory_index`` (continue vs <<NEW>>); empty/
+        None → no upstream block (seed authoring, byte-identical)."""
+        # PRECEDENCE (d341): when the selected shape supplies a decompose_methodology, it REPLACES
+        # the generic gather→combine→deliver decision procedure (which stays the fallback for
+        # methodology-less shapes). The model reasons over the methodology; the engine authors
+        # nothing. Empty → byte-identical to the pre-d341 procedure.
+        methodology = self.shape_decompose_methodology
+        if methodology:
+            procedure = (
+                "Build the plan now, following THIS authoring methodology for the selected "
+                f"'{self.shape_name}' shape — it DEFINES exactly which steps to author and TAKES "
+                "PRECEDENCE over any generic gather/combine/deliver pattern:\n"
+                + methodology + "\n\n"
+                "Mechanics: call seed_plan first, then add_step for each step the methodology "
+                "calls for (set 'tool' and 'spec' as it directs), then finalize_plan. ONE tool "
+                "call per reply.\n"
+            )
+        else:
+            # NEUTRAL FALLBACK (RP-AUDIT F2) — topology-neutral decision procedure for a
+            # methodology-less shape. It guides the model to author the steps THIS goal needs and
+            # wire real dependencies, WITHOUT the pre-F2 gather→combine→deliver recipe ("list the
+            # distinct items … a gather step per item … a FINAL step that combines and delivers"),
+            # which forced every methodology-less goal (incl. a read→write codebase task) into a
+            # gather mold. A shape whose flow genuinely IS gather→combine carries that in its own
+            # decompose_methodology (the branch above). Output-FORMAT / spec binding guidance stays
+            # in the always-present _system GUIDANCE, so it is not lost by neutralizing here.
+            procedure = (
+                "Build the plan now. Decision procedure:\n"
+                "1. Work out the steps THIS goal actually needs: read its outcome and break it "
+                "into the distinct pieces of work required to reach it — no more, no fewer. Some "
+                "goals need one step; some need a step that reads or produces something and a "
+                "later step that uses it; some name several independent sub-tasks. Do NOT assume "
+                "a gather-then-combine shape.\n"
+                "2. Call seed_plan to open the plan.\n"
+                "3. Call add_step for each step. For each: set 'depends_on' by reasoning (the ids "
+                "of the steps whose result this step needs; [] for an independent step), set "
+                "'tool' to the tool that performs its action (search/fetch, read/write a file, "
+                "send email) or leave it blank for a reasoning/worker step, and set 'spec' only "
+                "when a listed specialization genuinely fits that step's work — a research/gather "
+                "step (it searches, fetches, reads, takes notes) takes a research/analysis spec "
+                "or NONE, never a document-format writer spec (that makes it emit the document "
+                "instead of gathering notes); bind an output-format writer spec ONLY on the final "
+                "step that WRITES the deliverable. Make the LAST step the one that DELIVERS the "
+                "goal's outcome (present it in chat, save it with file_write, or send_mail ONLY "
+                "if the goal EXPLICITLY asked to be emailed).\n"
+                "4. Call finalize_plan.\n"
+            )
         return (
             f"GOAL: {goal}\n\n"
-            "Build the plan now. Decision procedure:\n"
-            "1. List the DISTINCT ITEMS the GOAL names — each separate topic, place, "
-            "source, file or subject (e.g. 'climate change', 'space', 'AI' are "
-            "THREE). Each gather step covers exactly ONE.\n"
-            "2. Call seed_plan to open the plan.\n"
-            "3. Call add_step for each gather step (one per distinct item; "
-            "depends_on=[]; set 'tool' to the gather tool). Then add_step for the "
-            "FINAL step that combines and delivers (depends_on every gather id; set "
-            "'tool' to the delivery tool the goal asks for — file_write to save a "
-            "file; send_mail ONLY if the goal EXPLICITLY asked to be emailed). If "
-            "the goal names an output FORMAT (HTML, Markdown, a .html/.md file), "
-            "also set the FINAL step's output-style 'spec' to the writer for THAT "
-            "format — the HTML writer for HTML, the Markdown writer for Markdown.\n"
-            "4. Call finalize_plan.\n"
-            "Reply with ONE tool call now (start with seed_plan)."
+            + self._upstream_memory_block(prior_memory)
+            + procedure
+            + self._directive_block()
+            + "Reply with ONE tool call now (start with seed_plan)."
         )
 
     def _observation_user(self, obs: Mapping[str, Any]) -> str:
-        """Render a builder observation back to the model as the next user turn."""
+        """Render a builder observation back to the model as the next user turn.
+
+        NEUTRAL + METHODOLOGY-AWARE (RP-AUDIT F5, mirroring F1/F2/RP-4c d341). The
+        per-step "issue the NEXT tool call" nudge is TOPOLOGY-NEUTRAL: it asks the model
+        to author the next step THIS goal needs and to finalize once the plan has all the
+        steps the goal needs — WITHOUT the pre-F5 gather framing ("finalize_plan if every
+        distinct item is covered", which assumed a gather→combine flow and mis-framed a
+        read→write / single-step / non-gather goal). When the SELECTED shape supplies a
+        ``decompose_methodology`` the nudge DEFERS to it (author the next step that
+        methodology still calls for, finalize when the methodology's steps are all
+        present) — TAKING PRECEDENCE over the neutral guidance, exactly like ``_system`` /
+        ``_initial_user`` / ``_finalize_user``. Generic + shape-agnostic (a presence check
+        on the methodology field, NO shape-name/spec-name conditional); the engine renders
+        shape text, the model authors. Empty methodology → the neutral topology-agnostic
+        nudge."""
         steps = obs.get("steps") or []
         lines = [f"OBSERVATION: {obs.get('note', '')}"]
         if steps:
@@ -321,11 +453,28 @@ class IncrementalPlanner:
                 )
         else:
             lines.append("No steps authored yet.")
-        lines.append(
-            "Issue the NEXT tool call: add_step for the next step, set_node_spec to "
-            "refine a step's specialization, or finalize_plan if every distinct item "
-            "is covered and the plan is complete. Reply with ONE tool call."
-        )
+        if self.authoring_directive:
+            lines.append(self.authoring_directive)
+        # PRECEDENCE (RP-AUDIT F5 / d341): when the shape supplies a decompose_methodology,
+        # the nudge defers to it (the model authors the next step it calls for); otherwise
+        # a topology-neutral nudge that assumes NO gather→combine shape. The methodology
+        # itself is already rendered in the system prompt (passed every turn), so this turn
+        # only POINTS to it — it never re-authors or bakes a fixed flow.
+        if self.shape_decompose_methodology:
+            lines.append(
+                "Issue the NEXT tool call, following the selected "
+                f"'{self.shape_name}' shape's authoring methodology: add_step for the "
+                "next step it calls for, set_node_spec to refine a step's "
+                "specialization, or finalize_plan once the plan has every step the "
+                "methodology calls for and is complete. Reply with ONE tool call."
+            )
+        else:
+            lines.append(
+                "Issue the NEXT tool call: add_step for the next step THIS goal needs, "
+                "set_node_spec to refine a step's specialization, or finalize_plan once "
+                "the plan has all the steps the goal needs and is complete. Reply with "
+                "ONE tool call."
+            )
         return "\n".join(lines)
 
     def _finalize_user(self, goal: str, builder: PlanBuilder) -> str:
@@ -334,9 +483,17 @@ class IncrementalPlanner:
         The 4.6B model cannot reliably do the 'which items are still uncovered'
         set-difference statelessly, so once it starts re-emitting an already-authored
         step (the duplicate signal) the gather phase is DONE — every distinct item is
-        covered. This turn directs it to author ONLY the final combine/deliver step
-        (the eda-base3 FSM plays this controller role for the strong model). NOT
-        few-shot coercion — it carries no example plan and works for any goal/shape."""
+        covered. This turn directs it to author ONLY the closing step(s) (the eda-base3
+        FSM plays this controller role for the strong model). NOT few-shot coercion —
+        it carries no example plan and works for any goal/shape.
+
+        SHAPE-METHODOLOGY-AWARE (RP-4c/d341, F1): like ``_system`` / ``_initial_user``,
+        when the selected shape supplies a ``decompose_methodology`` the turn RENDERS it
+        and DEFERS to it (the model authors the closing step(s) per the shape's own flow),
+        TAKING PRECEDENCE over — and REPLACING — the hardcoded gather→combine→deliver +
+        output-format + delivery-tool recipe, which stays the FALLBACK for methodology-
+        less gather shapes. Generic + shape-agnostic (presence check, no spec-name/flow
+        conditional); the engine renders shape text, the model authors."""
         lines = [f"GOAL: {goal}", "", "STEPS ALREADY AUTHORED:"]
         for s in builder._state_summary():
             dep = ", ".join(s.get("depends_on") or []) or "-"
@@ -344,22 +501,57 @@ class IncrementalPlanner:
                 f"  {s['id']}: {s['task']}  [tool={s.get('tool') or '-'} "
                 f"depends_on={dep}]"
             )
-        lines.extend(
-            [
-                "",
-                "Every distinct item the goal names is now COVERED — the gathering "
-                "phase is COMPLETE. Call add_step ONCE for the FINAL step that "
-                "combines the gathered results and delivers the goal's outcome. Its "
-                "depends_on MUST list EVERY gather step id above it uses; set 'tool' "
-                "to the delivery tool the goal asks for (file_write to save a file; "
-                "send_mail ONLY if the goal EXPLICITLY asked to be emailed; else "
-                "leave it \"\"). If the goal names an output FORMAT (HTML, Markdown, "
-                "a .html/.md file), set this step's output-style 'spec' to the "
-                "matching writer (the HTML writer for HTML, the Markdown writer for "
-                "Markdown). Do NOT author another gather step or repeat any step "
-                "above. Reply with ONE add_step tool call for this final step.",
-            ]
-        )
+        # PRECEDENCE (RP-4c/d341, F1): when the SELECTED shape supplies a decompose_methodology,
+        # this forced-finalize turn RENDERS that methodology and DEFERS to it — the model authors
+        # the remaining/closing step(s) per the SHAPE's own flow, TAKING PRECEDENCE over (and
+        # REPLACING) the hardcoded gather→combine→deliver + output-format-writer + delivery-tool
+        # recipe below (which stays the FALLBACK only for methodology-LESS gather shapes). This
+        # mirrors _system / _initial_user EXACTLY (same field, same precedence framing, same
+        # research_tree d161/d170 substitution posture): behaviour lives in the SHAPE (definition
+        # layer); the substitution is generic + shape-agnostic (a presence check on the methodology
+        # field, NOT a spec-name/flow conditional); the engine renders shape text, the model authors
+        # the step(s). Empty → byte-identical to the pre-F1 hardcoded finalize turn.
+        methodology = self.shape_decompose_methodology
+        if methodology:
+            lines.extend(
+                [
+                    "",
+                    "The plan is NOT yet finalized — author the remaining step(s) to "
+                    "COMPLETE it, following THIS authoring methodology for the selected "
+                    f"'{self.shape_name}' shape. It DEFINES which step(s) still need "
+                    "authoring and TAKES PRECEDENCE over any generic gather/combine/"
+                    "deliver pattern:\n"
+                    + methodology + "\n\n"
+                    "Author ONLY the step(s) the methodology still calls for (do NOT "
+                    "repeat any step above; set 'tool'/'spec' exactly as the methodology "
+                    "directs), then call finalize_plan. Reply with ONE tool call now.",
+                ]
+            )
+        else:
+            # NEUTRAL FALLBACK (RP-AUDIT F2) — topology-neutral closing turn for a methodology-less
+            # shape. The pre-F2 version hardcoded "the FINAL step that combines the gathered results
+            # … depends_on MUST list EVERY gather step id … the HTML writer for HTML" — a gather→
+            # combine→deliver + output-format recipe the engine must NOT bake (d341). This directs
+            # the model to author the remaining step(s) that finish the goal — usually the single
+            # delivering step — wiring its real dependencies, without a gather assumption. Output-
+            # FORMAT / spec binding guidance is carried by the always-present _system prompt (passed
+            # on the same call), so neutralizing here does not lose it.
+            lines.extend(
+                [
+                    "",
+                    "The steps authored above do not yet COMPLETE the goal. Author the "
+                    "remaining step(s) needed to finish it — most often the single step "
+                    "that DELIVERS the goal's outcome using the earlier steps' results. "
+                    "Set that step's depends_on to the ids of the earlier steps it uses; "
+                    "set 'tool' to the delivery tool the goal asks for (file_write to save "
+                    "a file; send_mail ONLY if the goal EXPLICITLY asked to be emailed; "
+                    "else leave it \"\"). Do NOT repeat any step already authored above. "
+                    "Reply with ONE add_step tool call.",
+                ]
+            )
+        if self.authoring_directive:
+            lines.append("")
+            lines.append(self.authoring_directive)
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
@@ -478,320 +670,54 @@ class IncrementalPlanner:
                 pass
         return applied
 
-    def _apply_default_research_spec(
-        self, authored: list[dict[str, Any]], span: Any
-    ) -> int:
-        """Stamp the default research spec onto every null-spec GATHER node (F2).
-
-        A spec-less gather node has no ruleset, so it degrades to the d13 source-list-
-        summary anti-pattern (the empty/thin emailed news section). This finalization
-        pass binds :attr:`default_research_spec` to any node that has NO effective
-        spec, did NOT declare ``needs_spec`` (so the missing-specialist hatch is never
-        masked), AND is a GATHER node (its ``tool`` is one of :attr:`research_tools`).
-        Sibling-consistent; a delivery node is intentionally left unbound (its content
-        is upstream-grounded, d11). A no-op when the default is unset or not
-        registered. Returns the number of nodes stamped."""
-        default = self.default_research_spec
-        if not default or default not in set(self.spec_names):
-            return 0
-        applied = 0
-        for record in authored:
-            has_spec = bool(record.get("spec")) or bool(record.get("specs"))
-            if has_spec:
-                continue
-            if record.get("needs_spec"):
-                continue  # declared a MISSING specialist → leave for the gate
-            tool = str(record.get("tool") or "").strip().lower()
-            if tool not in self.research_tools:
-                continue
-            record["spec"] = default
-            applied += 1
-            try:
-                span.set_attribute(
-                    f"planner.node.{record['id']}.default_spec", default
-                )
-            except Exception:  # tracing must never break authoring
-                pass
-        if applied:
-            try:
-                span.set_attribute("planner.default_research_spec", default)
-                span.set_attribute("planner.default_spec_applied", applied)
-            except Exception:
-                pass
-        return applied
-
     # ------------------------------------------------------------------ #
-    # d28: terminal write/synthesize node MUST depend on the research node(s)
-    # ------------------------------------------------------------------ #
-    def _is_research(self, record: Mapping[str, Any]) -> bool:
-        """Is this node a RESEARCH/GATHER node (its output IS the research)?
-
-        Three signals, any of which is sufficient: it fires a research/gather tool
-        (``web_search``/``web_fetch`` — :attr:`research_tools`); its node ROLE is
-        ``research``; or it is bound to the :attr:`default_research_spec` (the F2
-        pass may have just stamped that onto a null-spec gather node, so this is
-        called AFTER F2). These are exactly the nodes whose output a downstream
-        write/synthesize node must consume — never a delivery node (file_write /
-        send_mail), whose content is grounded in upstream text, not researched."""
-        tool = str(record.get("tool") or "").strip().lower()
-        if tool in self.research_tools:
-            return True
-        if str(record.get("role") or "").strip().lower() == "research":
-            return True
-        specs = {str(s) for s in (record.get("specs") or [])}
-        if record.get("spec"):
-            specs.add(str(record["spec"]))
-        if self.default_research_spec and self.default_research_spec in specs:
-            return True
-        return False
-
-    @staticmethod
-    def _ancestors(start_id: str, by_id: Mapping[str, Mapping[str, Any]]) -> set[str]:
-        """Transitive ``depends_on`` closure of ``start_id`` (its upstream nodes)."""
-        seen: set[str] = set()
-        stack = [str(d) for d in (by_id[start_id].get("depends_on") or [])]
-        while stack:
-            d = stack.pop()
-            if d in seen or d not in by_id:
-                continue
-            seen.add(d)
-            stack.extend(str(x) for x in (by_id[d].get("depends_on") or []))
-        return seen
-
-    def _enforce_terminal_research_edge(
-        self, authored: list[dict[str, Any]], span: Any
-    ) -> list[str]:
-        """d28: a TERMINAL write/synthesize node MUST depend on the RESEARCH node(s).
-
-        E4B (and intermittently e2b) authors a FLAT zero-edge DAG — a research node
-        and a write node with NO edge between them — so the writer runs DISCONNECTED
-        from the research and the report comes back thin (the o4 / d34 emptiness).
-        This pass repairs that STRUCTURALLY at finalize: for every TERMINAL node (a
-        SINK — nothing depends on it) that is a WRITER (NOT itself a research/gather
-        node, per :meth:`_is_research`) and that does NOT already (directly or
-        transitively) depend on ANY research node, AUTO-ADD an edge to each research
-        node it can reach acyclically — so the writer always sees the research.
-
-        A no-op when there is no research node, the plan is a single step, or every
-        terminal writer already sees the research (the healthy DAG the model authored
-        stays BYTE-IDENTICAL — a connected combine/synthesize sink transitively
-        depends on its gather nodes, so this never fires on it). Adding an edge from a
-        SINK to a SOURCE only adds an ordering constraint and a sink has no dependents,
-        so it can never introduce a cycle (guarded regardless). Returns repair notes.
-        """
-        if len(authored) < 2:
-            return []
-        research_ids = [r["id"] for r in authored if self._is_research(r)]
-        if not research_ids:
-            return []  # not a research task → nothing to connect a writer to
-        by_id = {r["id"]: r for r in authored}
-        depended_on = {
-            str(d) for r in authored for d in (r.get("depends_on") or [])
-        }
-        sinks = [r for r in authored if r["id"] not in depended_on]
-        notes: list[str] = []
-        for w in sinks:
-            if self._is_research(w):
-                continue  # a research node that is itself terminal needs no upstream
-            w_anc = self._ancestors(w["id"], by_id)
-            if any(rid in w_anc for rid in research_ids):
-                continue  # already sees the research (directly or transitively)
-            deps = list(w.get("depends_on") or [])
-            added: list[str] = []
-            for rid in research_ids:
-                if rid == w["id"] or rid in deps:
-                    continue
-                if w["id"] in self._ancestors(rid, by_id):
-                    continue  # would cycle (defensive; a sink has no dependents)
-                deps.append(rid)
-                added.append(rid)
-            if added:
-                w["depends_on"] = deps
-                notes.append(
-                    f"node {w['id']!r}: auto-added research edge(s) {added} "
-                    "(disconnected terminal writer → research)"
-                )
-                try:
-                    span.set_attribute(
-                        f"planner.node.{w['id']}.research_edge_added",
-                        ", ".join(added),
-                    )
-                except Exception:
-                    pass
-        if notes:
-            try:
-                span.set_attribute("planner.research_edge_repairs", len(notes))
-                span.set_attribute("planner.dag.connectivity_repaired", True)
-            except Exception:
-                pass
-        return notes
-
-    # ------------------------------------------------------------------ #
-    # b5: GUARANTEE the requested OUTPUT FORMAT writer on the terminal node
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _requested_output_format(goal: str) -> Optional[tuple[str, str]]:
-        """The ``(format, writer-spec)`` the GOAL explicitly asks for, or ``None``.
-
-        Returns a single format ONLY when the goal names EXACTLY one of the known
-        output formats (so an ambiguous goal that mentions both, or none, is a
-        no-op — never a guess, mirroring the fail-open posture of the other
-        signals). The match is on the verbatim goal text (the plan carries it),
-        not the planner's paraphrase."""
-        import re as _re
-
-        text = str(goal or "")
-        hits = [
-            (fmt, writer)
-            for fmt, writer, pat in _OUTPUT_FORMAT_WRITERS
-            if _re.search(pat, text, _re.IGNORECASE)
-        ]
-        return hits[0] if len(hits) == 1 else None
-
-    def _enforce_output_format_spec(
-        self, authored: list[dict[str, Any]], goal: str, span: Any
-    ) -> list[str]:
-        """Guarantee the GOAL's requested output-format writer on the terminal node.
-
-        The d13/B2 fix as a STRUCTURAL guarantee (the F5 pattern): when the goal
-        names a deliverable format (HTML / Markdown / a .html/.md file) the PROMPT
-        already tells the planner to bind that format's writer on the final step,
-        but E4B intermittently binds the analysis spec (``research-analyst``) on a
-        "synthesize" node instead — so the deliverable comes back in the wrong form.
-        This pass closes that gap deterministically: for every TERMINAL writer node
-        (a SINK that is not itself a research/gather node), it ensures the requested
-        format's writer is the PRIMARY output-style spec, COMPOSING it ahead of any
-        analysis spec already there (per the selection guidelines: an analysis spec +
-        an output-format spec compose on the final node), and REMOVING the OTHER
-        format's writer (the two are mutually exclusive). No-op (byte-identical) when
-        the goal names no single format, the writer spec is not registered, or the
-        terminal writer already leads with the right format spec. Returns repair
-        notes.
-
-        s9/c2 (d48) — JUSTIFIED, NOT a flow-forcing flag. This is a structural
-        OUTPUT-FORMAT INVARIANT (parallel to the wants_file→file invariant): "an HTML
-        request must terminate in the HTML writer." It does NOT pick the route or the
-        plan shape (the model's reasoning does that). With c2's faithful selection
-        (shape selection off format=schema), the planner usually binds the right writer
-        itself, so this is a NO-OP safety net that only fires on an intermittent
-        mis-bind — it never overrides a correctly-reasoned binding. Kept (justified)
-        rather than removed so a single E4B mis-bind cannot silently ship the wrong
-        format; it is the thin deterministic floor under the reasoned selection."""
-        want = self._requested_output_format(goal)
-        if not want:
-            return []
-        fmt, writer = want
-        if writer not in set(self.spec_names):
-            return []  # the project does not have this output-style seed → no-op
-        other_writers = {
-            w for _f, w, _p in _OUTPUT_FORMAT_WRITERS if w != writer
-        }
-        depended_on = {
-            str(d) for r in authored for d in (r.get("depends_on") or [])
-        }
-        sinks = [r for r in authored if r["id"] not in depended_on]
-        notes: list[str] = []
-        for w in sinks:
-            # Skip a pure GATHER sink (its job is fetching, not producing the
-            # deliverable) — keyed on the TOOL/role, NOT on a spec binding: the
-            # whole point of this pass is to fix a synthesize sink that was
-            # mis-bound to the research-analyst spec, so ``_is_research`` (which
-            # treats that binding as "research") must NOT gate it here.
-            # d48: "research" is no longer a node role — a gather node is identified
-            # by its TOOL (web_search/web_fetch), which is the reliable signal here.
-            tool = str(w.get("tool") or "").strip().lower()
-            if tool in self.research_tools:
-                continue  # a gather node, not the deliverable writer
-            existing = list(w.get("specs") or [])
-            if not existing and w.get("spec"):
-                existing = [w["spec"]]
-            # Drop the wrong-format writer(s); keep analysis/other specs in order.
-            kept = [s for s in existing if s not in other_writers]
-            changed = kept != existing
-            if writer in kept:
-                if kept[0] != writer:  # present but not primary → promote it
-                    kept = [writer] + [s for s in kept if s != writer]
-                    changed = True
-            else:
-                kept = [writer] + kept  # missing → stamp it as the primary output style
-                changed = True
-            if changed:
-                w["specs"] = kept
-                w["spec"] = kept[0]
-                w["needs_spec"] = None  # a registered writer is not "missing"
-                notes.append(
-                    f"node {w['id']!r}: enforced {fmt} output spec {writer!r} "
-                    f"(specs now {kept})"
-                )
-                try:
-                    span.set_attribute(
-                        f"planner.node.{w['id']}.output_format_spec", writer
-                    )
-                except Exception:
-                    pass
-        if notes:
-            try:
-                span.set_attribute("planner.output_format", fmt)
-                span.set_attribute("planner.output_format_repairs", len(notes))
-            except Exception:
-                pass
-        return notes
-
-    # ------------------------------------------------------------------ #
-    # d50 point-4: echo an explicitly-named filename into the terminal task
-    # ------------------------------------------------------------------ #
-    def _echo_literal_filename(
-        self, authored: list[dict[str, Any]], goal: str, span: Any
-    ) -> list[str]:
-        """Echo the GOAL's explicit filename into the TERMINAL writer node's task.
-
-        Point-4 (d50): so ``cats.html`` resolves VERBATIM on ANY route. The
-        deliverable path is derived TYPE-AGNOSTICALLY by
-        :func:`~agent_runtime.synth_tools.derive_output_path`, which reads BOTH the
-        carried overall-goal AND the node's task. The live path carries the goal, but
-        echoing the literal name into the terminal task makes the verbatim name
-        survive even when only the node task reaches the writer (a replan/standalone
-        re-dispatch, or any future route) — the same robustness the output-format /
-        research-edge finalization passes give. No-op (byte-identical) when the goal
-        names no explicit file, or the terminal task already mentions it. Scoped to
-        the deliverable-writer sink(s); a pure gather sink is skipped. Returns notes."""
-        name = explicit_filename(goal)
-        if not name:
-            return []
-        depended_on = {
-            str(d) for r in authored for d in (r.get("depends_on") or [])
-        }
-        sinks = [r for r in authored if r["id"] not in depended_on]
-        notes: list[str] = []
-        for w in sinks:
-            tool = str(w.get("tool") or "").strip().lower()
-            role = str(w.get("role") or "").strip().lower()
-            if tool in self.research_tools or role == "research":
-                continue  # a gather sink, not the deliverable writer
-            task = str(w.get("task") or "")
-            if name.lower() in task.lower():
-                continue  # already names the file → leave byte-identical
-            w["task"] = (task.rstrip(". ") + f". Write the file as {name}.").strip()
-            notes.append(
-                f"node {w['id']!r}: echoed literal filename {name!r} into task"
-            )
-            try:
-                span.set_attribute(f"planner.node.{w['id']}.literal_filename", name)
-            except Exception:
-                pass
-        if notes:
-            try:
-                span.set_attribute("planner.literal_filename", name)
-                span.set_attribute("planner.literal_filename_echoed", len(notes))
-            except Exception:
-                pass
-        return notes
+    # RP-3b (d311/d319/d328) — the three engine-authored STRUCTURE repairs are RETIRED.
+    #
+    # Three finalization passes used to CRUTCH the planner's authoring reliability by
+    # having the ENGINE author DAG/spec/format structure the model was expected to
+    # produce: _apply_default_research_spec (stamped a research spec on null-spec gather
+    # nodes), _enforce_terminal_research_edge (auto-added the writer<-research edge on a
+    # disconnected terminal), and _enforce_output_format_spec (stamped the format writer
+    # on the terminal). Each is now retired, COUPLED to a live measure (RP-3b probe, 20
+    # E4B :11434 trials): the planner authors all three axes ITSELF 100% reliably —
+    # gather-node spec 12/12, terminal writer<-research edge 12/12, terminal format
+    # writer 16/16 (incl. the deep-research write phase). Per d311/d319 the engine now
+    # authors NO DAG/spec/format structure here; reliability comes from the planner
+    # prompt + the selected shape (the definition layer), never an engine stamp/flag/
+    # spec-name conditional. The helpers those passes used (_is_research, _ancestors,
+    # _requested_output_format, _OUTPUT_FORMAT_WRITERS/_VARIANTS, default_research_spec)
+    # are removed with them. F5 _apply_requested_specs (honours a user-NAMED spec) is OUT
+    # of scope and preserved.
+    #
+    # RP-AUDIT F5 (d50 echo RETIRED, d319/d341): the ``_echo_literal_filename`` pass used
+    # to ENGINE-AUTHOR a "write-the-file-as-<name>" sentence into the terminal node's TASK
+    # and assumed a FILE-WRITER SINK (it classified sinks and skipped gather nodes). Both
+    # are anti-fab violations — the engine authoring node task content + baking a delivery-
+    # sink assumption. It is RETIRED. Filename-honoring is PRESERVED by the already-present
+    # goal-carry: the user's named file is carried VERBATIM on ``PlanDAG.goal`` (= every
+    # node's overall-goal, d39), and the writer derives its output path via
+    # ``synth_tools.derive_output_path(overall_goal, node.task)`` — which reads the explicit
+    # filename straight from the GOAL (the user's own words) regardless of the node task. So
+    # ``cats.html`` still reaches disk as the user asked, with NO engine-authored task text
+    # and NO file-sink assumption — the delivery sink is goal/shape-implied (the model
+    # authors it; ``derive_output_path`` only applies when a node actually writes a file).
 
     # ------------------------------------------------------------------ #
     # the authoring loop (tool calls → assemble DAG)
     # ------------------------------------------------------------------ #
-    async def plan(self, goal: str) -> PlanResult:
+    async def plan(
+        self, goal: str,
+        *,
+        prior_memory: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> PlanResult:
         """Author a validated :class:`PlanDAG` for ``goal`` via planner tool calls.
+
+        ``prior_memory`` (d285 SB-3) is the OPTIONAL upstream (summary, memory_index)
+        pairs the planner reasons over to choose each step's ``memory_index`` — CONTINUE a
+        prior research line (reuse its index) or start a FRESH one (``<<NEW>>``). None/empty
+        → no upstream block, the authoring is byte-identical to the seed path. This is the
+        SB-3 SEAM; SB-4 wires the served handoff that populates it from compose-task (a test
+        injects it directly to prove the choice resolves through SB-1's store pre-SB-4).
 
         Loops up to ``2*max_nodes + 4`` turns: each turn the model issues ONE tool
         call (a small native reasoning decision), the :class:`PlanBuilder` applies it
@@ -812,7 +738,6 @@ class IncrementalPlanner:
             shape_name=self.shape_name,
             shape_description=self.shape_description,
             max_nodes=self.max_nodes,
-            inject_review=self.inject_review,
         )
         self.last_builder = builder
         max_turns = 2 * self.max_nodes + 4
@@ -825,7 +750,7 @@ class IncrementalPlanner:
             span.set_attribute("planner.authoring", "tool-driven")
 
             convo: list[dict[str, Any]] = [
-                {"role": "user", "content": self._initial_user(goal)}
+                {"role": "user", "content": self._initial_user(goal, prior_memory)}
             ]
             tool_call_count = 0
             unproductive = 0  # consecutive turns that produced no usable progress
@@ -869,8 +794,13 @@ class IncrementalPlanner:
                     break
                 if unproductive >= 2:
                     break
+                # s15/a18 (d189): the builder.dispatch RESULT (the authored-steps observation)
+                # is a tool function-result, NOT a fresh USER instruction — feed it back role
+                # 'tool' so the planner reasons over the running plan state instead of reading
+                # its own tool output as a new user turn. The "not a single JSON tool call"
+                # nudge above and the finalize prompt stay role 'user' (genuine instructions).
                 convo.append(
-                    {"role": "user", "content": self._observation_user(obs)}
+                    {"role": "tool", "content": self._observation_user(obs)}
                 )
 
             span.set_attribute("planner.tool_calls", tool_call_count)
@@ -904,33 +834,19 @@ class IncrementalPlanner:
 
             span.set_attribute("planner.node_count", len(builder.nodes))
 
-            # F5 REQUESTED-SPEC PASS (before F2): guarantee a user-NAMED spec is bound
-            # on the terminal/delivery node when the model forgot to. Runs FIRST so the
-            # F2 default-research pass below sees the now-bound node as already-specced.
+            # F5 REQUESTED-SPEC PASS: guarantee a user-NAMED spec (from the model-driven
+            # ShapeSelector) is bound on the terminal/delivery node when the model forgot
+            # to. Out of RP-3b scope (honours an explicit user request, not engine-authored
+            # structure) — preserved.
             self._apply_requested_specs(builder.nodes, span)
-            # F2 DEFAULT-RESEARCH-SPEC PASS: bind the generic research spec to any
-            # null-spec gather node so no parallel sibling ships an ungrounded /
-            # source-list-summary section (d13). Topology stays exactly as the model
-            # authored it — only spec-less gather nodes gain the default ruleset.
-            self._apply_default_research_spec(builder.nodes, span)
-            # d28 TERMINAL-RESEARCH EDGE PASS (after F2 so default-spec'd gather nodes
-            # are detectable): a terminal write/synthesize node MUST depend on the
-            # research/gather node(s). E4B authors flat zero-edge DAGs EVERY run,
-            # starving the writer → thin output (o4); this auto-adds the missing edge.
-            # No-op (byte-identical) on a healthy DAG whose sink already sees research.
-            edge_repairs = self._enforce_terminal_research_edge(builder.nodes, span)
-            # b5 OUTPUT-FORMAT PASS: when the goal names a deliverable format
-            # (HTML/Markdown/.html/.md), GUARANTEE that format's output-style writer
-            # on the terminal write node (the prompt is the primary lever; E4B
-            # intermittently binds research-analyst on a synthesize node instead, so
-            # this stamps the format writer as primary + drops the wrong-format one).
-            # No-op when the goal names no single format or the writer is unregistered.
-            format_repairs = self._enforce_output_format_spec(builder.nodes, goal, span)
-            # d50 POINT-4: echo an explicitly-named filename (cats.html) into the
-            # terminal writer's task so it resolves VERBATIM on any route (the shared
-            # agentic file loop derives the path from goal+task). No-op when the goal
-            # names no file or the terminal task already mentions it.
-            filename_echoes = self._echo_literal_filename(builder.nodes, goal, span)
+            # RP-3b (d311/d319/d328): the F2 default-research-spec pass, the d28 terminal-
+            # research-edge pass, and the b5 output-format pass are RETIRED — the planner
+            # authors the gather-node spec, the writer<-research edge, and the format
+            # writer ITSELF (measured 100% reliable on live E4B, RP-3b probe). The engine
+            # authors NO DAG/spec/format structure here.
+            # RP-AUDIT F5: the d50 ``_echo_literal_filename`` pass is RETIRED — filename-
+            # honoring is preserved by the goal-carry (PlanDAG.goal → derive_output_path),
+            # so the engine no longer authors task prose or assumes a file-writer sink.
 
             if not builder.nodes:
                 raise MalformedOutputError(
@@ -972,10 +888,7 @@ class IncrementalPlanner:
                 raw=json.dumps(builder.calls),
                 structured=structured,
                 repair={
-                    "research_edges": edge_repairs,
                     "dangling_edges": list(dangling_repairs),
-                    "output_format": format_repairs,
-                    "literal_filename": filename_echoes,
                 },
             )
             self.last_result = result

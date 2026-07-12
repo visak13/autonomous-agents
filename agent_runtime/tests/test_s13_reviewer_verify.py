@@ -26,20 +26,14 @@ from __future__ import annotations
 
 import asyncio
 
-from llm_framework import ChatResult, FakeTransport
-
 from agent_runtime.claim_verify import (
     REVIEWER_FILE_TOOL_SPECS,
     REVIEWER_TOOL_SPECS,
     VERIFY_VERDICT_TOOL,
     parse_verify_verdict,
     verdict_from_native_args,
-    verify_and_revise,
     verify_claims,
 )
-from agent_runtime.factory import PlanDAG, PlanNode
-from agent_runtime.runtime import AgentRuntime
-from agent_runtime.synth_tools import DONE_SENTINEL
 from reactive_tools import EventPlane, ToolHook, register_agentic_tools
 
 
@@ -207,77 +201,8 @@ def test_verdict_from_native_args_matches_string_parse_shape():
     assert alt.grounded is False and alt.unbacked[0].claim == "c2"
 
 
-# =========================================================================== #
-# INTEGRATION — the SERVED runtime section-verify seam dispatches the verdict
-# from a NATIVE tool_call even with leading prose, then the RAW revise removes it.
-# =========================================================================== #
-_VERIFY_SOURCES = [
-    {"title": "UN News", "url": "https://news.un.org/iran",
-     "source_trust": "secondary", "markdown": "Iran fired 180 missiles on June 14."},
-]
-_REPORT_REAL = (
-    "# Iran-Israel Escalation\n\n"
-    "On June 14 Iran fired 180 missiles, the UN reported. Twelve people were killed in "
-    "the exchange. Damage assessments continue across several provinces.\n\n"
-)
-_REPORT_FAB = "Legally, under 17 USC 107(5) enacted by the CTEA of 1998, the strike was lawful.\n"
-
-
-def _synth_dag() -> PlanDAG:
-    return PlanDAG(
-        nodes=[PlanNode(id="s1", task="Write a report on the Iran escalation to iran.md.",
-                        role="synthesizer")],
-        goal="Write a report on the Iran escalation.",
-    )
-
-
-def _native_synth_reply():
-    """Write the report (real + fabricated), then serve the VERDICT as a NATIVE tool_call
-    that LEADS WITH PROSE, and the RAW revise turn as plain corrected text."""
-    def reply(messages, **opts):
-        user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-        if "REPORT TO CORRECT" in user:
-            return _REPORT_REAL                      # raw ground-or-remove → fabrication gone
-        if "REPORT TO FACT-CHECK" in user:
-            # the verdict rides NATIVE tool_calls, with leading PROSE on the same turn
-            if "17 USC 107(5)" in user:
-                return ChatResult(
-                    role="assistant",
-                    content="Let me review the report against the sources.",
-                    tool_calls=[{"name": VERIFY_VERDICT_TOOL,
-                                 "arguments": {"verdict": "revise", "unbacked": [
-                                     {"claim": "17 USC 107(5)",
-                                      "reason": "no fetched source backs this statute"}]}}])
-            return ChatResult(role="assistant", content="All grounded now.",
-                              tool_calls=[{"name": VERIFY_VERDICT_TOOL,
-                                           "arguments": {"verdict": "ok"}}])
-        # the write loop: one-shot the whole report, then confirm DONE
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        return (_REPORT_REAL + _REPORT_FAB) if n == 0 else DONE_SENTINEL
-    return reply
-
-
-def _hook(tmp_path) -> ToolHook:
-    hook = ToolHook(EventPlane())
-    register_agentic_tools(hook, file_base=tmp_path, cron_data_dir=tmp_path)
-    return hook
-
-
-def test_served_section_verify_dispatches_native_verdict_and_revises(tmp_path):
-    """verify_lane ON via the runtime: the section verdict arrives on the NATIVE tool_call
-    channel DESPITE leading prose (drop-immune), the raw revise removes the fabrication, and
-    the corrected file is re-persisted — the real content survives."""
-    transport = FakeTransport([_native_synth_reply()])
-    rt = AgentRuntime(
-        transport=transport, hook=_hook(tmp_path),
-        subagent_call_opts={"think": True, "temperature": 0},
-        verify_lane=True,
-    )
-    rt.chain_sources = _VERIFY_SOURCES
-    out = _run(rt.run(_synth_dag()))
-
-    assert out.ok
-    doc = out.results["s1"].output or ""
-    assert "17 USC 107(5)" not in doc and "180 missiles" in doc
-    on_disk = (tmp_path / "iran.md").read_text(encoding="utf-8")
-    assert on_disk == doc and "CTEA" not in on_disk
+# RP-3c (d330): the SERVED runtime section-verify INTEGRATION test is RETIRED with the
+# engine verify/revise lane it drove (``verify_lane`` + ``verify_and_revise`` are gone). The
+# NATIVE-verdict dispatch it proved is still covered by the ``verdict_from_native_args`` unit
+# above and the model-driven ``verify_claims`` tests; the no-fab self-review now lives in the
+# writer doctrine (proven by the RP-3c self-policing test + the bounded live measure).

@@ -1,5 +1,10 @@
 import { useTheme } from "../../theme/useTheme";
 import type { StreamStatus } from "../../hooks/useChatStream";
+import featherIcon from "../../assets/theme/icon-shape-feather.svg";
+import lotusIcon from "../../assets/theme/icon-spec-lotus.svg";
+import tunedIcon from "../../assets/theme/icon-tuned.svg";
+import sunIcon from "../../assets/theme/icon-sun.svg";
+import moonIcon from "../../assets/theme/icon-moon.svg";
 import "./TopBar.css";
 
 export type AppView = "tasks" | "spec" | "tuned" | "shapes";
@@ -26,10 +31,12 @@ export function TopBar({ streamStatus, hasChat, view, onSetView }: TopBarProps) 
   return (
     <header className="topbar">
       <div className="topbar-brand">
-        <span className="topbar-logo" aria-hidden="true">
-          λ
-        </span>
+        {/* s17 re-theme: the peacock-feather mark + wordmark in real type (no
+            generated brand image — the user rejected those; the feather says
+            "shapes", which IS the product). */}
+        <img className="topbar-logo" src={featherIcon} alt="" aria-hidden="true" />
         <span className="topbar-title">ReactiveAgents</span>
+        <span className="topbar-tagline">Any goal. It takes shape.</span>
       </div>
 
       <div className="topbar-right">
@@ -40,7 +47,14 @@ export function TopBar({ streamStatus, hasChat, view, onSetView }: TopBarProps) 
           aria-pressed={view === "tuned"}
           title="How your model was tuned for your PC"
         >
-          {view === "tuned" ? "← Task chat" : "🔧 How it's tuned"}
+          {view === "tuned" ? (
+            "← Task chat"
+          ) : (
+            <>
+              <img className="theme-icon" src={tunedIcon} alt="" aria-hidden="true" />{" "}
+              How it&apos;s tuned
+            </>
+          )}
         </button>
         <button
           type="button"
@@ -48,7 +62,14 @@ export function TopBar({ streamStatus, hasChat, view, onSetView }: TopBarProps) 
           onClick={toggleTo("spec")}
           aria-pressed={view === "spec"}
         >
-          {view === "spec" ? "← Task chat" : "Specializations"}
+          {view === "spec" ? (
+            "← Task chat"
+          ) : (
+            <>
+              <img className="theme-icon" src={lotusIcon} alt="" aria-hidden="true" />{" "}
+              Specializations
+            </>
+          )}
         </button>
         <button
           type="button"
@@ -57,7 +78,14 @@ export function TopBar({ streamStatus, hasChat, view, onSetView }: TopBarProps) 
           aria-pressed={view === "shapes"}
           title="The plan shapes the planner selects — set each shape's iteration ceiling"
         >
-          {view === "shapes" ? "← Task chat" : "Shapes"}
+          {view === "shapes" ? (
+            "← Task chat"
+          ) : (
+            <>
+              <img className="theme-icon" src={featherIcon} alt="" aria-hidden="true" />{" "}
+              Shapes
+            </>
+          )}
         </button>
         {hasChat && view === "tasks" && (
           <span
@@ -76,7 +104,12 @@ export function TopBar({ streamStatus, hasChat, view, onSetView }: TopBarProps) 
           aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
           title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
         >
-          {theme === "dark" ? "☾" : "☀"}
+          <img
+            className="theme-icon"
+            src={theme === "dark" ? moonIcon : sunIcon}
+            alt=""
+            aria-hidden="true"
+          />
         </button>
       </div>
     </header>

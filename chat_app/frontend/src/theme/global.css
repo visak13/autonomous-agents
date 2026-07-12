@@ -17,44 +17,14 @@ body {
   font-size: var(--text-md);
   font-weight: 450;
   color: var(--text-primary);
-  /* Solid parchment base = instant, zero-CLS paint behind the wash. */
-  background-color: var(--wash-base);
+  /* SOLID ground (s17 re-theme): lotus white by day, tiger night-ink by night.
+   * No background image/wash — ornament rides the vectorized border assets. */
+  background-color: var(--bg-app);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-/*
- * Full-page kitsune watercolour wash — a FIXED, heavily-faded backdrop behind
- * ALL content. Three stacked background layers (top → bottom):
- *   1. a parchment scrim (--wash-scrim) that fades/desaturates the fox so text
- *      always wins the contrast fight (the graded readability requirement);
- *   2. the optimized wash, FORMAT-negotiated via image-set (AVIF → WebP → JPEG);
- *   3. a tiny inline base64 LQIP that paints the dominant colours instantly,
- *      under the real image, so first paint is never blank.
- * position:fixed + background-size:cover ⇒ it never participates in layout ⇒
- * zero CLS regardless of viewport size. The preload of the AVIF (index.html,
- * fetchpriority=high) makes this the prioritized LCP fetch.
- */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background-image:
-    linear-gradient(var(--wash-scrim), var(--wash-scrim)),
-    image-set(
-      url("/static/bg/kitsune-bg-1280.avif") type("image/avif"),
-      url("/static/bg/kitsune-bg-1280.webp") type("image/webp"),
-      url("/static/bg/kitsune-bg-1280.jpg") type("image/jpeg")
-    ),
-    url("data:image/jpeg;base64,/9j//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgQEBMQExYWFhYWFhoYGhsbGxoaGhobGxsdHR0iIiIdHR0bGx0dICAiIiUmJSMjIiMmJigoKDAwLi44ODpFRVP/xABoAAEAAwEAAAAAAAAAAAAAAAAFBAAHBgEBAAMBAQAAAAAAAAAAAAAAAgMEAQAFEAABBAEFAQAAAAAAAAAAAAACABEBAwQS0pNxFFQRAAEDBQEBAAAAAAAAAAAAAAACAQPRERSSUwQx/8AAEQgADgAYAwESAAISAAMSAP/aAAwDAQACEQMRAD8A0XwYfzY/EG1KrwceHnHqmhZDjefjFomhfKi779EMy0RxhMghJcjQcibvPToEb3dQ/hM1mSf/2Q==");
-  background-size: cover;
-  background-position: center center;
-  background-repeat: no-repeat;
-}
-
-/* Headings use the English display serif at heavier weight — crisp over the wash. */
+/* Headings use the display serif at heavier weight. */
 h1,
 h2,
 h3 {
@@ -96,38 +66,42 @@ a {
 }
 
 /*
- * Frosted-parchment glass for the surface panels that float over the wash.
- * Centralized here (rather than repeated in every component sheet) so the
- * watercolour treatment lives in one place: each listed panel already carries a
- * translucent parchment background via its semantic token; the backdrop blur
- * softens the fox showing THROUGH it, which both reads as washi paper and lifts
- * text contrast. Only OUTER containers are frosted (their nested cards inherit
- * the effect) to keep the GPU cost bounded. Degrades gracefully where
- * backdrop-filter is unsupported (the high token alpha still passes AA).
+ * Theme ornament helpers (s17 re-theme) — the vectorized peacock/lotus/tiger
+ * assets, applied as centrally-defined chrome so components stay token-only.
+ * Each divider is an <hr class="orn-divider …"> or a block element; the image
+ * scales to the container width, height-capped so it stays an ornament.
  */
-.topbar,
-.sidebar,
-.app-aside,
-.bubble,
-.spec-bubble,
-.cot-panel,
-.cot-launcher,
-.lambda-tab-panel,
-.spec-surface-head,
-.spec-open,
-.spec-draft,
-.tuned-head,
-.tuned-card {
-  -webkit-backdrop-filter: blur(8px) saturate(108%);
-  backdrop-filter: blur(8px) saturate(108%);
+.orn-divider {
+  border: none;
+  height: 28px;
+  margin: var(--space-4) auto;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: contain;
+  opacity: 0.9;
+}
+.orn-divider-feather {
+  background-image: url("../assets/theme/divider-feather.svg");
+}
+.orn-divider-lotus {
+  background-image: url("../assets/theme/divider-lotus.svg");
+}
+.orn-divider-ticks {
+  background-image: url("../assets/theme/divider-ticks.svg");
+  height: 16px;
+  opacity: 0.75;
 }
 
-/* The central chat column is transparent so the fox shows behind the floating
- * message cards; a whisper-thin parchment veil keeps inter-bubble hint text
- * comfortably above AA without hiding the wash. */
-.app-main {
-  background: rgba(244, 234, 213, 0.28);
+/* Inline theme icon (img.theme-icon) — sized to the text line it sits beside. */
+.theme-icon {
+  display: inline-block;
+  width: 1.15em;
+  height: 1.15em;
+  vertical-align: -0.2em;
+  object-fit: contain;
 }
-:root[data-theme="dark"] .app-main {
-  background: rgba(22, 18, 14, 0.32);
+.theme-icon-lg {
+  width: 1.6em;
+  height: 1.6em;
+  vertical-align: -0.35em;
 }

@@ -93,6 +93,7 @@ from chat_app.shape_authoring import (
     ShapeAuthorService,
     register_shape_author_routes,
 )
+from chat_app.shape_chat import ShapeChatService, register_shape_chat_routes
 from chat_app.runs import RunManager
 from chat_app.workflow import make_live_report_producer, schedule_workflow_spec
 
@@ -128,6 +129,13 @@ RUNTIME_EVENT_KINDS: tuple[str, ...] = (
     # user a clarifying question publishes this kind so the chat is NOTIFIED live
     # and shown the question — never a silent guess of the missing detail.
     EVENT_NEEDS_CLARIFICATION,
+    # TERMINAL SYNTHESIZER summary (D4, d215): the run_plan_chain terminal synthesizer
+    # SSE-announces a brief summary + the downloadable artifact on the chat plane once the
+    # planner loop exits. Whitelist it so the live stream relays it. d221 — the synthesizer
+    # also STREAMS the summary as ordered delta frames ahead of the terminal event; relay
+    # those too so a streaming-aware shell renders the summary progressively.
+    "agent_run_synthesis",
+    "agent_run_synthesis_delta",
     "tool_call",
     "tool_result",
 )
@@ -394,6 +402,17 @@ def register_routes(app: FastAPI) -> None:
     register_shape_author_routes(app, shape_author_service)
     app.state.shape_author_service = shape_author_service
 
+    # --- (5b) the CONVERSATIONAL shape chat (s17, d18a/d249 parity) ---------- #
+    # The multi-turn, draft-based authoring conversation the spec chat already has:
+    # each message refines an IN-SESSION draft; approve persists it (same round-trip
+    # guard as the one-shot path); deny discards. Live transport only (else 503).
+    shape_chat_service = ShapeChatService(
+        shape_service,
+        transport=w.live_transport if w.transport_mode == "live" else None,
+    )
+    register_shape_chat_routes(app, shape_chat_service)
+    app.state.shape_chat_service = shape_chat_service
+
     # ---------------------------- chat surface ---------------------------- #
     @app.post("/chats", status_code=201)
     async def new_chat(req: NewChatRequest) -> JSONResponse:
@@ -474,6 +493,9 @@ def register_routes(app: FastAPI) -> None:
                 run_id=run_id,
                 shape_config=w.shape_config,  # UI-set per-shape max_iter (s4/a4, d5)
                 conversation_context=conversation_context,
+                # a17 (d185 Layer 3) — bind PHASE-1 research state to THIS chat session so a
+                # follow-up turn reads prior notes/sources back instead of re-researching.
+                session_id=chat_id,
             )
         else:
             agentic = await run_offline(
@@ -613,6 +635,21 @@ def register_routes(app: FastAPI) -> None:
                 )
             )
 
+        # d185 NOTES-ARCH Layer 2 — persist this research's BRIEF at the chat-session
+        # level keyed by (chat_id, research_id) so MULTIPLE researches in one chat
+        # coexist, each addressable by its brief. research_id is the run_id (the
+        # per-research job id); the inline path leaves run_id None, so fall back to a
+        # turn-stable id within this chat. Additive: only the new research_briefs table
+        # is touched. None brief (a non-research turn) => no row, no-op.
+        if getattr(agentic, "research_brief", None):
+            research_id = run_id or f"research-turn-{turn.turn_index}"
+            await asyncio.to_thread(
+                w.chat_store.save_research_brief,
+                chat_id,
+                research_id,
+                agentic.research_brief,
+            )
+
         return MessageResponse(
             chat_id=chat_id,
             turn_index=turn.turn_index,
@@ -736,6 +773,8 @@ def register_routes(app: FastAPI) -> None:
                     shape_config=w.shape_config,
                     conversation_context=resume_context,
                     clarification=answer,
+                    # a17 (d185 Layer 3) — same chat session → same sticky research state.
+                    session_id=chat_id,
                 )
             else:
                 # Offline seam (d12): the offline path never asks a clarifying

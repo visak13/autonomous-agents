@@ -95,7 +95,6 @@ def _planner(replies: Sequence[str], tmp_path) -> IncrementalPlanner:
         tool_names=[t["name"] for t in _TOOL_CATALOG],
         shape_name="linear",
         shape_description="a gather step then a single deliver step",
-        default_research_spec=DEEP_RESEARCH_SPEC,
     )
 
 

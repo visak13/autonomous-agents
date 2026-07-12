@@ -248,6 +248,75 @@ def test_web_fetch_passes_through_plain_text(monkeypatch):
     assert out["markdown"] == "just plain text"
 
 
+def test_web_fetch_caches_same_url(monkeypatch):
+    """d221: a same-url re-fetch within the TTL is served from cache (no live HTTP)."""
+    calls = {"n": 0}
+
+    def _counting_get(url, **k):
+        calls["n"] += 1
+        return _ARTICLE_HTML, _FakeResp("https://example.com/a")
+
+    monkeypatch.setattr(wt, "_http_get_bytes", _counting_get)
+    fetch = make_web_fetch()
+    first = fetch("https://example.com/a")
+    second = fetch("https://example.com/a")
+    assert calls["n"] == 1                    # only ONE live round-trip
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert second["markdown"] == first["markdown"]
+
+
+def test_web_fetch_cache_key_includes_max_bytes(monkeypatch):
+    """A larger re-fetch must NOT be served a smaller cached body (key has max_bytes)."""
+    calls = {"n": 0}
+
+    def _counting_get(url, **k):
+        calls["n"] += 1
+        return _ARTICLE_HTML, _FakeResp("https://example.com/a")
+
+    monkeypatch.setattr(wt, "_http_get_bytes", _counting_get)
+    fetch = make_web_fetch()
+    fetch("https://example.com/a", max_bytes=1000)
+    fetch("https://example.com/a", max_bytes=5000)   # different key → live fetch
+    assert calls["n"] == 2
+
+
+def test_web_fetch_cache_expires_on_ttl(monkeypatch):
+    """An entry past the TTL is re-fetched (clock-driven, deterministic)."""
+    now = {"t": 0.0}
+    cache = ResultCache(ttl=10.0, clock=lambda: now["t"])
+    calls = {"n": 0}
+
+    def _counting_get(url, **k):
+        calls["n"] += 1
+        return _ARTICLE_HTML, _FakeResp("https://example.com/a")
+
+    monkeypatch.setattr(wt, "_http_get_bytes", _counting_get)
+    fetch = make_web_fetch(cache=cache)
+    fetch("https://example.com/a")
+    now["t"] = 11.0                           # advance past the TTL
+    out = fetch("https://example.com/a")
+    assert calls["n"] == 2                    # cache expired → fetched again
+    assert out["cached"] is False
+
+
+def test_web_fetch_does_not_cache_failures(monkeypatch):
+    """A failure is never pinned — the next call retries the live fetch."""
+    calls = {"n": 0}
+
+    def _failing_get(url, **k):
+        calls["n"] += 1
+        raise wt.httpx.TimeoutException("boom")
+
+    monkeypatch.setattr(wt, "_http_get_bytes", _failing_get)
+    fetch = make_web_fetch(max_retries=0, sleep=lambda s: None)
+    first = fetch("https://example.com/a")
+    second = fetch("https://example.com/a")
+    assert first["ok"] is False
+    assert second["ok"] is False
+    assert calls["n"] == 2                    # both attempted live, none cached
+
+
 # --------------------------------------------------------------------------- #
 # Registry growth — register_web_tools adds both as one ToolDef each, dispatchable
 # --------------------------------------------------------------------------- #

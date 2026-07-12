@@ -15,22 +15,31 @@
   gap: var(--space-2);
 }
 
+/* s17 re-theme: the brand is the vectorized peacock-feather mark + wordmark. */
 .topbar-logo {
-  display: grid;
-  place-items: center;
   width: 28px;
   height: 28px;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-weight: 700;
-  font-size: var(--text-lg);
+  object-fit: contain;
 }
 
 .topbar-title {
-  font-weight: 600;
-  font-size: var(--text-md);
-  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 650;
+  font-size: var(--text-lg);
+  color: var(--accent);
+}
+
+.topbar-tagline {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  border-left: 1px solid var(--border-subtle);
+  padding-left: var(--space-2);
+  white-space: nowrap;
+}
+@media (max-width: 900px) {
+  .topbar-tagline {
+    display: none;
+  }
 }
 
 .topbar-right {

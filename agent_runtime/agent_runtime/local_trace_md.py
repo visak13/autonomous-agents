@@ -286,11 +286,31 @@ def render_trace_file(json_path: str, out_dir: Optional[str] = None) -> str:
     return md_path
 
 
-def render_all(trace_dir: Optional[str] = None) -> List[str]:
-    """Render every ``*.json`` trace in the dir to markdown. Returns md paths."""
+def _md_is_current(json_path: str) -> bool:
+    """True when ``<trace_id>.md`` already exists beside the JSON and is at least as
+    new as it — i.e. nothing changed since it was last rendered. Lets a bulk render
+    skip already-rendered traces instead of redoing all-time work (a shared trace dir
+    accumulates tens of thousands of files; re-rendering every one on each shutdown
+    turned teardown into a multi-minute stall)."""
+    md_path = os.path.splitext(json_path)[0] + ".md"
+    try:
+        return os.path.getmtime(md_path) >= os.path.getmtime(json_path)
+    except OSError:  # md missing (or json vanished) -> render it
+        return False
+
+
+def render_all(trace_dir: Optional[str] = None, *, force: bool = False) -> List[str]:
+    """Render every ``*.json`` trace in the dir to markdown. Returns md paths.
+
+    Skips traces whose ``.md`` is already up to date (``force=True`` re-renders all)
+    so a full-directory pass stays O(new traces), not O(all-time traces) — the
+    ``on_end`` hook already renders each trace as its root span closes, so a bulk
+    pass only needs to fill in genuinely-unrendered files."""
     trace_dir = trace_dir or resolve_local_trace_dir()
     written: List[str] = []
     for json_path in sorted(glob.glob(os.path.join(trace_dir, "*.json"))):
+        if not force and _md_is_current(json_path):
+            continue
         try:
             written.append(render_trace_file(json_path))
         except Exception:  # one bad file must not abort the rest (debugging aid)

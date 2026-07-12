@@ -220,7 +220,9 @@ class _ScriptTransport:
     turn — and counted, so a test can assert NO map/reduce happened on the select path."""
 
     def __init__(self, agent_turns: list[str]) -> None:
-        self._turns = list(agent_turns)
+        # d242 TRUE self-select: the research node starts TOOL-LESS, so the script loads the
+        # 'research' bundle first (its opening move) before any web_search/web_fetch.
+        self._turns = ['{"tool": "get_bundles", "args": {"name": "research"}}'] + list(agent_turns)
         self.agent_calls: list[str] = []
         self.summarize_calls = 0
 
@@ -228,8 +230,11 @@ class _ScriptTransport:
         return self.chat(messages, **opts).content
 
     def chat(self, messages, **opts) -> ChatResult:
+        # s15/a18 (d189): tool RESULTS ride role 'tool' now (not 'user') — scan both so the
+        # observation the loop feeds back is still seen as the freshest turn.
         user = next(
-            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+            (m["content"] for m in reversed(messages)
+             if m.get("role") in ("user", "tool")), ""
         )
         if "FACTUAL SUMMARY" in user:
             self.summarize_calls += 1
@@ -304,7 +309,7 @@ def test_research_loop_emits_honest_provenance_signal():
     res, _agent = _drive(
         transport, _FakeHook({url: _DOC}), fetched_char_budget=500, read_embedder=_FakeEmbedder()
     )
-    fetch_obs = transport.agent_calls[-1]  # the user turn carrying the fetch observation
+    fetch_obs = transport.agent_calls[-1]  # the role 'tool' turn carrying the fetch observation
     assert "relevant passages in this source" in fetch_obs
     assert "reading the top" in fetch_obs
     assert "You have now read 1 source(s)" in fetch_obs

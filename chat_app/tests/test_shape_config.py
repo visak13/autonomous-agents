@@ -7,9 +7,10 @@ default).* These tests prove exactly that chain, end to end, with NO live model:
 1. STORE DURABILITY — an override written through :class:`ShapeConfigStore` is in
    the SHARED ``chat.db`` and a FRESH connection reads it back (real persistence,
    not an in-memory cache).
-2. UNROLL HONORS THE OVERRIDE — the generic :func:`~agent_runtime.unroll_shape`
-   emits exactly ``override`` research rounds when given the stored value, vs the
-   text-file default (10) when given none (a3: there is no per-shape executor).
+2. DEPTH CEILING HONORS THE OVERRIDE — ``ShapeSpec.effective_max_iter`` returns exactly
+   ``override`` (clamped to ``hard_cap``) vs the text-file default (10) when given none. The
+   override drives the research DEPTH ceiling the grower reasons within (s16/a3 d239/d247: the
+   deterministic unroll is retired — there is no fixed round count to count).
 3. SERVICE VIEW — the merged view surfaces the stored override + the EFFECTIVE cap
    (clamped to the shape's ``hard_cap``), the number the runtime actually runs.
 4. API → SQLite — ``PUT /shapes/{name}/max_iter`` over the real app persists the
@@ -22,18 +23,15 @@ default).* These tests prove exactly that chain, end to end, with NO live model:
 """
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from llm_framework import FakeTransport
 
-from agent_runtime import load_shape, unroll_shape
+from agent_runtime import load_shape
 from agent_runtime.shape_author import write_shape
 
 from chat_app.app import create_app
-from chat_app.agentic import run_agentic
 from chat_app.shape_config import (
     ShapeConfigService,
     ShapeConfigStore,
@@ -43,15 +41,6 @@ from chat_app.shape_config import (
 DEEP_RESEARCH = "deep-research"
 FILE_DEFAULT_MAX_ITER = 10  # the deep-research.toml default
 HARD_CAP = 24               # the deep-research.toml absolute bound
-
-
-def _rounds_in(dag) -> int:
-    """The number of research ROUNDS in an unrolled deep-research DAG.
-
-    One research node is emitted per round (final round included), so the count of
-    research-POSITION nodes (id suffix ``_research``; d48 — they are worker nodes now)
-    IS the effective round count the unroll ran."""
-    return sum(1 for n in dag.nodes if n.id.endswith("_research"))
 
 
 # --------------------------------------------------------------------------- #
@@ -81,25 +70,27 @@ def test_store_rejects_nonsensical_override(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 2) the deep-research UNROLL uses the override count, not the file default
+# 2) the deep-research DEPTH CEILING honors the override, not the file default
+#    (s16/a3 d239/d247: the deterministic unroll is RETIRED — there is no fixed
+#    round count to count. The override now drives the EFFECTIVE depth ceiling
+#    (effective_max_iter), which the engine feeds the grow_config depth clamp; the
+#    grower then authors the actual research topology by reasoning. The override→
+#    effective-count→hard_cap-clamp CONTRACT is unchanged, measured at the discipline
+#    level instead of by counting unrolled nodes.)
 # --------------------------------------------------------------------------- #
-def test_build_dag_uses_override_round_count():
+def test_effective_max_iter_uses_override_round_count():
     shape = load_shape(DEEP_RESEARCH)
-    # no override → the text-file default (10 rounds)
-    default_dag = unroll_shape(shape, "research X deeply", max_iter_override=None)
-    assert _rounds_in(default_dag) == FILE_DEFAULT_MAX_ITER
-
-    # an override → exactly that many rounds (the s4 UI value drives the unroll)
-    overridden = unroll_shape(shape, "research X deeply", max_iter_override=3)
-    assert _rounds_in(overridden) == 3
-    assert _rounds_in(overridden) != FILE_DEFAULT_MAX_ITER
+    # no override → the text-file default (10)
+    assert shape.effective_max_iter(None) == FILE_DEFAULT_MAX_ITER
+    # an override → exactly that value (the s4 UI value drives the depth ceiling)
+    assert shape.effective_max_iter(3) == 3
+    assert shape.effective_max_iter(3) != FILE_DEFAULT_MAX_ITER
 
 
-def test_build_dag_override_is_clamped_to_hard_cap():
+def test_effective_max_iter_override_is_clamped_to_hard_cap():
     shape = load_shape(DEEP_RESEARCH)
     # a UI value above the safety bound never exceeds hard_cap (shared-GPU guard)
-    huge = unroll_shape(shape, "research X", max_iter_override=999)
-    assert _rounds_in(huge) == HARD_CAP
+    assert shape.effective_max_iter(999) == HARD_CAP
 
 
 # --------------------------------------------------------------------------- #
@@ -112,9 +103,12 @@ def test_service_view_surfaces_override_and_effective(tmp_path):
     assert before is not None
     assert before["max_iter_override"] is None
     assert before["effective_max_iter"] == FILE_DEFAULT_MAX_ITER
-    # the structure the s4 screen renders is present
-    assert before["round_roles"] == ["research", "critic"]
-    assert before["final_roles"] == ["research", "synthesis", "verify"]
+    # s17 (d248/d249): round_roles/final_roles are fully RETIRED — the transitional empty-[]
+    # API-boundary shim is REMOVED with the redesigned Shapes screen (shape = discipline +
+    # doctrine; the planner authors topology). The deep-research identity is the execution
+    # token; the research topology is authored at runtime by the grower.
+    assert "round_roles" not in before
+    assert "final_roles" not in before
     assert before["execution"] == "deep-research"
 
     updated = service.set_max_iter(DEEP_RESEARCH, 4)
@@ -162,62 +156,19 @@ def test_api_put_max_iter_persists_to_sqlite(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 5) THE FULL WIRING — API set → run_agentic reads the SAME store → unroll honors it
+# (5 — REMOVED, s15/a24) ``test_run_agentic_honors_api_set_override_for_deep_research``
+# was deleted: it pinned the RETIRED ``_run_deep_research`` fixed-unroll return contract.
+# Under the new design (a1 / P2-5c) the served deep-research route runs the GROWABLE engine
+# via ``run_plan_chain`` driven by the DEPTH knob (``get_depth`` -> ``research_depth``);
+# ``run_agentic`` never feeds ``get_max_iter`` into that route (see agentic.py:679-726, which
+# passes ``research_depth`` and never ``max_iter_override``), and ``rounds_executed`` is now the
+# grower's EMERGENT gather count, not ``== effective_max_iter``. The 3-reply transport could no
+# longer drive the new section-write phase (MalformedOutputError: tool-driven authorer produced
+# no usable nodes). The end-to-end ``run_agentic`` -> store -> runtime override wiring is now
+# covered (for depth) by ``test_s13_run_agentic_reads_depth_from_shape_config``; the ``max_iter``
+# store/API/override honoring stays covered by tests (1)-(4) above (store durability,
+# ``effective_max_iter`` honoring the override depth ceiling, the service view, API->SQLite).
 # --------------------------------------------------------------------------- #
-def _deep_research_fake_transport() -> FakeTransport:
-    """A transport that selects ``deep-research`` then answers every role node.
-
-    Reply 1 is the shape-selection JSON; reply 2 is a generic role payload that
-    FakeTransport repeats for every subsequent role call (research/critic/
-    synthesis/verify) — enough to drive the bounded unroll to completion offline.
-    The unroll's round COUNT (what a4 proves) is set by max_iter, not by anything
-    the role nodes return."""
-    # Reply 0 is the interactive AMBIGUITY assessment (scenario-2): run_agentic now
-    # asks the planner whether the request is underspecified BEFORE shape selection.
-    # A clear "research the topic in depth" request is not ambiguous, so this returns
-    # needs_clarification=false and the run proceeds to selection (reply 1) unchanged.
-    ambiguity = '{"needs_clarification": false, "question": "", "rationale": "clear"}'
-    selection = '{"shape": "deep-research", "rationale": "iterative depth research"}'
-    role = (
-        '{"findings": ["f"], "sources": ["s"], "open_questions": ["q"], '
-        '"gaps": [], "weak_claims": [], "follow_up_queries": ["nq"], '
-        '"verdict": "converged", "fixed_inline": []}'
-    )
-    return FakeTransport([ambiguity, selection, role])
-
-
-def test_run_agentic_honors_api_set_override_for_deep_research(tmp_path):
-    app = create_app(data_dir=tmp_path)
-    with TestClient(app) as client:
-        # 1) set the override THROUGH THE API (the s4 screen's write path)
-        resp = client.put(f"/shapes/{DEEP_RESEARCH}/max_iter", json={"max_iter": 3})
-        assert resp.status_code == 200
-
-        # 2) drive the REAL routed entrypoint (run_agentic) on a deterministic
-        #    transport, handed the app's SAME shared store — the exact object the
-        #    live /chat path passes. No explicit max_iter_override: the value MUST
-        #    come from the store the API just wrote.
-        w = app.state.wiring
-        result = asyncio.run(
-            run_agentic(
-                "research the topic in depth",
-                transport=_deep_research_fake_transport(),
-                registry=w.registry,
-                hook=w.hook,
-                plane=w.plane,
-                shape_config=w.shape_config,
-            )
-        )
-
-    assert result.shape == DEEP_RESEARCH
-    dr = result.deep_research
-    assert dr is not None
-    # the unroll ran the API-SET count (3), NOT the text-file default (10). The
-    # deep-research run summary is now a plain dict (a3: no DeepResearchResult).
-    assert dr["effective_max_iter"] == 3
-    assert dr["rounds_executed"] == 3
-    # the unrolled DAG the generic runtime actually drove carries exactly 3 rounds
-    assert _rounds_in(result.dag) == 3
 
 
 # --------------------------------------------------------------------------- #

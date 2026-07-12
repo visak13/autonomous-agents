@@ -1,7 +1,7 @@
 """Claude-Code-style context management: token budgeting + compaction.
 
-This module is the framework's answer to phi4-mini's small context window
-(d10). It keeps a live, in-window conversation and, Claude-Code-style, keeps it
+This module is the framework's answer to a small local model's bounded context
+window (d10; today gemma4-e4b at num_ctx 32768 — phi4-mini historically). It keeps a live, in-window conversation and, Claude-Code-style, keeps it
 from outgrowing the model's budget two ways (d4):
 
 - **Auto-compaction** — whenever the estimated token count crosses a
@@ -123,7 +123,7 @@ class TransportSummarizer:
     """Summarise older turns by calling the injected transport (d4 path).
 
     With a real :class:`~llm_framework.transport.OllamaTransport` this is a live
-    phi4-mini summarisation call; with :class:`~llm_framework.transport.FakeTransport`
+    model summarisation call; with :class:`~llm_framework.transport.FakeTransport`
     its scripted reply is returned verbatim — a deterministic canned summary
     that needs no GPU (d7/d8). ``call_opts`` (temperature, keep_alive, …) are
     forwarded to ``transport.complete`` on every call.
@@ -234,7 +234,7 @@ class CompactionEvent:
 
 DEFAULT_COMPACTION_THRESHOLD = 4000
 """Default token budget at which auto-compaction fires. Configurable per
-Conversation — sized well under phi4-mini's window so recall + the new turn
+Conversation — sized well under the model's window so recall + the new turn
 still fit comfortably after the summary lands (d10)."""
 
 DEFAULT_KEEP_RECENT = 4
@@ -340,7 +340,12 @@ class Conversation:
 
     @property
     def messages(self) -> List[Message]:
-        """The full transport-ready window: system + summary + recent turns."""
+        """The full transport-ready window: ``system`` → running summary → recent turns.
+
+        The optional ``system`` prompt and the running compaction ``summary`` lead the
+        live recent turns (d263: the pinned head + SWA-tail re-injection are removed —
+        the goal/doctrine ride the system/first turn ONCE and compaction carries the
+        rest, rather than being re-pasted as always-in-view blocks every call)."""
         out: List[Message] = []
         if self.system:
             out.append({"role": "system", "content": self.system})
@@ -425,17 +430,17 @@ class Conversation:
         """Build a chain :class:`Context` from the current window.
 
         The running summary is folded into the system prompt (so the canonical
-        ``prompt_assembly`` stage sees it as part of ``system``), the live
-        recent turns become ``history``, and ``user`` is the new turn. The
-        transport defaults to this conversation's own.
-        """
+        ``prompt_assembly`` stage sees it as part of ``system``), the live recent
+        turns become ``history``, and ``user`` is the new turn. The transport defaults
+        to this conversation's own."""
         system = self.system
         if self._summary:
             block = f"{SUMMARY_HEADER}\n{self._summary}"
             system = f"{system}\n\n{block}" if system else block
+        history = list(self._messages)
         return Context(
             system=system,
-            history=list(self._messages),
+            history=history,
             user=user,
             transport=transport if transport is not None else self.transport,
         )

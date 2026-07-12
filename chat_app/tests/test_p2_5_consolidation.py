@@ -38,7 +38,7 @@ from chat_app.agentic import (
 )
 from chat_app.parity import parity_metrics, parity_verdict
 from agent_runtime import ShapeSelection, ShapeSpec
-from agent_runtime.factory import PlanDAG
+from agent_runtime.factory import PlanDAG, PlanNode
 
 
 _SRC = {"title": "Iran 2025", "url": "https://news.example.com/iran-2025",
@@ -46,17 +46,45 @@ _SRC = {"title": "Iran 2025", "url": "https://news.example.com/iran-2025",
 
 
 def _deep_research_shape() -> ShapeSpec:
-    """A small unrollable deep-research ShapeSpec carrying the P2.4 completeness_stop."""
+    """A small deep-research ShapeSpec carrying the P2.4 completeness_stop (s16/a3: identified
+    by its execution token; its research topology is authored at runtime by the grower)."""
     return ShapeSpec(
         name="deep-research",
         description="deep research",
         max_iter=2,
         hard_cap=4,
         execution="deep-research",
-        round_roles=["research", "critic"],
-        final_roles=["research", "synthesis", "verify"],
         completeness_stop="Fill ALL the blanks across timeline/costs/impact before stopping.",
+        expand_on_gaps=True,
+        fan_out=5,
+        max_layers=5,
     )
+
+
+def test_research_seed_dag_is_tool_less_self_selecting_growable():
+    """s16/a3 (d239/d247) read-verify bar (ii): the ENGINE-owned research seed builder emits
+    a single TOOL-LESS self-selecting research node (no shape-bound web_search; d242) + tags
+    the DAG growable, carrying the shape's growth bounds for the grower. The grower then
+    AUTHORS the real topology by reasoning (decompose-first → grow on note gaps)."""
+    shape = _deep_research_shape()
+    dag = agentic._research_seed_dag(shape, "US-Iran June 2025 detailed report", spec="research-analyst")
+    assert [n.id for n in dag.nodes] == ["r1_research"]
+    seed = dag.nodes[0]
+    # TOOL-LESS: neither the shape nor the seed binds a gather tool — the node self-selects
+    # its research bundle at runtime (as2/d242). NO deterministic web_search position.
+    assert seed.tool is None
+    assert seed.tool_args == {}
+    assert seed.depends_on == ()
+    # SB-RR (d292/d293): the seed is a WORKER-default node (research is a SPECIALIZATION, not a
+    # role) whose research-methodology spec LEADS its composed specs — that spec is the
+    # self-select lever that makes the seed worker self-select its gather bundle.
+    from agent_runtime.roles import ROLE_WORKER
+    from specialization.seed import RESEARCH_METHODOLOGY_SPEC
+    assert seed.role == ROLE_WORKER
+    assert seed.effective_specs == (RESEARCH_METHODOLOGY_SPEC, "research-analyst")
+    # growable + carries the shape's growth bounds (the grower drives the real topology).
+    assert dag.growable is True
+    assert dag.fan_out == 5 and dag.max_layers == 5
 
 
 class _ProseTransport:
@@ -180,9 +208,12 @@ def test_plan_chain_resolves_shape_without_catalog(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 3. CF#1 — the generic research path is DESCRIPTION-driven (unrolled research-only DAG)
+# 3. CF#1 — the generic research path seeds a TOOL-LESS growable DAG + report-route config
+#    (s16/a3 d239/d247: the frozen-unroll path is RETIRED — deep-research is always growable;
+#    the grower authors the topology by reasoning. This test pins the seed shape + the
+#    report-route grounding config the phase hands the runtime.)
 # --------------------------------------------------------------------------- #
-def test_generic_research_phase_unrolls_research_only_dag(monkeypatch, tmp_path):
+def test_generic_research_phase_seeds_growable_research_dag(monkeypatch, tmp_path):
     captured: dict = {}
 
     class _FakeRuntime:
@@ -208,18 +239,18 @@ def test_generic_research_phase_unrolls_research_only_dag(monkeypatch, tmp_path)
         overall_goal="detailed report on the war", requested_specs=[],
         dr_shape=_deep_research_shape(), research_depth=2,
     ))
-    # a non-growable shape yields a non-growable trace (the frozen unroll path).
-    assert grow_trace.get("growable") is False
+    # The deep-research shape ALWAYS seeds a growable plan now (no frozen unroll, s16/a3).
+    assert grow_trace.get("growable") is True
 
     dag = captured["dag"]
     ids = [n.id for n in dag.nodes]
-    # research/critic rounds only — the terminal synthesis/verify are stripped (the write
-    # phase replaces synthesis); the DAG IS the research topology (description-driven).
-    assert ids, "unroll produced no research nodes"
+    # The engine emits a SINGLE TOOL-LESS self-selecting research seed (d242); the grower
+    # then authors the real topology by reasoning. No terminal synthesis/verify in the seed.
+    assert ids == ["r1_research"], "expected the single tool-less growable research seed"
+    assert dag.nodes[0].tool is None, "the seed must be tool-less (self-selects its bundle)"
     assert all(not (i.endswith("_synthesis") or i.endswith("_verify")) for i in ids)
-    assert any(i.endswith("_research") for i in ids)
-    # The node tasks carry the unrolled ROLE framing (description-driven), NOT the
-    # hardcoded research-tree decision/decompose prompt constants (CF#1).
+    # The seed task carries the research ROLE framing, NOT the hardcoded research-tree
+    # decision/decompose prompt constants (those reach the grower, not the seed node) (CF#1).
     from agent_runtime import research_tree as rt
     joined = "\n".join(n.task for n in dag.nodes)
     assert rt._DECISION_INSTRUCTION not in joined
@@ -228,8 +259,8 @@ def test_generic_research_phase_unrolls_research_only_dag(monkeypatch, tmp_path)
     assert captured["enable_reactor"] is True
     assert captured["emit_article_notes"] is True
     assert captured["research_fetch_breadth"] == PLAN_CHAIN_TREE_BREADTH
-    # a NON-growable shape wires NO grower (the frozen unroll, byte-identical).
-    assert captured["grower"] is None
+    # the growable seed wires a real grower (the grower authors the topology by reasoning).
+    assert captured["grower"] is not None
 
 
 def test_generic_research_phase_wires_grower_for_growable_shape(monkeypatch, tmp_path):
@@ -256,7 +287,6 @@ def test_generic_research_phase_wires_grower_for_growable_shape(monkeypatch, tmp
     growable_shape = ShapeSpec(
         name="deep-research", description="d", max_iter=2, hard_cap=4,
         execution="deep-research",
-        round_roles=["research", "critic"], final_roles=["research", "synthesis", "verify"],
         completeness_stop="Fill ALL the blanks before stopping.",
         expand_on_gaps=True, fan_out=4, max_layers=3,
     )
@@ -306,17 +336,21 @@ def test_build_acyclic_runtime_reactor_gated(tmp_path):
     assert rt_on.planner_reactor is not None  # event-driven reactor wired
 
 
-def test_write_phase_review_and_reactor_always_on(monkeypatch, tmp_path):
-    """P2-5c — the served write phase ALWAYS builds its planner with inject_review and its
-    runtime with the reactor (no flag): both are LIVE by default on the served report route."""
+def test_write_phase_review_retired_and_reactor_always_on(monkeypatch, tmp_path):
+    """SF-1 (d310/d311) — the framework REVIEW INJECTION is RETIRED: the served write phase hands
+    the runtime the planner's OWN authored DAG with ZERO review nodes (no ``final_review``, no
+    ``*_review`` twins) — the model authors the whole document; no engine reviewer edits it. The
+    runtime reactor stays ON (unchanged). Proven on the FINAL DAG handed to the runtime."""
     seen: dict = {}
 
     def fake_planner(**kw):
-        seen["inject_review"] = kw.get("inject_review")
-
         class _P:
-            async def plan(self, goal):
-                return type("R", (), {"dag": PlanDAG(nodes=[], goal=goal)})()
+            async def plan(self, goal, *, prior_memory=None):
+                # ``prior_memory`` mirrors the real IncrementalPlanner.plan (SB-3 seam, populated
+                # by SB-4's d285 write handoff) — accept + ignore it so this fake stays
+                # signature-transparent to the live call.
+                node = PlanNode(id="w1", task="write the report body", tool="file_write")
+                return type("R", (), {"dag": PlanDAG(nodes=[node], goal=goal)})()
         return _P()
 
     def fake_runtime(**kw):
@@ -325,6 +359,7 @@ def test_write_phase_review_and_reactor_always_on(monkeypatch, tmp_path):
         class _R:
             chain_sources = None
             async def run(self, dag, **k):
+                seen["dag"] = dag
                 return _FakeWriteResult()
         return _R(), None
 
@@ -333,9 +368,12 @@ def test_write_phase_review_and_reactor_always_on(monkeypatch, tmp_path):
 
     monkeypatch.setattr(agentic, "_build_incremental_planner", fake_planner)
     monkeypatch.setattr(agentic, "_build_acyclic_runtime", fake_runtime)
+    # Identity-pass the NORMALIZE pass so the DAG the runtime sees is exactly the planner's
+    # authored one (d216/d218 emergent sectioning — no lead+body scaffold is imposed, and SF-1
+    # injects no review, so the planner's work node reaches the runtime unchanged). RP-1
+    # (d319/d311): the engine coverage/flag DAG passes (_ensure_source_coverage /
+    # _flag_unsupported_sections) are RETIRED, so there is nothing left to identity-pass.
     monkeypatch.setattr(agentic, "_normalize_write_dag", lambda dag, out: dag)
-    monkeypatch.setattr(agentic, "_ensure_source_coverage", lambda dag, s: dag)
-    monkeypatch.setattr(agentic, "_flag_unsupported_sections", lambda dag: dag)
 
     hook = ToolHook(EventPlane(), registry=ToolRegistry())
     monkeypatch.setattr(hook, "invoke", fake_invoke)
@@ -349,22 +387,32 @@ def test_write_phase_review_and_reactor_always_on(monkeypatch, tmp_path):
             hook=hook, plane=hook.plane, timeout=5.0, run_id="w",
         )
 
-    # No flag/env in play — review + reactor are on regardless of any env value.
     monkeypatch.delenv("RA_GENERIC_REPORT_PATH", raising=False)
     asyncio.run(drive())
-    assert seen["inject_review"] is True and seen["enable_reactor"] is True
+    # The reactor is on (unchanged), AND the FINAL DAG the runtime ran carries NO framework review
+    # node — review injection is retired (SF-1), proven on the served report DAG.
+    assert seen["enable_reactor"] is True
+    final_ids = [n.id for n in seen["dag"].nodes]
+    assert not any(i == "final_review" or i.endswith("_review") for i in final_ids), final_ids
 
 
-# --------------------------------------------------------------------------- #
-# 5. CF#3 — the duplicate-section-collapse backstops are RETAINED
-# --------------------------------------------------------------------------- #
-def test_dup_collapse_backstops_retained():
+# RP-1 (d319/d311): the engine-derived served-route outline
+# (``_outline_from_authored_sections``) is RETIRED — the model authors its own nav/headings —
+# so its unit test is removed. The self-policing test below (surgery stays retired) is KEPT and
+# now also covers ``collapse_duplicate_sections``.
+
+
+def test_write_phase_html_surgery_retired():
+    # SF-1 (d310/d311, self-policing) — the deterministic assemble_report_spa HTML surgery + the
+    # coherence metrics are RETIRED from the served write phase: the engine authors/fixes NOTHING;
+    # the MODEL authors the whole document (skeleton + content + nav + Sources). These must NOT
+    # come back into run_section_write_phase.
     src = inspect.getsource(run_section_write_phase)
-    # The structural fix (anchored insert, P2.3) prevents the dup TAIL but not an in-body
-    # re-emitted section; the post-hoc collapse backstops MUST stay (P2-3-review CF#3).
-    assert "collapse_duplicate_sections" in src
-    assert "collapse_outline_duplicate_sections" in src
-    assert "enforce_single_html_document" in src
+    assert "assemble_report_spa" not in src
+    assert "collapse_duplicate_sections" not in src
+    assert "collapse_outline_duplicate_sections" not in src
+    assert "_coherence_metrics" not in src
+    assert "_pre_surgery_path" not in src
 
 
 # --------------------------------------------------------------------------- #
@@ -402,25 +450,6 @@ def test_sibling_route_runs_generic_engine_with_stop(monkeypatch, tmp_path):
     assert captured.get("completeness_stop") == shape.completeness_stop
     assert result.deep_research["engine"] == "generic-unroll"
     assert result.deep_research["stop_reason"] == "agent_sufficient"
-
-
-# --------------------------------------------------------------------------- #
-# 7. (c) the framework-injected review renders RAW worker content, not a verdict envelope
-# --------------------------------------------------------------------------- #
-def test_injected_review_is_raw_worker_not_verdict():
-    from agent_runtime.review_injection import inject_reviews
-    structured = {"rationale": "r", "nodes": [
-        {"id": "w1", "task": "write the report", "tool": "file_write"},
-    ]}
-    out = inject_reviews(structured)
-    reviews = [n for n in out["nodes"] if n["id"] not in {"w1"}]
-    assert reviews, "no review node injected"
-    for rv in reviews:
-        # worker role (or unset → worker), never a judgment/verdict role.
-        assert rv.get("role", "worker") in ("worker", "", None)
-        task = (rv.get("task") or "").lower()
-        # the review must return corrected RAW content, never a verdict/findings envelope.
-        assert "verdict" not in task or "not" in task or "raw" in task
 
 
 # --------------------------------------------------------------------------- #

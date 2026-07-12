@@ -48,8 +48,6 @@ def _deep_research_shape() -> ShapeSpec:
         max_iter=2,
         hard_cap=4,
         execution="deep-research",
-        round_roles=["research", "critic"],
-        final_roles=["research", "synthesis", "verify"],
         completeness_stop="Fill ALL the blanks across timeline/costs/impact before stopping.",
     )
 

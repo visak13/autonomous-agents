@@ -40,7 +40,7 @@ Re-editable surface (s4/RC7 — re-open an EXISTING spec to view + edit, persist
                                            re-register via /approve).
 
 NEVER FREEZE (d4): the redraft (``SpecConversation.start`` / ``refine``) is a
-SYNCHRONOUS chain call — on live phi4-mini it blocks on a slow, GPU-contended
+SYNCHRONOUS chain call — on the live local model it blocks on a slow, GPU-contended
 round-trip. Every route that drives it (``/message``) and the compile-on-approval
 (``/approve`` writes a file) is OFFLOADED off the asyncio event loop via
 ``asyncio.to_thread`` (specialist [required] rule: never block the one loop in an

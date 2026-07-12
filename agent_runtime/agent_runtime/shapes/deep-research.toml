@@ -1,51 +1,60 @@
 # =============================================================================
-# DEEP-RESEARCH shape (blueprint §2a/§2c/§2d, decision d2/d5)
+# DEEP-RESEARCH shape (blueprint §2a/§2c/§2d, decision d2/d5; s16/a3 d239/d247)
 # =============================================================================
-# A FIXED, BOUNDED plan shape the planner SELECTS (it is NOT an open critic-gated
-# loop). It is the local-Gemma port of eda-base3's research-synthesize, iterated
-# to depth with an added critic role.
+# An EXECUTION-DISCIPLINE the planner SELECTS for an exhaustive, fact-checked,
+# multi-round investigation of ONE topic. It is the local-Gemma descendant of
+# eda-base3's research-synthesize, taken to depth with research/critic/synthesis/
+# verify positions — but it is NOT a frozen pre-baked node sequence and NOT an
+# open critic-gated loop.
 #
-# Mechanics (user-specified):
-#   * The SAME specialization is reused across EVERY round; only the node ROLE
-#     differs (role-prompt template + per-role output schema — see roles.py).
-#   * Each non-final round = {research node + critic node}.
-#   * The FINAL round = {research node + synthesis node + verify node}.
-#   * Each round gains VISIBILITY into all previously-researched layers.
-#   * The LOOP COUNT is bounded by max_iter (the SHAPE), NOT by the critic's
-#     verdict. The critic's verdict is recorded but never terminates the loop.
+# Mechanics (s16/a3 — RETIRE THE UNROLL):
+#   * The shape pre-bakes NO node graph and declares NO per-round positions: there
+#     is no deterministic unroll (round_roles/final_roles are RETIRED).
+#   * The research TOPOLOGY is AUTHORED AT RUNTIME BY REASONING. The engine emits
+#     ONE tool-less self-selecting research SEED carrying only the goal and tags
+#     the PlanDAG `growable`; the DagGrower then decompose-first-seeds the goal into
+#     scoped facets and GROWS the DAG wave-by-wave on each note's gaps (via
+#     research_tree.run_decision_node), so each layer still sees all prior layers.
+#   * The SAME specialization is reused across the whole investigation; the node
+#     ROLE (research/critic/synthesis/verify — see roles.py) sets behaviour, and
+#     those positions live in the grower + roles, NOT in this file.
+#   * Growth is bounded by max_iter (depth ceiling) / max_layers / fan_out and the
+#     completeness_stop DOCTRINE below — never by a critic verdict.
 #
 # This file is the DECLARATIVE definition the runtime READS and HONORS. It is a
 # plain, human-editable text file (TOML); the s4 "Shapes" UI lists it and lets the
-# user override `max_iter` (persisted in shared SQLite). The GENERIC
-# `agent_runtime.shapes.unroll_shape` UNROLLS this template into a bounded ACYCLIC
-# role-tagged DAG (each round's nodes depend on every prior node → growing
-# visibility into all earlier layers), which the SAME generic AgentRuntime then
-# executes like any other DAG — so the "cyclic" shape never violates the PlanDAG
-# acyclic invariant AND there is no per-shape executor (adding a cyclic shape is
-# adding one text file; a3 re-architecture).
+# user override `max_iter` (persisted in shared SQLite). The generic AgentRuntime
+# then drives the growable DAG like any other DAG — each grown layer depends on the
+# prior layers (growing visibility) so the topology stays ACYCLIC and there is no
+# per-shape executor (adding a shape is adding one text file; a3 re-architecture).
 
 name = "deep-research"
 description = """Choose for an EXHAUSTIVE, multi-round investigation of ONE topic \
 that must go deep and be fact-checked — not a quick answer, and not a parallel \
-gather of separate topics. Runs ~9 iterative rounds of {research + critic}, each \
-building on and critiquing the last, then a final {research + synthesis + verify} \
-round; ONE specialization reused across all rounds (node role sets behaviour), \
-each round sees all prior researched layers, bounded by max_iter (not the critic)."""
+gather of separate topics. The research topology is AUTHORED BY REASONING: it \
+decomposes the topic into its real facets, then deepens round-by-round — each round \
+building on, critiquing and filling the gaps of the last — ending in synthesis + \
+verify; ONE specialization reused throughout (node role sets behaviour), each round \
+sees all prior researched layers, bounded to depth by max_iter (not by a critic verdict)."""
 
-# UI-OVERRIDABLE CEILING (d5). Default ≈10 rounds = 9×{research+critic} + 1 final
-# round of {research+synthesis+verify}. The s4 Shapes screen persists an override
-# in SQLite; the runtime honors the effective value (override if set, else this).
+# UI-OVERRIDABLE DEPTH CEILING (d5). The growable drive's depth bound: ~10 research
+# layers deep (seed + grown waves), further clamped by the runtime tree depth ceiling.
+# It is the depth the grower runs to, NOT a count of pre-baked rounds (the unroll is
+# retired). The s4 Shapes screen persists an override in SQLite; the runtime honors the
+# effective value (override if set, else this) via ShapeSpec.effective_max_iter, feeding
+# it as the grow_config depth clamp (agentic effective_max_iter -> research_depth).
 max_iter = 10
 
 # Absolute safety bound the runtime NEVER exceeds, no matter what the UI sets —
 # protects the shared GPU from a runaway override.
 hard_cap = 24
 
-# EXECUTION discipline: this shape is UNROLLED (it declares round_roles/final_roles)
-# into a bounded acyclic role-tagged DAG with growing-visibility edges, then run by
-# the generic AgentRuntime. The "deep-research" token marks it as the cyclic family
-# (the router keys off round_roles/final_roles, not this name); once unrolled the
-# edges serialise the rounds, so the dispatch mode is immaterial.
+# EXECUTION discipline (s16/a3 — no unroll). The "deep-research" token IS this shape's
+# identity: the router keys off execution == "deep-research" (see the is_deep_research
+# routing) to take the growable-research path. The planner/grower then AUTHOR the acyclic
+# role-tagged topology by REASONING (decompose-first seed -> grow on note gaps), with each
+# grown layer depending on the prior layers (growing visibility). There is no deterministic
+# unroll and no round_roles/final_roles to key off — the discipline is the routing signal.
 execution = "deep-research"
 
 # ---------------------------------------------------------------------------
@@ -70,6 +79,42 @@ COMPLETENESS stop: do NOT halt at an arbitrary depth, and do NOT pad once the bl
 are filled."""
 
 # ---------------------------------------------------------------------------
+# s14/a15 (d160/d161) — the BREADTH DOCTRINE is DEFINED IN THE SHAPE, not in code.
+# ---------------------------------------------------------------------------
+# DECOMPOSE-FIRST breadth. This text is handed to the research-tree DECOMPOSE node
+# verbatim as its breadth methodology (research_tree._decompose_instruction reads it),
+# so the model REASONS over "a detailed report spans MULTIPLE distinct dimensions ->
+# scope the real facets" rather than collapsing to a single unfocused sub-question
+# (the d160 thin-report root cause: research_nodes=1 / sources=1). It is the SHAPE-level
+# statement that breadth is a SHAPE PROPERTY (d161), and it cures the breadth collapse
+# WITHOUT a hard-coded force-exactly-N branch or an engine seed force-count (those are the
+# d14/d148/d161-rejected hacks): the FLOOR is expressed as doctrine the LLM reasons over,
+# exactly as completeness_stop expresses the STOP as doctrine. Editing THIS string changes
+# the breadth behaviour — no code change. (Empty => the runtime keeps its baked default.)
+decompose_methodology = """A 'detailed report' / 'exhaustive investigation' on a topic is \
+NEVER answered by one unfocused question — it SPANS MULTIPLE DISTINCT DIMENSIONS, and a \
+deep report must open every one of them. So your FIRST move is to scope the REAL facets THIS \
+goal implies — typically at least: (1) the TIMELINE / sequence of what happened and when; \
+(2) the KEY EVENTS / headlines / specific incidents; (3) the FIGURES — costs, casualties, \
+damage, quantities, with sources; (4) the CAUSES / drivers / background; (5) the IMPACT / \
+consequences / expert analysis. Author ONE scoped sub-question per real dimension — each a \
+distinct facet ONE focused research node can answer. A 'detailed report' almost always has \
+THREE OR MORE such dimensions; collapsing to one or two leaves the report thin and is a \
+FAILURE of the opening. Do NOT invent padding facets the goal does not imply, and do NOT try \
+to research the whole goal in one pass — decompose into the genuine dimensions, no more, no \
+fewer. Each sub-question must stand alone (one focused node answers it) yet together they must \
+COVER the thesis across its real dimensions. CRITICAL — the facets must be MUTUALLY EXCLUSIVE \
+(no two overlap): author a SINGLE facet per dimension — ONE costs/figures facet, ONE causes \
+facet, ONE impact/analysis facet — never two facets that would become duplicate or \
+near-duplicate sections (e.g. a separate 'analysis' AND 'future outlook'; 'costs' twice; or an \
+'analysis of the costs' facet ALONGSIDE a dedicated 'costs' facet — the analysis would absorb \
+the figures and leave the dedicated section empty). If a facet would merely ANALYSE or \
+SUMMARISE another facet's subject, do NOT make it a separate facet — fold the analysis into \
+that subject's facet. If two candidate facets would draw on the same sources and produce \
+overlapping content, MERGE them into one. Each facet must be answerable from DISTINCT sources; do not author a facet you \
+cannot point real sources at."""
+
+# ---------------------------------------------------------------------------
 # P2.4 (d131/d133) — CROSS-CUTTING SOURCE POLICY, expressed at the SHAPE.
 # ---------------------------------------------------------------------------
 # The deep-research shape declares the domains the research must NEVER fetch or
@@ -81,19 +126,22 @@ are filled."""
 deny_domains = ["wikipedia.org", "wikimedia.org", "wiktionary.org"]
 
 # ---------------------------------------------------------------------------
-# P2.5b (d134/d135) — ITERATIVE GAP-EXPANSION (the parity lever to RETIRE the tree).
+# P2.5b (d134/d135) — GROWABLE MARKER (iterative gap-expansion).
 # ---------------------------------------------------------------------------
-# When true, the GENERIC engine reproduces run_research_tree's ITERATIVE breadth:
-# `unroll_shape` emits ONLY the first (seed) research layer and tags the PlanDAG
-# `growable`, and the runtime's drive loop GROWS the DAG round-by-round by invoking
-# the SAME research_tree.run_decision_node over the persisted ResearchState — each
-# note's gaps author the next layer's research nodes (growing-visibility edges). The
-# loop is bounded by `max_layers` + `fan_out` + no_expansion + the `completeness_stop`
-# above (the model's stop_research). This relaxes EXACTLY ONE invariant ("node set
-# fixed at unroll time") and reuses the tree's already-generic tool-driven loop — NO
-# bespoke python, no second engine. false => the legacy frozen unroll (all rounds at
-# unroll time), byte-identical to pre-P2.5b. (The DAG IS the research topology; the
-# `max_iter`/`round_roles`/`final_roles` above still describe the frozen-unroll mode.)
+# The GROWABLE marker for the deep-research path: it declares that this shape's research
+# is built by ITERATIVE breadth — the engine emits ONLY a tool-less seed research node,
+# tags the PlanDAG `growable`, and the runtime's drive loop GROWS the DAG wave-by-wave by
+# invoking the SAME research_tree.run_decision_node over the persisted ResearchState (each
+# note's gaps author the next layer's research nodes, with growing-visibility edges),
+# bounded by `max_layers` + `fan_out` + no_expansion + the `completeness_stop` above. It
+# reuses the tree's already-generic tool-driven loop — NO bespoke python, no second engine.
+#
+# ALWAYS-ON for deep-research (s16/a3 — unroll RETIRED). The old `false` branch selected the
+# frozen unroll (all rounds pre-baked at unroll time); that path and `unroll_shape` are
+# DELETED. The engine's research seed now hard-codes `growable=True` (agentic._research_seed_
+# dag), so nothing branches on this value: a `false` here is INERT and CANNOT resurrect the
+# retired unroll. It stays as the schema-friendly growable marker the shape_author writes and
+# the loader/tests read (ShapeSpec.expand_on_gaps); keep it true for a deep-research shape.
 expand_on_gaps = true
 
 # GROWTH BOUND: the max number of research layers the growable drive runs (seed = layer
@@ -106,19 +154,56 @@ max_layers = 5
 # keeps per layer) — the iterative breadth knob. Mirrors TreeConfig.fan_out (~4-5).
 fan_out = 5
 
-# Node roles emitted each NON-FINAL round, in order. Both run the SAME spec.
-# (Frozen-unroll mode only; in the growable mode above the SEED uses the research
-# position and the decision node plays the critic — mirroring the tree's gather-decide.)
-round_roles = ["research", "critic"]
+# ---------------------------------------------------------------------------
+# s14/a17 (d163) — SOURCE-COUNT CEILING fed to the WRITE phase (the richness backstop).
+# ---------------------------------------------------------------------------
+# A deep report's richness comes from the writer USING each source's concrete figures/dates,
+# NOT from MORE sources: the good run had ~5 sources + ~80 figures, while the 11-source run
+# went hollow (the oversized feed truncated and starved the writer of figures + its styling
+# spec). This caps the fetched sources handed to the write phase to a focused, fully-mineable
+# set — breadth still comes from the decompose-first facets (>=3 dimensions); each facet's
+# best sources lead the launch-order list, so the retained head still spans the facets. The
+# tool-layer push-leads already make the write INPUT bounded regardless of count; this ceiling
+# is the richness backstop, not the bound. 0 => uncapped. (Honoured in agentic._run_deep_
+# research_sectioned right after _collect_chain_sources.)
+max_sources = 8
 
-# Node roles emitted in the SINGLE FINAL round, in order (replaces the last
-# round's {research, critic} with {research, synthesis, verify}).
-final_roles = ["research", "synthesis", "verify"]
+# NO round_roles / final_roles (s16/a3 d239/d247 — RETIRE THE UNROLL). The shape NO LONGER
+# declares a per-round node sequence: there is no deterministic unroll. The research TOPOLOGY
+# is AUTHORED at runtime by REASONING — the engine emits a TOOL-LESS self-selecting research
+# seed and the DagGrower decompose-first-seeds the goal into scoped facets, then grows
+# wave-by-wave on note gaps (run_decision_node), bounded by max_iter / max_layers / fan_out /
+# completeness_stop. The research positions (research/critic/synthesis/verify) live in the
+# grower + roles, not here. A deep-research shape is fully described by { name, description,
+# execution, max_iter, hard_cap } + the doctrine/grow fields above — a clean, schema-friendly
+# structure a structured-output call can generate.
 
-# EDGE POLICY is generic + fixed (not per-shape): `unroll_shape` makes every node
-# depend on EVERY previously-authored node, so the rounds run in order and each
-# node's inputs carry all earlier layers (findings + critic follow-ups) — full
-# growing visibility, acyclic by construction. Nothing to declare here, which keeps
-# the on-disk shape format minimal + schema-friendly (d14): a cyclic shape is fully
-# described by { name, description, max_iter, hard_cap, round_roles, final_roles,
-# execution } — a clean structure a structured-output call could later generate.
+# ---------------------------------------------------------------------------
+# RP-6b (d359/d361) — the deep-research PHASES + per-phase SPEC-ROUTING, DECLARED HERE.
+# ---------------------------------------------------------------------------
+# The deep-research FLOW is an ordered sequence of PHASES — first GATHER the topic
+# (research), then AUTHOR the sourced deliverable (write). Per the d341/d319 charter
+# (behaviour lives in SHAPES, not baked in engine code), those phases are DECLARED HERE,
+# not as a hardcoded research-first SEED in the engine's route (agentic.route_research) +
+# a FIXED phase enum in the planner (planner.FOLLOWUP_PLANS). The generic iterative-planner
+# loop READS this list:
+#   * the FIRST phase's `kind` SEEDS the loop (was the hardcoded `first_plan_kind="research"`);
+#   * the phase ORDER drives the default phase transition (research → write → done — was the
+#     hardcoded `default_next`);
+#   * the follow-up plan VOCABULARY derives from these `kind`s (+ the always-on review/done
+#     loop-controls) — was the fixed `FOLLOWUP_PLANS` engine enum.
+#
+# Each phase also declares its `spec_role` — the CLASS of specialization its nodes carry —
+# so the right spec lands on the right node (Bug A d355/d356): the RESEARCH phase's gather
+# nodes carry the research/analysis spec (research-analyst), the WRITE phase's node carries
+# the writer spec — NEVER a writer spec on a research node, NEVER a research spec on the
+# write node. This is a declarative role (not a spec NAME): the engine maps `research` →
+# the seeded research-analysis spec, and routes the user-named output/writer spec to the
+# WRITE phase. Editing this list changes the flow + spec-routing — no engine code change.
+[[phases]]
+kind = "research"       # GATHER: investigate the topic on the growable research engine.
+spec_role = "research"  # research/analysis specialization on the gather nodes.
+
+[[phases]]
+kind = "write"          # AUTHOR: write the sourced deliverable from the gathered research.
+spec_role = "writer"    # the writer specialization on the deliverable node.

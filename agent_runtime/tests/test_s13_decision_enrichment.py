@@ -9,8 +9,12 @@ node. Same scripted-transport + injected-gather seam as ``test_n4_research_tree.
   the LAYER LOOP breaks EARLY with ``stop_reason='agent_sufficient'`` before the depth bound;
 * (2c) ``expand_branch`` / ``prune_branch`` still parse + dispatch correctly (the meaning
   levers, unchanged) and a discrete ``set_next_direction`` is NOT confused with the new stop;
-* (2a) ``render_for_decision`` emits the per-branch ``contributes: N claims, M sources,
-  trust=T`` MEANING signal, computed from the persisted record alone (no new fetch).
+* (s14/P3A items 1+2) ``render_for_decision`` now renders the COMPACT RESEARCH MEMORY —
+  a running NARRATIVE summary (COVERED grounded in stable [S#] / OPEN GAPS / DIRECTION) plus
+  the VERBATIM SOURCE INDEX — and the raw per-branch ``contributes`` dump is RETIRED (it
+  re-rendered all prior-layer state every layer → d146(2) unbounded context growth). The
+  s13 findings-bridge is preserved INTO the narrative (a notes-empty branch surfaces its
+  findings prose as COVERED so the decision node is never blind).
 """
 from __future__ import annotations
 
@@ -64,6 +68,16 @@ class _ScriptedTransport:
 def _note(sid, trust, title, claims, gaps):
     return {
         "source_id": sid, "url": f"https://ex/{sid}", "title": title,
+        "source_trust": trust, "category": "x", "summary": "s",
+        "key_claims": claims, "relevance": "r", "gaps_or_followups": gaps,
+    }
+
+
+def _note_at(url, trust, title, claims, gaps):
+    """A note whose ``url`` MATCHES a fetched source url, so the narrative resolves its
+    claims to that source's stable [S#] (the s14/P3A index↔narrative join)."""
+    return {
+        "source_id": 1, "url": url, "title": title,
         "source_trust": trust, "category": "x", "summary": "s",
         "key_claims": claims, "relevance": "r", "gaps_or_followups": gaps,
     }
@@ -195,44 +209,62 @@ def test_s13_agent_sufficient_wins_over_expansions_same_layer():
 
 
 # =========================================================================== #
-# 2a — render_for_decision emits the per-branch 'contributes' MEANING line.
+# s14/P3A items 1+2 — render_for_decision now renders the COMPACT RESEARCH MEMORY
+# (running NARRATIVE summary + VERBATIM SOURCE INDEX) and the raw per-branch
+# 'contributes' dump is RETIRED (kills the d146(2) unbounded linear context growth).
+# The decision node reasons over COVERED (grounded in stable [S#]) + OPEN GAPS, and
+# a stable [S#] verbatim source index — NOT a re-render of all prior-layer state.
 # =========================================================================== #
-def test_s13_render_emits_per_branch_contributes_line(tmp_path):
+def test_s14_render_emits_narrative_and_verbatim_index(tmp_path):
     state = ResearchState(tmp_path / "state.jsonl")
     state.append_leaf(LeafResult(
         branch_id="root", question="overview",
         findings="f",
         notes=[
-            _note("1", "primary", "AP", ["Fordow hit", "12 dead"], ["damage assessment"]),
-            _note("2", "secondary", "Reuters", ["ceasefire signed"], []),
+            # note urls MATCH the fetched-source urls so the claim grounds to a real [S#]
+            _note_at("https://ap", "primary", "AP", ["Fordow hit", "12 dead"], ["damage assessment"]),
+            _note_at("https://reuters", "secondary", "Reuters", ["ceasefire signed"], []),
         ],
-        fetched=[{"title": "AP", "url": "https://ap", "markdown": "m"}],
+        fetched=[
+            {"title": "AP", "url": "https://ap", "markdown": "# Strike\nFordow hit"},
+            {"title": "Reuters", "url": "https://reuters", "markdown": "ceasefire signed"},
+        ],
     ), layer=1)
     render = state.render_for_decision()  # reads BACK from disk (d49 real state)
-    # 3 claims total (2 + 1), 2 note-bearing sources, both trust tiers present
-    assert "contributes: 3 claims, 2 sources, trust=primary/secondary" in render
-    # the underlying notes still render (the enrichment ADDS a line, removes nothing)
-    assert "Fordow hit" in render and "damage assessment" in render
+    # the OLD raw per-branch dump is RETIRED
+    assert "ARTICLE NOTES (already gathered)" not in render
+    assert "contributes:" not in render
+    # the NEW compact memory: a narrative + a verbatim [S#] index
+    assert "RESEARCH NARRATIVE" in render and "SOURCE INDEX" in render
+    # the notes' claims surface as COVERED bullets, grounded in the stable [S#] of the
+    # source whose url matches the note (the index↔narrative join)
+    assert "Fordow hit" in render and "ceasefire signed" in render
+    assert "[S1]" in render and "[S2]" in render
+    # the note's gap becomes an OPEN GAP the decision node can expand from
+    assert "damage assessment" in render
+    # the verbatim index carries the real fetched urls (never paraphrased)
+    assert "https://ap" in render and "https://reuters" in render
 
 
-def test_s13_contributes_line_handles_empty_branch(tmp_path):
+def test_s14_render_handles_empty_branch(tmp_path):
+    # A genuinely empty branch (no notes, no findings, no sources) renders an honest
+    # 'none yet' for both artifacts — no crash, no fabricated content.
     state = ResearchState(tmp_path / "state.jsonl")
     state.append_leaf(LeafResult(
         branch_id="B1", question="dead-end", findings="", notes=[], fetched=[],
     ), layer=2)
     render = state.render_for_decision()
-    assert "contributes: 0 claims, 0 sources, trust=n/a" in render
+    assert "none yet" in render or "no sources" in render
+    assert "contributes:" not in render
 
 
 # =========================================================================== #
-# P1-findings (s13) — FINDINGS BRIDGE. A leaf that gathered REAL findings but
-# emitted 0 ArticleNotes must NEVER render "0 sources": the notes-only signal
-# would make the decision node prune/stop on a branch full of real content. The
-# bridge derives a NON-ZERO claims/sources signal from the persisted
-# findings_digest + fetched_count, and surfaces the findings text so the planner
-# decides on real data.
+# FINDINGS BRIDGE (preserved into the narrative): a leaf that gathered REAL findings
+# but emitted 0 ArticleNotes must NEVER leave the decision node blind. The narrative
+# (built from notes) is then empty, so render derives COVERED bullets from the real
+# findings prose — the decision node still reasons over what was gathered.
 # =========================================================================== #
-def test_s13_findings_bridge_nonzero_contribution_when_notes_empty(tmp_path):
+def test_s14_findings_bridge_surfaces_findings_when_notes_empty(tmp_path):
     state = ResearchState(tmp_path / "state.jsonl")
     state.append_leaf(LeafResult(
         branch_id="B2", question="Fordow strike damage",
@@ -251,21 +283,17 @@ def test_s13_findings_bridge_nonzero_contribution_when_notes_empty(tmp_path):
         ],
     ), layer=1)
     render = state.render_for_decision()  # what the decision node actually sees
-    # The branch is NOT rendered as empty — this is the core fix.
-    assert "0 claims, 0 sources" not in render
-    assert "0 sources" not in render
-    # A non-zero contribution is shown, attributed to findings (not fabricated notes),
-    # with the real fetched-source count (3) carried through.
-    assert "claims (from findings)" in render
-    assert "3 sources, trust=findings (notes not emitted)" in render
-    # And the planner can SEE the actual findings content, not just a count.
+    # the branch is NOT blind — the findings prose is surfaced as COVERED (the bridge)
     assert "Fordow enrichment site was struck" in render
+    assert "note lane emitted nothing" in render  # the bridge header
+    # the verbatim index still lists the 3 real fetched sources by stable [S#]
+    assert "[S1]" in render and "[S2]" in render and "[S3]" in render
 
 
-def test_s13_findings_bridge_floors_sources_at_one_without_fetch_count(tmp_path):
-    # A leaf with findings but neither notes NOR a recorded fetch count must still
-    # read as a real contribution (>=1 claim, >=1 source) — it read SOMETHING to
-    # write findings, so it is never shown as the empty 0/0 dead-end.
+def test_s14_findings_bridge_without_any_sources(tmp_path):
+    # A leaf with findings but neither notes NOR fetched sources still surfaces its
+    # findings as COVERED (it read SOMETHING to write them) — never an empty dead-end —
+    # while the source index honestly reports no sources fetched yet.
     state = ResearchState(tmp_path / "state.jsonl")
     state.append_leaf(LeafResult(
         branch_id="B3", question="ceasefire terms",
@@ -273,23 +301,23 @@ def test_s13_findings_bridge_floors_sources_at_one_without_fetch_count(tmp_path)
         notes=[], fetched=[],
     ), layer=2)
     render = state.render_for_decision()
-    assert "0 sources" not in render
-    assert "1 sources, trust=findings (notes not emitted)" in render
-    assert "claims (from findings)" in render
+    assert "A ceasefire was brokered on June 24" in render
+    assert "no sources fetched yet" in render
 
 
-def test_s13_findings_bridge_does_not_disturb_noted_branches(tmp_path):
-    # Regression guard: a branch WITH notes keeps the original notes-only signal
-    # (no "from findings" wording, no findings line) — the bridge only fires when
-    # notes are empty.
+def test_s14_noted_branch_prefers_narrative_over_findings_bridge(tmp_path):
+    # Regression guard: a branch WITH notes uses the NOTE-derived narrative (claims as
+    # COVERED grounded in [S#]); the findings-bridge fallback header must NOT appear.
     state = ResearchState(tmp_path / "state.jsonl")
     state.append_leaf(LeafResult(
         branch_id="root", question="overview",
-        findings="some findings prose that should NOT appear as a findings line here",
-        notes=[_note("1", "primary", "AP", ["Fordow hit"], ["damage"])],
+        findings="some findings prose that should NOT appear as a covered bullet here",
+        notes=[_note_at("https://ap", "primary", "AP", ["Fordow hit"], ["damage"])],
         fetched=[{"title": "AP", "url": "https://ap", "markdown": "m"}],
     ), layer=1)
     render = state.render_for_decision()
-    assert "contributes: 1 claims, 1 sources, trust=primary" in render
-    assert "from findings" not in render
-    assert "findings: some findings prose" not in render
+    # the note's claim is COVERED, grounded in the matching source's [S1]
+    assert "Fordow hit" in render and "[S1]" in render
+    # the note-driven narrative is used, NOT the findings-bridge fallback
+    assert "note lane emitted nothing" not in render
+    assert "some findings prose that should NOT appear" not in render

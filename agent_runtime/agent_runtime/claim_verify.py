@@ -502,147 +502,17 @@ async def verify_claims(
     return parse_verify_verdict(raw)
 
 
-# ---------------------------------------------------------------------------- #
-# REVISE turn — force the model to GROUND or REVISE/REMOVE the unbacked claims.
-# ---------------------------------------------------------------------------- #
-# The revised deliverable comes back RAW (content is RAW on every route — d50/d50.1).
-# Grounded-only: ground each flagged claim from the listed real sources, or REMOVE
-# it; NEVER invent a fact/figure/citation/source to keep it. The whole document is
-# re-emitted so the model can excise a claim cleanly in context.
-_REVISE_INSTRUCTION = (
-    "A fact-check found UNBACKED claims in your report — claims that NO fetched "
-    "source supports. Produce a CORRECTED report that fixes EACH one by either:\n"
-    "  (a) GROUNDING it — restate it to match what a listed FETCHED SOURCE actually "
-    "says (and cite that source's URL), if a source backs it; OR\n"
-    "  (b) REMOVING it — delete the claim (and any sentence that depends on it) if NO "
-    "fetched source backs it.\n"
-    "You may NOT invent a fact, figure, statute/section number, citation, date, "
-    "publication or URL to keep a claim. Do NOT add new claims. Keep every backed "
-    "claim and the report's structure/format intact. Output ONLY the full corrected "
-    "report (raw, same format as the input) — no preamble, no JSON, no explanation."
-)
-
-
-def _render_unbacked(unbacked: Sequence[UnbackedClaim]) -> str:
-    lines = ["UNBACKED CLAIMS to ground-or-remove:"]
-    for i, u in enumerate(unbacked, 1):
-        reason = f" — {u.reason}" if u.reason else ""
-        lines.append(f"{i}. {u.claim}{reason}")
-    return "\n".join(lines)
-
-
-@dataclass
-class RevisionResult:
-    """The outcome of the verify-and-revise checkpoint over a deliverable.
-
-    ``document`` is the deliverable AFTER the lane (the revised text when a revision
-    fired, else the original unchanged). ``revised`` is True when a grounded-or-remove
-    pass actually rewrote it. ``unbacked`` is what the final verify turn flagged;
-    ``grounded`` is True when the deliverable ended with no unbacked claim. ``passes``
-    counts the verify turns run; ``trace`` is per-pass detail for the live proof."""
-
-    document: str
-    revised: bool
-    grounded: bool
-    unbacked: list[UnbackedClaim] = field(default_factory=list)
-    passes: int = 0
-    trace: list[dict[str, Any]] = field(default_factory=list)
-
-
-async def verify_and_revise(
-    document: str,
-    sources: Sequence[Mapping[str, Any]],
-    *,
-    verify: Verify,
-    revise: Optional[Verify] = None,
-    verify_native: Optional[VerifyNative] = None,
-    goal: str = "",
-    spec: str = "",
-    max_passes: int = 1,
-    excerpt_budget: int = _SOURCE_EXCERPT_BUDGET,
-    min_retention_ratio: float = 0.5,
-) -> RevisionResult:
-    """The N5 checkpoint: VERIFY the deliverable, then force GROUND-or-REVISE/REMOVE.
-
-    Runs :func:`verify_claims`; if it is already grounded, returns the document
-    unchanged (a clean report is never nagged or stripped — the steer's "do not strip
-    valid content"). On flagged unbacked claims it runs a RAW revise turn (``revise``,
-    or ``verify`` reused) that grounds each claim from the listed sources or removes
-    it (never invents), re-verifies the result, and repeats up to ``max_passes``
-    times. Both the unbacked-claim judgement and the rewrite are the MODEL's reasoning
-    — this orchestrator never edits the text itself (no regex content-filter, d14/d48).
-
-    SAFEGUARD against a truncated / over-deleting revise turn (a single whole-document
-    re-emission can be cut short by the output budget, or the model can over-prune):
-    a revision shorter than ``min_retention_ratio`` of the original is REJECTED (the
-    original stands, the unbacked verdict is surfaced) so the lane never blanks or
-    guts a real deliverable. This is a "don't blank the deliverable" length FLOOR (the
-    same class as the write loop's empty-doc floor), NOT a content regex over claims —
-    grounding is still the model's reasoning; this only refuses a catastrophic rewrite.
-
-    Returns a :class:`RevisionResult`: the final document, whether a revision fired,
-    whether it ended grounded, the residual unbacked list, and a per-pass trace. If the
-    verify turn is UNREADABLE (``parsed=False``) the document is returned UNCHANGED with
-    ``grounded=False`` — the lane surfaces the failure rather than stripping on noise."""
-    do_revise = revise or verify
-    current = document or ""
-    trace: list[dict[str, Any]] = []
-    last: VerifyResult = VerifyResult(grounded=True, verdict="ok")
-    revised_any = False
-    ratio = max(0.0, min(1.0, float(min_retention_ratio)))
-
-    passes = max(1, int(max_passes))
-    for p in range(passes):
-        last = await verify_claims(
-            current, sources, verify=verify, verify_native=verify_native,
-            goal=goal, spec=spec, excerpt_budget=excerpt_budget,
-        )
-        trace.append({
-            "pass": p + 1,
-            "grounded": last.grounded,
-            "parsed": last.parsed,
-            "verdict": last.verdict,
-            "unbacked": [u.claim for u in last.unbacked],
-        })
-        if last.grounded or not last.parsed or not last.unbacked:
-            # Grounded → done; unreadable verdict → surface, don't strip; no actionable
-            # unbacked list → nothing to ground-or-remove (never invent a revision).
-            break
-
-        src_block = render_sources_for_verify(sources, excerpt_budget=excerpt_budget)
-        if not src_block:
-            src_block = "FETCHED SOURCES: (none — NO real source was read for this report)."
-        prompt = (
-            f"{src_block}\n\n{_render_unbacked(last.unbacked)}\n\n"
-            f"REPORT TO CORRECT:\n{current}\n\n{_REVISE_INSTRUCTION}"
-        )
-        try:
-            new_doc = (await do_revise(prompt) or "").strip()
-        except Exception:  # noqa: BLE001 - a revise hiccup leaves the document as-is
-            new_doc = ""
-        # Accept a revision ONLY when it returned real content of a sane length: an
-        # empty reply (model failed to revise) or a catastrophically short one (a
-        # truncated/over-pruned rewrite) is REJECTED so the deliverable is never blanked
-        # or gutted — the original stands and the unbacked verdict is surfaced instead.
-        floor = int(len(current.strip()) * ratio)
-        if new_doc and new_doc != current.strip() and len(new_doc) >= floor:
-            current = new_doc
-            revised_any = True
-            trace[-1]["rewrote"] = True
-        else:
-            trace[-1]["rewrote"] = False
-            if new_doc and len(new_doc) < floor:
-                trace[-1]["rejected_short"] = True
-            break
-
-    return RevisionResult(
-        document=current,
-        revised=revised_any,
-        grounded=bool(last.grounded),
-        unbacked=list(last.unbacked),
-        passes=len(trace),
-        trace=trace,
-    )
+# RP-3c (d330): the engine VERIFY-AND-REVISE checkpoint (``verify_and_revise`` + its
+# ``RevisionResult`` / ``_render_unbacked`` / ``_REVISE_INSTRUCTION`` helpers) is DELETED.
+# It was the ground-or-revise/remove pass the runtime ran, gated on the ``verify_lane``
+# boolean — a flag-gated engine behavior the no-hardcoded-flags mandate forbids (d311). The
+# no-fabrication self-review it enforced (every claim traces to a real fetched source;
+# ground-or-drop any unbacked claim) MOVED to the DEFINITION LAYER: the writer specs' shared
+# ``_COHERENT_ARTIFACT_DOCTRINE`` self-review-before-finish clause (the MODEL reviews its own
+# artifact). What remains here is the MODEL-DRIVEN verify surface: ``verify_claims`` (the one
+# reasoning verify turn) is still live via the ``cross_verify`` research bundle tool a node
+# self-selects, and ``research_answered_from_memory`` still powers the (de-flagged) no-fab
+# gather-more gate.
 
 
 __all__ = [
@@ -650,7 +520,6 @@ __all__ = [
     "VerifyNative",
     "UnbackedClaim",
     "VerifyResult",
-    "RevisionResult",
     "VERIFY_VERDICT_TOOL",
     "VERIFY_VERDICT_SPEC",
     "REVIEWER_FILE_TOOL_SPECS",
@@ -660,5 +529,4 @@ __all__ = [
     "parse_verify_verdict",
     "verdict_from_native_args",
     "verify_claims",
-    "verify_and_revise",
 ]

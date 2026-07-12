@@ -105,6 +105,8 @@ def test_downstream_writer_prompt_contains_goal_and_upstream_sources():
     # n1's agentic loop: search → fetch the chosen URL → write findings (3 turns);
     # then n2's single writer call. FakeTransport replays these in order.
     transport = FakeTransport([
+        # d242 TRUE self-select: n1 (research) starts TOOL-LESS and loads 'research' first.
+        '{"tool": "get_bundles", "args": {"name": "research"}}',
         '{"tool": "web_search", "args": {"query": "US Iran June 2026 casualties"}}',
         '{"tool": "web_fetch", "args": {"url": "https://example.org/a"}}',
         "RESEARCH: " + research_prose,

@@ -102,7 +102,11 @@ TOOL_ARG_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "schedule": {
                 "type": "string",
-                "description": "a 5-field cron expression, e.g. '0 9 * * *'",
+                "description": (
+                    "a 5-field cron expression TRANSLATED from the time/cadence the "
+                    "USER actually asked for (e.g. 'every day at 8am' -> '0 8 * * *'); "
+                    "never a default time the user did not state"
+                ),
             },
             "prompt": {
                 "type": "string",
@@ -321,62 +325,14 @@ def _is_generic_name(path: str) -> bool:
     return (not stem) or re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_") in _GENERIC_NAMES
 
 
-# --------------------------------------------------------------------------- #
-# cron_add PROMPT grounding (s7/a3) — the scheduled job's prompt is the REAL task
-# --------------------------------------------------------------------------- #
-# The s7/a3 LIVE scenario-2 POC surfaced the cron analogue of a2's stub-file gap:
-# ``cron_add`` carries a ``prompt`` (the plan the job runs WHEN IT FIRES). Left to
-# the small model's schema-constrained emission, that prompt came back a hallucinated
-# STUB ("Run the daily job.", "Perform news research.") — so the UNATTENDED fired job
-# was hollow (no real search, no email): the dummy-chatbot symptom, one level down.
-# The fix mirrors a2: ground the fired prompt DETERMINISTICALLY in the planner's own
-# authoritative description of the scheduled step (``node.task``), stripping the
-# SCHEDULING scaffolding ("schedule a recurring task to ... every morning at 7am") so
-# what remains is the recurring ACTION the job must perform on fire ("research the
-# latest AI news and email me a summary") — never the model's placeholder.
-
-# Leading scheduling verbs the planner wraps the cron step's task in.
-_CRON_TASK_PREFIXES = (
-    "schedule a recurring task to ", "schedule a recurring job to ",
-    "schedule a recurring task that ", "schedule a daily task to ",
-    "schedule a daily job to ", "schedule a task to ", "schedule a job to ",
-    "set up a recurring task to ", "set up a recurring job to ",
-    "create a recurring task to ", "create a recurring job to ",
-    "schedule a recurring ", "schedule a daily ", "schedule ", "set up a daily ",
-    "set up ", "create a daily ",
-)
-# A trailing schedule/cadence clause to drop (so the fired prompt is the action only).
-_CRON_CADENCE_RE = re.compile(r"\b(every|each)\s+\w+", re.IGNORECASE)
-_CRON_DAILY_RE = re.compile(r"\b(daily|hourly|weekly|nightly)\b", re.IGNORECASE)
-_CRON_AT_TIME_RE = re.compile(r"\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b", re.IGNORECASE)
-
-
-def cron_prompt_from_task(task: str) -> str:
-    """Derive the recurring ACTION (the fired job's prompt) from the cron node's task.
-
-    Strips the leading scheduling verb and any trailing cadence/time clause so the
-    scheduled job's prompt is the work to DO on fire ("research the latest AI news
-    and email me a summary"), not "schedule a recurring task ... every morning at
-    7am" (which would make the fired plan try to RE-schedule) and not the small
-    model's hallucinated placeholder. Deterministic (no LLM): the planner's task
-    text is the authoritative source. Returns "" when nothing usable remains."""
-    t = (task or "").strip()
-    low = t.lower()
-    for p in _CRON_TASK_PREFIXES:
-        if low.startswith(p):
-            t = t[len(p):]
-            break
-    # Cut from the first cadence/time clause onward (whichever comes first).
-    cut = len(t)
-    for rx in (_CRON_CADENCE_RE, _CRON_DAILY_RE, _CRON_AT_TIME_RE):
-        m = rx.search(t)
-        if m:
-            cut = min(cut, m.start())
-    t = t[:cut].strip().rstrip(",.;: ")
-    # Drop a dangling leading "to " left by an unmatched prefix variant.
-    if t.lower().startswith("to "):
-        t = t[3:].strip()
-    return t
+# RP-4 (d322/d332): the s7/a3 ``cron_prompt_from_task`` string-surgery that used to
+# derive the fired job's ``prompt`` by stripping scheduling scaffolding from
+# ``node.task`` was REMOVED. It was engine-authored output (it REWROTE the model's
+# cron prompt), the exact d310/d311/d319 fabrication the re-plan retires, and it was
+# fragile (empty / truncated on common phrasings). The whole-DAG scheduling doctrine
+# now lives in the ``recurring-scheduler`` SPEC the planner stamps on the cron node,
+# which drives the MODEL to author the whole self-contained task as the prompt; the
+# engine stores it VERBATIM (parse-to-read only).
 
 
 def _subject_from(node: PlanNode, body: str) -> str:
@@ -526,7 +482,7 @@ class SchemaToolArgEmitter:
         )
 
     def _prompt(self, node: PlanNode, schema: Mapping[str, Any],
-                have: Mapping[str, Any]) -> tuple[str, str]:
+                have: Mapping[str, Any], goal: Optional[str] = None) -> tuple[str, str]:
         req = ", ".join(schema.get("required", [])) or "(none)"
         system = (
             f"You emit ONLY the JSON arguments for a '{node.tool}' tool call, "
@@ -534,8 +490,15 @@ class SchemaToolArgEmitter:
             "privately first; your VISIBLE reply must be ONLY the JSON arguments "
             "object — no prose, no code fences."
         )
+        # The run's USER GOAL rides the prompt when the caller supplies it (the
+        # scheduled-brief live catch: the node task alone can drop a load-bearing
+        # user-stated detail — a time, a recipient, a format — and the model then
+        # anchors on a schema example instead of the user's words). Bounded: the
+        # goal is the user's own short request text.
+        goal_line = f"USER GOAL (ground every argument in the user's OWN words — a stated time, format or recipient is binding): {str(goal).strip()}\n" if goal and str(goal).strip() else ""
         user = (
-            f"TASK (the step this tool call serves): {node.task}\n"
+            goal_line
+            + f"TASK (the step this tool call serves): {node.task}\n"
             + (f"ALREADY-KNOWN ARGS: {json.dumps(dict(have))}\n" if have else "")
             + f"TOOL ARG SCHEMA: {json.dumps(dict(schema))}\n\n"
             "Return ONLY the JSON arguments object."
@@ -547,21 +510,16 @@ class SchemaToolArgEmitter:
         node: PlanNode,
         inputs: Optional[Mapping[str, Any]] = None,
         tool_values: Optional[Mapping[str, Any]] = None,
+        goal: Optional[str] = None,
     ) -> Mapping[str, Any]:
-        args = await self._resolve(node, inputs, tool_values)
-        # cron_add PROMPT grounding (s7/a3): override the (often-hallucinated)
-        # emitted ``prompt`` with the recurring ACTION distilled from the planner's
-        # own cron-step task, so the UNATTENDED fired job runs the real task — not a
-        # stub. Deterministic; only kicks in for cron_add when a usable action can be
-        # distilled (>= 12 chars), else the resolved value stands. The repair is
-        # reflected in the recorded emission so the proof shows the grounded prompt.
-        if node.tool == "cron_add":
-            grounded_prompt = cron_prompt_from_task(node.task)
-            if len(grounded_prompt) >= 12 and grounded_prompt != args.get("prompt"):
-                args = {**dict(args), "prompt": grounded_prompt}
-                if self.log and self.log[-1].node_id == node.id:
-                    self.log[-1].final_args = dict(args)
-                    self.log[-1].source = (self.log[-1].source or "") + "+cron_prompt_grounded"
+        args = await self._resolve(node, inputs, tool_values, goal)
+        # RP-4 (d322/d332): the cron_add PROMPT is authored by the MODEL and STORED
+        # VERBATIM. The retired ``cron_prompt_from_task`` string-surgery that used to
+        # REWRITE it here was engine-authored output — a tool-name conditional editing
+        # the model's bytes, the exact d310/d311/d319 fabrication the re-plan retires
+        # (and measured fragile: '' / truncated on common phrasings). The whole-DAG
+        # scheduling doctrine now lives in the ``recurring-scheduler`` SPEC the planner
+        # stamps on the cron node; the engine only parses-to-read, never rewrites.
         return args
 
     async def _resolve(
@@ -569,6 +527,7 @@ class SchemaToolArgEmitter:
         node: PlanNode,
         inputs: Optional[Mapping[str, Any]] = None,
         tool_values: Optional[Mapping[str, Any]] = None,
+        goal: Optional[str] = None,
     ) -> Mapping[str, Any]:
         schema = self.schemas.get(node.tool or "")
         base = dict(node.tool_args or {})
@@ -600,7 +559,7 @@ class SchemaToolArgEmitter:
             return base
 
         rec = ToolArgEmission(node.id, node.tool, dict(base), source="phi_schema")
-        system, user = self._prompt(node, schema, have)
+        system, user = self._prompt(node, schema, have, goal)
         last_raw: Optional[str] = None
         for attempt in range(1, self.max_attempts + 1):
             rec.attempts = attempt
@@ -658,5 +617,4 @@ __all__ = [
     "ArgFallback",
     "default_fallback",
     "ground_args_from_upstream",
-    "cron_prompt_from_task",
 ]

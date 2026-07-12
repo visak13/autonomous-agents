@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from llm_framework import Chain, Context, Transport
 from llm_framework.stages import call_stage, prompt_assembly, structured_output
@@ -124,6 +124,124 @@ _AMBIGUITY_OPTS: dict[str, Any] = {
     "format": _AMBIGUITY_DECISION_SCHEMA,
 }
 
+# RESEARCH-PLAN LAST-STEP REVIEWER (d214/d221/d237). After the research plan executes, its
+# last-step REVIEWER REASONS over the gathered research and emits a structured STATUS the
+# planner reads: whether the research is COMPLETE or still THIN, and the DATA COMPLEXITY —
+# the shape of the researched data over N points (how many concerns + how complex) — which
+# the planner uses to reason one-pass-vs-sectioned for the write plan (d237). It does NOT
+# dictate "write sectioned"; it reports. This replaces the retired hardcoded
+# ``_research_plan_final_status`` pure-function that ALWAYS returned write-plan.
+_RESEARCH_REVIEW_STATUSES: tuple[str, ...] = ("research_complete", "research_thin")
+
+_RESEARCH_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": list(_RESEARCH_REVIEW_STATUSES),
+            "description": "research_complete if the gathered research can support the "
+            "deliverable; research_thin if a key part is unsupported / more gathering is needed",
+        },
+        "data_complexity": {
+            "type": "string",
+            "description": "one line: the shape of the researched data over N points — how "
+            "many distinct concerns/parts and how complex (informs one-pass vs sectioned write)",
+        },
+        "rationale": {"type": "string", "description": "one line: why"},
+    },
+    "required": ["status", "data_complexity", "rationale"],
+}
+
+_RESEARCH_REVIEW_OPTS: dict[str, Any] = {
+    "api": "native",
+    "think": True,
+    "temperature": 0,
+    "num_predict": 4096,
+    "format": _RESEARCH_REVIEW_SCHEMA,
+}
+
+
+# FOLLOW-UP PLAN DECISION (d214/d215/d221 — the ITERATIVE PLANNER LOOP). After a plan's
+# LAST-STEP REVIEWER emits its status, the PLANNER REASONS whether another plan is needed
+# and which kind — replacing the retired hardcoded research->write->done while-loop on the
+# served report route. The model picks among:
+#   * research_plan — more gathering is needed before the deliverable can be written.
+#   * write_plan    — the research is settled; author the written (sectioned) deliverable.
+#   * review_plan   — a standalone review/QA pass over the produced deliverable.
+#   * done          — the deliverable is complete; EXIT the loop into the terminal synthesizer.
+#
+# RP-6b (d359/d361): this vocabulary is no longer a HARDCODED engine enum — the deep-research
+# PHASES are DECLARED IN THE SHAPE (deep-research.toml ``[[phases]]``) and the plan kinds
+# DERIVE from them (``ShapeSpec.followup_plans`` = the phase plan-kinds + the always-on
+# review/done loop-controls). We read it from the shipped canonical deep-research shape at
+# import; if that shape is unloadable (a degenerate checkout / offline path) we fall back to
+# the byte-identical default the shape itself yields for no phases, so the enum is never empty.
+def _followup_plans_from_shape() -> tuple[str, ...]:
+    """The follow-up plan vocabulary, DERIVED from the deep-research shape's declared phases
+    (RP-6b). Falls back to the shape's own no-phases default when the shape can't be loaded."""
+    try:
+        from .shapes import load_shape
+
+        return load_shape("deep-research").followup_plans
+    except Exception:  # noqa: BLE001 - a broken/absent shape must not break import; safe default
+        from .shapes import _DEFAULT_FOLLOWUP_PLANS
+
+        return _DEFAULT_FOLLOWUP_PLANS
+
+
+FOLLOWUP_PLANS: tuple[str, ...] = _followup_plans_from_shape()
+
+# The per-call OUTPUT SCHEMA for the follow-up decision (native structured path, like the
+# heal/ambiguity decisions: ``enum`` on next_plan + ``required`` keys).
+_FOLLOWUP_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "next_plan": {
+            "type": "string",
+            "enum": list(FOLLOWUP_PLANS),
+            "description": "the next plan to author, or 'done' to finish",
+        },
+        "rationale": {"type": "string", "description": "one line: why this next plan"},
+    },
+    "required": ["next_plan", "rationale"],
+}
+
+# Native structured-call options for the follow-up decision — same think=True + raised
+# num_predict regime as heal/ambiguity (the CoT competes with the content budget).
+_FOLLOWUP_OPTS: dict[str, Any] = {
+    "api": "native",
+    "think": True,
+    "temperature": 0,
+    "num_predict": 4096,
+    "format": _FOLLOWUP_DECISION_SCHEMA,
+}
+
+# s17 (user mandate: FLEX output — no engine format stamp): the MODEL names the
+# deliverable file. One structured call; the engine parse-to-reads the filename and
+# sanitizes it (never invents/repairs the name beyond the basename guard).
+_DELIVERABLE_NAME_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "filename": {
+            "type": "string",
+            "description": (
+                "the deliverable's filename WITH the extension that fits the format "
+                "the request asks for (e.g. report.html for an HTML report, "
+                "notes.md for markdown, data.csv for tabular data)"
+            ),
+        },
+        "rationale": {"type": "string", "description": "one line: why this name/format"},
+    },
+    "required": ["filename", "rationale"],
+}
+_DELIVERABLE_NAME_OPTS: dict[str, Any] = {
+    "api": "native",
+    "think": True,
+    "temperature": 0,
+    "num_predict": 2048,
+    "format": _DELIVERABLE_NAME_SCHEMA,
+}
+
 
 @dataclass
 class HealDecision:
@@ -156,6 +274,79 @@ class AmbiguityDecision:
             "question": self.question,
             "rationale": self.rationale,
         }
+
+
+@dataclass
+class ResearchReviewStatus:
+    """The research plan's last-step reviewer status (d214/d221/d237).
+
+    ``status`` is one of :data:`_RESEARCH_REVIEW_STATUSES`; ``data_complexity`` is the
+    reviewer's one-line read of the shape of the researched data over N points (how many
+    concerns + how complex) which the planner reasons over for one-pass-vs-sectioned write."""
+
+    status: str            # research_complete | research_thin
+    data_complexity: str   # one-line data-shape read (d237)
+    rationale: str = ""
+    raw: Optional[str] = None
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "research_complete"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "data_complexity": self.data_complexity,
+            "rationale": self.rationale,
+        }
+
+
+@dataclass
+class FollowupDecision:
+    """The planner's structured FOLLOW-UP decision after a plan's reviewer status (d214).
+
+    ``next_plan`` is one of :data:`FOLLOWUP_PLANS` — the next plan the planner authors, or
+    ``"done"`` to EXIT the loop into the terminal synthesizer. This is the model's own
+    reasoning over the last plan's reviewer status + findings digest (d214/d221), replacing
+    the retired hardcoded research->write->done while-loop."""
+
+    next_plan: str             # one of FOLLOWUP_PLANS
+    rationale: str             # the model's one-line justification
+    raw: Optional[str] = None
+
+    @property
+    def done(self) -> bool:
+        return self.next_plan == "done"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"next_plan": self.next_plan, "rationale": self.rationale}
+
+
+@dataclass(frozen=True)
+class NodeFinalization:
+    """The UNIVERSAL node-finalize PAIR (d285 SB-2): a ``(summary, memory_index)`` emitted
+    by EVERY node when it finishes — a research worker, a reviewer, and (as ONE caller) the
+    terminal synthesizer alike — generalizing the prose-only terminal :meth:`finalize_summary`
+    into the node contract.
+
+    * ``summary`` is MODEL-emitted — a brief digest the node's own model writes of what it
+      accomplished + the key findings/outcome (and, when its work assessed it, the SHAPE and
+      COMPLEXITY of the data; a reviewer's digest then carries the d237 data-complexity signal
+      as model-emitted TEXT, which the SB-5 planner reads). The engine authors NO template,
+      structure, or fields inside it.
+    * ``memory_index`` is the index of the research memory the node used (SB-1's store):
+      finalize carries it through UNCHANGED, so passing it back to
+      :func:`~agent_runtime.get_research_memory_store` / ``open_memory`` round-trips to the
+      SAME memory the node opened/continued.
+
+    Role-agnostic by construction — there is no spec-name / role-name field here; the pair is
+    identical in shape for a worker and a reviewer."""
+
+    summary: str        # MODEL-emitted digest of what the node did / found
+    memory_index: str   # the index of the research memory the node used (SB-1)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"summary": self.summary, "memory_index": self.memory_index}
 
 
 @dataclass
@@ -361,6 +552,410 @@ class Planner:
                 raw=ctx.raw_output,
             )
 
+    async def finalize_node(
+        self,
+        goal: str,
+        *,
+        memory_index: str = "",
+        work_digest: str = "",
+        plans_authored: Optional[list[str]] = None,
+        sources: int = 0,
+        sections: int = 0,
+        artifact: str = "",
+    ) -> NodeFinalization:
+        """The UNIVERSAL node FINALIZE (d285 SB-2): a ROLE-AGNOSTIC ``(summary, memory_index)``
+        pair every node emits when it finishes.
+
+        Generalizes the prose-only terminal finalize into the NODE CONTRACT: a research worker,
+        a reviewer, and (via :meth:`finalize_summary`) the terminal synthesizer all call THIS —
+        the synthesizer is now ONE caller, not a special-cased path (d215 terminal kept).
+
+        * the SUMMARY is MODEL-emitted (a short ``think=True``, low-temp Gemma digest the node's
+          own model writes) — the engine authors NO template/structure/fields. The prompt invites
+          every finishing node to digest WHAT it did + the key findings/outcome AND, when its work
+          assessed it, the SHAPE and COMPLEXITY of the data; a reviewer's digest then naturally
+          carries the d237 data-complexity signal as model-emitted TEXT (no engine flag/field),
+          which the SB-5 planner reads. Nothing here branches on which role calls it.
+        * the MEMORY_INDEX is the index of the research memory the node used (SB-1's store),
+          carried through UNCHANGED so passing it back to
+          :func:`~agent_runtime.get_research_memory_store` / ``open_memory`` resolves to the SAME
+          memory the node opened/continued. ``finalize_node`` never opens or mutates the memory —
+          it only digests + carries the index.
+
+        FAIL-SAFE: an empty / errored reply yields a minimal DERIVED one-line summary (the offline
+        FakeTransport seam) so a finalize never breaks a run — graceful degrade, not a fabricated
+        narrative. The ``memory_index`` is preserved on the pair regardless of the summary path."""
+        plans = list(plans_authored or [])
+        index = str(memory_index or "").strip()
+        # Minimal derived fallback (offline seam / empty reply) — a factual one-liner, not an
+        # invented narrative; the LIVE thinking model produces the real digest.
+        derived = (
+            f"Finished: {goal.strip()[:160]}. "
+            + (f"Authored {sections} section(s) " if sections else "")
+            + (f"grounded in {sources} source(s). " if sources else "")
+            + (f"Artifact ready: {artifact}." if artifact else "")
+        ).strip()
+        system = with_identity(
+            self.factory.description
+            + "\n\nYour part of the job is COMPLETE. Write a BRIEF (2-3 sentence) factual summary "
+            "of what you accomplished — what your work covers/found, the key outcome (for a "
+            "finished deliverable, that it is ready), and — WHEN your work assessed it — the SHAPE "
+            "and COMPLEXITY of the data (roughly how many distinct parts/concerns and how complex). "
+            "Be concrete and factual; do NOT invent facts not implied by the inputs, do NOT add a "
+            "preamble, and do NOT restate these instructions. Plain prose only."
+        )
+        user = (
+            f"USER REQUEST / GOAL:\n{goal}\n\n"
+            + (f"WHAT YOU PRODUCED / FOUND:\n{work_digest}\n\n" if work_digest else "")
+            + f"PLANS RUN: {', '.join(plans) or 'n/a'}\n"
+            f"SECTIONS AUTHORED: {sections}\n"
+            f"SOURCES GROUNDED: {sources}\n"
+            + (f"DOWNLOADABLE ARTIFACT: {artifact}\n" if artifact else "")
+            + "\nWrite the brief summary now."
+        )
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(
+            self.transport, api="native", think=True, temperature=0.3, num_predict=1024,
+        ))
+        ctx = Context(system=system, user=user, transport=self.transport)
+        tracer = get_tracer("agent_runtime.planner")
+        with tracer.start_as_current_span("planner.finalize_node") as span:
+            span.set_attribute("planner.finalize.goal", str(goal)[:500])
+            span.set_attribute("planner.finalize.plans", ",".join(plans))
+            span.set_attribute("planner.finalize.memory_index", index)
+            try:
+                ctx = await run_blocking_in_span(chain.run, ctx)
+            except Exception:  # noqa: BLE001 - fail-safe: derived one-liner
+                span.set_attribute("planner.finalize.fail_open", True)
+                return NodeFinalization(summary=derived, memory_index=index)
+            summary = (ctx.raw_output or "").strip()
+            if not summary:
+                span.set_attribute("planner.finalize.fail_open", True)
+                return NodeFinalization(summary=derived, memory_index=index)
+            span.set_attribute("planner.finalize.fail_open", False)
+            span.set_attribute("planner.finalize.chars", len(summary))
+            return NodeFinalization(summary=summary, memory_index=index)
+
+    async def finalize_summary(
+        self,
+        goal: str,
+        *,
+        plans_authored: Optional[list[str]] = None,
+        sources: int = 0,
+        sections: int = 0,
+        artifact: str = "",
+        memory_index: str = "",
+    ) -> str:
+        """The TERMINAL SYNTHESIZER's finalize summary (d215/d221): a REAL LLM digest of the run.
+
+        Now ONE CALLER of the universal :meth:`finalize_node` (d285 SB-2) — the synthesizer is no
+        longer a special-cased finalize path; it shares the exact role-agnostic finalize contract
+        every worker and reviewer uses, and returns just the model-emitted ``summary`` string for
+        the SSE announce (the synthesizer streams prose, not the memory index). The synthesizer
+        runs ONCE after the planner loop EXITS and delivers the final output — a brief, human-
+        facing summary of what the run produced; per d221/d240 it is the model's LLM-generated
+        digest, NOT a hardcoded string. It never edits content/coherence (writer + reviewer own
+        those, d218).
+
+        FAIL-SAFE: an empty / errored reply yields a minimal DERIVED one-line summary (the offline
+        FakeTransport seam) so the SSE announce never breaks — graceful degrade, not a fabricated
+        narrative."""
+        result = await self.finalize_node(
+            goal,
+            memory_index=memory_index,
+            plans_authored=plans_authored,
+            sources=sources,
+            sections=sections,
+            artifact=artifact,
+        )
+        return result.summary
+
+    async def review_research(
+        self,
+        goal: str,
+        findings: str,
+        *,
+        sources: int = 0,
+    ) -> ResearchReviewStatus:
+        """The research plan's LAST-STEP REVIEWER: reason over the gathered research (d214/d237).
+
+        A native structured Gemma call (same think=True regime as the other reviewer/decision
+        calls) that REASONS over the accumulated findings + source count and emits a structured
+        status — research_complete vs research_thin — plus the DATA COMPLEXITY (the shape of the
+        researched data over N points), which the planner reads to reason one-pass-vs-sectioned
+        for the write plan (d237). It replaces the retired ``_research_plan_final_status`` pure
+        function that ALWAYS hardcoded write-plan; now a REAL reviewer reasons the status.
+
+        FAIL-SAFE: any malformed / schema-blind reply (the offline FakeTransport seam) yields a
+        DERIVED status — research_complete when there are findings/sources, else research_thin,
+        with a source-count data-complexity note — so the served route + offline tests stay
+        green while the live thinking model gets the real reviewed status."""
+        n_src = int(sources or 0)
+        derived = "research_complete" if ((findings or "").strip() or n_src) else "research_thin"
+        derived_status = ResearchReviewStatus(
+            status=derived,
+            data_complexity=f"{n_src} source(s) gathered",
+            rationale="derived (no reviewed decision)",
+        )
+        system = with_identity(
+            self.factory.description
+            + "\n\nYou are the research plan's LAST-STEP REVIEWER. Read the gathered research "
+            "and emit a status:\n"
+            "- 'research_complete': the research can SUPPORT the desired deliverable (the key "
+            "parts are covered with sources).\n"
+            "- 'research_thin': a key part is unsupported / more gathering is needed before "
+            "writing.\n"
+            "Also report DATA COMPLEXITY in one line: the shape of the researched data over N "
+            "points — roughly how many distinct concerns/parts it covers and how complex — so "
+            "the planner can reason whether the write should be one pass or sectioned. Do NOT "
+            "dictate the write structure; just REPORT. Emit STRICT JSON {\"status\": "
+            "<research_complete|research_thin>, \"data_complexity\": <one line>, \"rationale\": "
+            "<one line>}."
+        )
+        user = (
+            f"DESIRED DELIVERABLE / GOAL:\n{goal}\n\n"
+            f"SOURCES GATHERED: {n_src}\n"
+            f"GATHERED RESEARCH (bounded):\n{(findings or '')[:6000]}\n\n"
+            "Return ONLY the JSON research review status."
+        )
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(self.transport, **_RESEARCH_REVIEW_OPTS))
+        chain.use(
+            structured_output(self.transport, max_repair_attempts=self.max_repair_attempts)
+        )
+        ctx = Context(system=system, user=user, transport=self.transport)
+        tracer = get_tracer("agent_runtime.planner")
+        with tracer.start_as_current_span("planner.review_research") as span:
+            span.set_attribute("planner.research_review.goal", str(goal)[:500])
+            span.set_attribute("planner.research_review.sources", n_src)
+            try:
+                ctx = await run_blocking_in_span(chain.run, ctx)
+            except Exception:  # noqa: BLE001 - fail-safe: derive from what was gathered
+                span.set_attribute("planner.research_review.status", derived_status.status)
+                span.set_attribute("planner.research_review.fail_open", True)
+                return derived_status
+            parsed = ctx.structured
+            status = (
+                str(parsed.get("status")).strip().lower()
+                if isinstance(parsed, Mapping) and parsed.get("status") is not None
+                else None
+            )
+            if status not in _RESEARCH_REVIEW_STATUSES:
+                span.set_attribute("planner.research_review.status", derived_status.status)
+                span.set_attribute("planner.research_review.fail_open", True)
+                return derived_status
+            data_complexity = (
+                str(parsed.get("data_complexity", "")).strip()
+                if isinstance(parsed, Mapping)
+                else ""
+            ) or derived_status.data_complexity
+            rationale = (
+                str(parsed.get("rationale", "")) if isinstance(parsed, Mapping) else ""
+            )
+            span.set_attribute("planner.research_review.status", status)
+            span.set_attribute("planner.research_review.fail_open", False)
+            return ResearchReviewStatus(
+                status=status,
+                data_complexity=data_complexity,
+                rationale=rationale,
+                raw=ctx.raw_output,
+            )
+
+    async def name_deliverable(
+        self,
+        goal: str,
+        *,
+        requested_specs: Optional[Sequence[str]] = None,
+    ) -> Optional[str]:
+        """The MODEL names the deliverable file (s17 — flex output, no engine stamp).
+
+        One native structured think=True call: the model reads the user's goal (and any
+        requested output specs) and returns a filename WITH the extension fitting the
+        format the request asks for. The engine parse-to-reads it (d311-8) and the
+        caller sanitizes the basename; on ANY failure (offline seam, malformed reply)
+        this returns ``None`` and the caller falls back to its neutral default — the
+        naming is the model's, never repaired/invented by the engine."""
+        system = with_identity(
+            "Name the DELIVERABLE FILE for the request below. Pick a short, relatable "
+            "kebab-case filename WITH the extension that fits the OUTPUT FORMAT the "
+            "request asks for (an HTML report -> .html, markdown -> .md, tabular data "
+            "-> .csv, code -> its language's extension, plain text -> .txt). Emit "
+            'STRICT JSON {"filename": <name.ext>, "rationale": <one line>}.'
+        )
+        user = (
+            f"REQUEST:\n{goal}\n"
+            + (
+                f"REQUESTED OUTPUT SPECS: {', '.join(requested_specs)}\n"
+                if requested_specs
+                else ""
+            )
+            + "\nReturn ONLY the JSON."
+        )
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(self.transport, **_DELIVERABLE_NAME_OPTS))
+        chain.use(
+            structured_output(self.transport, max_repair_attempts=self.max_repair_attempts)
+        )
+        ctx = Context(system=system, user=user, transport=self.transport)
+        tracer = get_tracer("agent_runtime.planner")
+        with tracer.start_as_current_span("planner.name_deliverable") as span:
+            span.set_attribute("planner.name_deliverable.goal", str(goal)[:300])
+            try:
+                ctx = await run_blocking_in_span(chain.run, ctx)
+            except Exception:  # noqa: BLE001 — fail-safe: caller falls back to its default
+                span.set_attribute("planner.name_deliverable.fail_open", True)
+                return None
+            parsed = ctx.structured
+            name = (
+                str(parsed.get("filename")).strip()
+                if isinstance(parsed, Mapping) and parsed.get("filename")
+                else ""
+            )
+            # Parse-to-read guard only: a usable name is a bare basename with an
+            # extension; anything else -> None (the caller's default names it).
+            name = name.replace("\\", "/").rsplit("/", 1)[-1]
+            if not name or "." not in name or name.startswith(".") or name.endswith("."):
+                span.set_attribute("planner.name_deliverable.fail_open", True)
+                return None
+            span.set_attribute("planner.name_deliverable.filename", name[:120])
+            return name
+
+    async def decide_followup(
+        self,
+        goal: str,
+        *,
+        last_plan_kind: str,
+        reviewer_status: str,
+        reviewer_summary: str = "",
+        memory_index: str = "",
+        findings_digest: str = "",
+        data_complexity: str = "",
+        sources: int = 0,
+        fresh_sources: Optional[int] = None,
+        plans_so_far: Optional[list[str]] = None,
+        default_next: str = "done",
+    ) -> FollowupDecision:
+        """REASON the next plan after a plan's last-step reviewer emits its status (d214/d215).
+
+        The autonomous iterative planner loop: a plan executes, its last-step REVIEWER emits a
+        FINAL STATUS, and the PLANNER reads that status to decide the follow-up plan — another
+        ``research_plan`` / ``write_plan`` / ``review_plan``, or ``done`` to EXIT into the
+        terminal synthesizer (d215). This is the model's own reasoning (a native structured
+        Gemma call — the SAME think=True regime as :meth:`assess_ambiguity` / :meth:`heal_decision`),
+        NOT a deterministic derivation from the status; it replaces the retired hardcoded
+        research->write->done while-loop on the served report route.
+
+        SB-5 (d285/d289) — the planner REASONS over the reviewer's OVERALL SUMMARY: the
+        ``(reviewer_summary, memory_index)`` pair is the d285-faithful SINGLE signal the decision
+        reads. ``reviewer_summary`` is the reviewer's model-emitted read of the gathered research,
+        which CARRIES the d237 data-complexity AS TEXT — so the add-more-research-vs-write decision
+        (and, downstream, the sectioned-vs-single emergence) reasons over ONE non-divergent source.
+        The structured ``data_complexity`` is no longer consulted SEPARATELY here when a summary is
+        present (it rides INSIDE the summary); it remains only the offline/back-compat fallback so a
+        caller (or the FakeTransport seam) with no composed summary still degrades gracefully. The
+        ``data-complexity`` is DATA the model reasons over (d10-clean) — never a hardcoded
+        ``if N>k -> sectioned`` heuristic and never a spec-name/role-name branch.
+
+        It is FAIL-SAFE to ``default_next`` (the caller's safe baseline — e.g. ``write_plan``
+        after a research plan whose deliverable is a written report, ``done`` after a write
+        plan or a single acyclic plan): any malformed / schema-blind reply (the offline
+        FakeTransport seam, a confused model) yields ``default_next``, so the loop always
+        makes safe forward progress and terminates — never spins. The LIVE thinking model
+        gets the real reasoned decision."""
+        default = default_next if default_next in FOLLOWUP_PLANS else "done"
+        system = with_identity(
+            self.factory.description
+            + "\n\nA plan just finished and its last-step REVIEWER emitted a status. Decide "
+            "the NEXT step of the overall job by reasoning over that status:\n"
+            "- 'research_plan': the deliverable still needs MORE gathering before it can be "
+            "written (the research is thin / a key part is unsupported).\n"
+            "- 'write_plan': the research is settled and the desired deliverable is a written "
+            "(sectioned) report/document — author it now.\n"
+            "- 'review_plan': the deliverable is written but needs a standalone review/QA pass.\n"
+            "- 'done': the deliverable is COMPLETE (the request is fully served) — FINISH.\n"
+            "Reason from the actual status: after a RESEARCH plan whose research is complete and "
+            "the user wants a written report, choose write_plan; after a WRITE plan whose "
+            "reviewer reports the deliverable complete, choose done; if a simple request was "
+            "already fully answered by the plan that just ran, choose done. Do NOT loop "
+            "needlessly. DIMINISHING RETURNS: when research plans have ALREADY run and the "
+            "latest one added few or NO NEW sources, another research_plan will not help — "
+            "the accumulated research memory is what there is; choose write_plan and author "
+            "the deliverable FROM it. Emit STRICT JSON {\"next_plan\": <research_plan|"
+            "write_plan|review_plan|done>, \"rationale\": <one line>}."
+        )
+        # SB-5 (d285/d289): reason over the reviewer's OVERALL SUMMARY (the (summary, index)
+        # pair) — the SINGLE non-divergent signal, carrying the data-complexity AS TEXT. The bare
+        # structured ``data_complexity`` is the offline/back-compat fallback only (no summary).
+        reviewer_view = (reviewer_summary or "").strip()
+        idx = (memory_index or "").strip()
+        complexity_block = (
+            "REVIEWER SUMMARY (reason over THIS — the reviewer's overall read of the gathered "
+            f"research; it carries the data-complexity as text):\n{reviewer_view}\n"
+            if reviewer_view
+            else f"DATA COMPLEXITY: {data_complexity or 'n/a'}\n"
+        )
+        user = (
+            f"OVERALL GOAL:\n{goal}\n\n"
+            f"LAST PLAN: {last_plan_kind}\n"
+            f"ITS REVIEWER STATUS: {reviewer_status}\n"
+            + complexity_block
+            + (f"RESEARCH MEMORY INDEX: {idx}\n" if idx else "")
+            + f"SOURCES GATHERED (accumulated across all research so far): {sources}\n"
+            + (
+                f"NEW SOURCES ADDED BY THE LAST PLAN: {int(fresh_sources)}\n"
+                if fresh_sources is not None
+                else ""
+            )
+            + f"PLANS AUTHORED SO FAR: {json.dumps(list(plans_so_far or []))}\n"
+            f"FINDINGS DIGEST:\n{(findings_digest or '')[:1500]}\n\n"
+            "Return ONLY the JSON follow-up decision."
+        )
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(self.transport, **_FOLLOWUP_OPTS))
+        chain.use(
+            structured_output(self.transport, max_repair_attempts=self.max_repair_attempts)
+        )
+        ctx = Context(system=system, user=user, transport=self.transport)
+        tracer = get_tracer("agent_runtime.planner")
+        with tracer.start_as_current_span("planner.decide_followup") as span:
+            span.set_attribute("planner.followup.goal", str(goal)[:500])
+            span.set_attribute("planner.followup.last_plan_kind", str(last_plan_kind))
+            span.set_attribute("planner.followup.reviewer_status", str(reviewer_status)[:200])
+            span.set_attribute("planner.followup.default_next", default)
+            # SB-5 (d285/d289) — make the decide leg's SINGLE-signal source visible: it reasoned
+            # over the reviewer (summary, memory_index) pair, not the bare structured field.
+            span.set_attribute("planner.followup.reviewed_summary", bool(reviewer_view))
+            span.set_attribute("planner.followup.reviewer_summary_chars", len(reviewer_view))
+            span.set_attribute("planner.followup.memory_index", idx[:200])
+            try:
+                ctx = await run_blocking_in_span(chain.run, ctx)
+            except Exception:  # noqa: BLE001 - fail-safe: any transport error => safe baseline
+                span.set_attribute("planner.followup.next_plan", default)
+                span.set_attribute("planner.followup.fail_open", True)
+                return FollowupDecision(default, rationale="decision errored; safe baseline")
+            parsed = ctx.structured
+            nxt = (
+                str(parsed.get("next_plan")).strip().lower()
+                if isinstance(parsed, Mapping) and parsed.get("next_plan") is not None
+                else None
+            )
+            if nxt not in FOLLOWUP_PLANS:
+                # No legal decision (malformed / schema-blind transport) => safe baseline so the
+                # loop always makes safe progress and terminates (offline seam stays green).
+                span.set_attribute("planner.followup.next_plan", default)
+                span.set_attribute("planner.followup.fail_open", True)
+                return FollowupDecision(default, rationale="no legal decision; safe baseline")
+            rationale = (
+                str(parsed.get("rationale", "")) if isinstance(parsed, Mapping) else ""
+            )
+            span.set_attribute("planner.followup.next_plan", nxt)
+            span.set_attribute("planner.followup.fail_open", False)
+            return FollowupDecision(next_plan=nxt, rationale=rationale, raw=ctx.raw_output)
+
     async def heal_decision(
         self,
         failed_task: str,
@@ -510,4 +1105,7 @@ __all__ = [
     "HealDecision",
     "HEAL_ACTIONS",
     "AmbiguityDecision",
+    "FollowupDecision",
+    "FOLLOWUP_PLANS",
+    "ResearchReviewStatus",
 ]

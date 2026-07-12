@@ -225,6 +225,54 @@ def test_s13_string_fallback_recovers_on_non_native_path():
     assert res.stop_research == {"reason": "enough"}
 
 
+def test_d222_repair_model_json_recovers_illegal_apostrophe_escape():
+    """d222 trace fix: a note dropped TWICE to an illegal ``\\'`` escape is now recovered."""
+    from agent_runtime.research_tree import repair_model_json
+    import json as _json
+
+    # The exact malformation class from the trace: \' is valid in Python/JS, ILLEGAL in JSON.
+    bad = '{"tool":"note","args":{"key_claims":"the conflict\\\'s instability grew"}}'
+    # Sanity: the raw blob is genuinely unparseable before repair.
+    try:
+        _json.loads(bad)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "fixture should be invalid JSON before repair"
+    fixed = _json.loads(repair_model_json(bad))
+    assert fixed["tool"] == "note"
+    assert fixed["args"]["key_claims"] == "the conflict's instability grew"
+
+
+def test_d222_repair_model_json_strips_stray_special_token():
+    """A stray ``<tool_call|>`` special token left in the object is stripped on repair."""
+    from agent_runtime.research_tree import repair_model_json
+    import json as _json
+
+    bad = '{"tool":"stop_research","args":{"reason":"enough"}}<tool_call|>'
+    fixed = _json.loads(repair_model_json(bad))
+    assert fixed["tool"] == "stop_research"
+
+
+def test_d222_repair_model_json_idempotent_on_valid_json():
+    """Repair never corrupts already-valid JSON (the common path)."""
+    from agent_runtime.research_tree import repair_model_json
+    import json as _json
+
+    good = '{"tool":"expand_branch","args":{"parent":"root","question":"q"}}'
+    assert _json.loads(repair_model_json(good)) == _json.loads(good)
+
+
+def test_d222_parse_tree_call_recovers_malformed_escape():
+    """The tree-call parser recovers a call that previously fell through to prose (note drop)."""
+    raw = '{"tool":"prune_branch","args":{"branch":"S5","reason":"the source\\\'s claim was redundant"}}'
+    out = parse_tree_call(raw)
+    assert out is not None
+    name, args = out
+    assert name == "prune_branch"
+    assert args["reason"] == "the source's claim was redundant"
+
+
 def test_s13_tree_tool_specs_cover_every_tree_tool():
     # Every dispatchable TREE tool is offered as a native schema (so the model can call it
     # natively) — no tool silently lacks a spec.

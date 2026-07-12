@@ -60,7 +60,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from pydantic import BaseModel, Field, ValidationError
 
 from .event_plane import EventPlane
-from .tool_hook import ToolHook, ToolResult
+from .tool_hook import ToolHook, ToolRegistry, ToolResult, ToolSpec
 
 
 class ToolRegistryError(RuntimeError):
@@ -179,6 +179,18 @@ class GrowableToolRegistry:
                 f"got {hook!r}")
         self._hook = hook
         self._defs: dict[str, ToolDef] = {}
+        # The DISPATCH store (A0): a base :class:`ToolRegistry` of dispatchable
+        # ``ToolSpec`` s. We ADOPT the hook's EXISTING base registry so that the
+        # static tools already registered on it (the core file/web tools and the
+        # reactive-lambda tools registered by ``build_default_hook``) SURVIVE when
+        # this growable becomes ``hook.registry`` — i.e. they stay dispatchable
+        # through ``hook.invoke`` even though they are not structured-selectable
+        # ``ToolDef`` s. Re-wrapping an existing growable reuses its base so the
+        # spec store is never lost.
+        base = getattr(hook, "registry", None)
+        if isinstance(base, GrowableToolRegistry):
+            base = base._base
+        self._base: ToolRegistry = base if isinstance(base, ToolRegistry) else ToolRegistry()
 
     @property
     def hook(self) -> ToolHook:
@@ -194,9 +206,32 @@ class GrowableToolRegistry:
         (last writer wins) so a host can override a default tool. Returns the def."""
         if not isinstance(tool, ToolDef):
             raise ToolRegistryError(f"add() takes a ToolDef, got {tool!r}")
-        self._hook.register(tool.name, tool.handler, description=tool.description)
+        # Record the handler in the dispatch store (a ToolSpec) AND the def in the
+        # structured-selection map. Writing straight to ``_base`` is equivalent to
+        # the old ``self._hook.register`` indirection (``hook.register`` delegates to
+        # ``hook.registry`` which IS ``_base`` once this growable is assigned), and is
+        # robust to whether the assign-back has happened yet.
+        self._base.register(tool.name, tool.handler, description=tool.description)
         self._defs[tool.name] = tool
         return tool
+
+    # -- dispatch / base passthroughs (so this can BE hook.registry, A0) -------- #
+
+    def register(self, name: str, func, *, description: str = "") -> ToolSpec:
+        """Register a raw handler as a dispatchable :class:`ToolSpec` (no ToolDef).
+
+        The passthrough that keeps EXISTING ``hook.register`` call sites working once
+        this growable is assigned to ``hook.registry``: ``hook.register`` delegates to
+        ``self.registry.register``, which lands here and stores the spec in the base
+        dispatch store. Such a tool is DISPATCHABLE (via :meth:`resolve` / the hook)
+        but not structured-SELECTABLE (it has no :class:`ToolDef` arg schema) — exactly
+        the right semantics for the core/lambda tools and the per-run write tools."""
+        return self._base.register(name, func, description=description)
+
+    def resolve(self, name: str) -> ToolSpec:
+        """Resolve ``name`` to its dispatchable :class:`ToolSpec` (the hook's dispatch
+        seam). Distinct from :meth:`get`, which returns the selection :class:`ToolDef`."""
+        return self._base.resolve(name)
 
     def tool(
         self,
@@ -225,20 +260,28 @@ class GrowableToolRegistry:
                 f"unknown tool {name!r}; registered: {self.names()}") from None
 
     def __contains__(self, name: object) -> bool:
-        return name in self._defs
+        # Membership = DISPATCHABLE: a structured-selectable ToolDef OR a base
+        # dispatch-only spec (core/lambda/per-run tools live only in ``_base``).
+        return name in self._defs or name in self._base
 
     def __len__(self) -> int:
         return len(self._defs)
 
     def names(self) -> list[str]:
+        # The structured-SELECTION names (the ``{tool, args}`` enum): only the
+        # ToolDefs. Dispatch-only base tools are intentionally NOT selectable here.
         return sorted(self._defs)
 
     def catalog(self) -> list[dict[str, Any]]:
-        """The lean ``[{name, description}]`` listing (names + one-liners only)."""
-        return [
-            {"name": d.name, "description": d.description}
-            for d in sorted(self._defs.values(), key=lambda d: d.name)
-        ]
+        """The lean ``[{name, description}]`` tool listing the planner/selector sees.
+
+        Delegates to the base dispatch store so it is the FULL set of registered
+        tools (the structured-selectable ToolDefs PLUS the dispatch-only core/lambda
+        tools) — i.e. byte-identical to the pre-A0 ``hook.registry.catalog()`` when
+        ``hook.registry`` was the base. Becoming ``hook.registry`` therefore does NOT
+        shrink the planner's tool catalog; it only ADDS the working ``.add`` growth
+        point. (The narrower structured-selection enum is :meth:`names` / :meth:`offered`.)"""
+        return self._base.catalog()
 
     def arg_schemas(self, tool_names: Optional[Sequence[str]] = None) -> dict[str, Any]:
         """``{name: args_json_schema}`` for the offered tools (all if ``None``)."""
@@ -595,6 +638,14 @@ def register_agentic_tools(
     register_filesystem_tools(registry, file_base)
     register_send_mail(registry, config=smtp_config)
     register_cron_tools(registry, cron_db_path, data_dir=cron_data_dir)
+    # A0 FOUNDATION FIX: ASSIGN the growable back as ``hook.registry`` (the static
+    # core/lambda tools already on the base were ADOPTED as the growable's dispatch
+    # store at construction, so they survive the swap). This makes the docstring's
+    # "also reachable as the bound hook.registry" TRUE and — crucially — gives every
+    # bundle self-select path (runtime ``_load_bundle`` / ``get_bundles`` ->
+    # ``expand_bundle`` -> ``registry.add``) a registry that actually HAS ``.add``,
+    # so a self-selected bundle's handlers genuinely register + dispatch (d242/d265).
+    hook.registry = registry
     return registry
 
 

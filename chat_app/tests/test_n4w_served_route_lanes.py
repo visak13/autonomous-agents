@@ -5,9 +5,11 @@ construction site — the lanes must actually FIRE on the request the served dee
 takes. After P2-5c the served report route (``run_plan_chain`` /
 ``_run_deep_research_sectioned``) gathers research through the GENERIC growable engine: each
 research node runs on the same :class:`~agent_runtime.AgentRuntime` the report route builds via
-``_build_acyclic_runtime(emit_article_notes=True, chunked_read=True, verify_lane=True,
+``_build_acyclic_runtime(emit_article_notes=True, chunked_read=True,
 research_fetch_breadth=PLAN_CHAIN_TREE_BREADTH)`` (the bespoke ``_make_tree_gather`` leaf is
-retired). These tests drive that EXACT served research config through the REAL AgentRuntime +
+retired; RP-3c/d330 retired the ``verify_lane`` flag — the no-fab self-review moved to the
+writer doctrine and the gather-more gate is de-flagged). These tests drive that EXACT served
+research config through the REAL AgentRuntime +
 the REAL :class:`~reactive_tools.ToolHook` seam (web tools on a real ToolRegistry) with a
 scripted transport, and assert BOTH lanes light up:
 
@@ -69,14 +71,21 @@ def _web_seam():
 class _LaneTransport:
     """Content-dispatching transport: the (now-fallback) map/reduce summarizer turn (the
     ``FACTUAL SUMMARY:`` map prompt) is answered with a canned factual summary and RECORDED;
-    every other turn replays the next scripted research turn. All user turns are captured so a
-    test can assert the d109 relevance-select honest signal reached the research convo."""
+    every other turn replays the next scripted research turn. Both the user turns AND the
+    role='tool' OBSERVATIONS are captured: s15/a25 (d199) feeds the research GATHER loop's
+    observations the model must ground on back as role='user' turns (live gemma4-e4b's
+    '{{ .Prompt }}' template ignores role='tool'), so the d109 relevance-select honest signal
+    rides in a USER turn — a test asserts it reached the research convo there. (a18/d189's
+    role='tool' still holds for the write/reviewer/planner loops, which this seam doesn't drive.)"""
 
     def __init__(self, research_turns: list[str]) -> None:
-        self._turns = list(research_turns)
+        # d242 TRUE self-select: the research node starts TOOL-LESS, so it loads the
+        # 'research' bundle first (its opening move) before any web_search/web_fetch.
+        self._turns = ['{"tool": "get_bundles", "args": {"name": "research"}}'] + list(research_turns)
         self._i = 0
         self.summarizer_calls: list[str] = []
         self.user_turns: list[str] = []
+        self.tool_turns: list[str] = []
 
     def complete(self, messages, **opts) -> str:
         return self.chat(messages, **opts).content
@@ -86,6 +95,11 @@ class _LaneTransport:
             (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
         )
         self.user_turns.append(user)
+        tool_obs = next(
+            (m["content"] for m in reversed(messages) if m.get("role") == "tool"), None
+        )
+        if tool_obs is not None:
+            self.tool_turns.append(tool_obs)
         if "FACTUAL SUMMARY:" in user:  # the N3 map/reduce turn (d109 fallback only)
             self.summarizer_calls.append(user)
             return ChatResult(role="assistant",
@@ -124,7 +138,7 @@ def test_served_generic_research_fires_note_and_chunked_read_lanes():
     runtime = AgentRuntime(
         transport=transport, loader=None, hook=hook, plane=plane,
         # the served generic report-route research lanes (parity with _run_generic_research_phase):
-        read_search_max_fetch=6, emit_article_notes=True, chunked_read=True, verify_lane=True,
+        read_search_max_fetch=6, emit_article_notes=True, chunked_read=True,
         execution=ExecutionMode.CONCURRENT,
     )
     result = asyncio.run(runtime.run(PlanDAG(nodes=[_served_research_node()], goal="g"),
@@ -138,11 +152,17 @@ def test_served_generic_research_fires_note_and_chunked_read_lanes():
     notes = tv.get("article_notes") or []
     assert notes, "emit_article_notes lane did not fire on the served generic research node"
     assert notes[0]["key_claims"] == ["June 13 escalation", "1,200 casualties"]
-    # read lane FIRED via d109 relevance-select: the honest coverage signal reached the convo,
-    # and the old map/reduce summarizer did NOT fire (relevance-select replaced it when the
-    # embedder is wired).
-    assert any("relevant passages in this source" in u for u in transport.user_turns), (
+    # read lane FIRED via d109 relevance-select: the honest coverage signal reached the convo
+    # (s15/a25 d199: the research GATHER loop feeds observations the model must ground on back as
+    # a role='user' turn — live gemma4-e4b's '{{ .Prompt }}' template ignores role='tool' — so the
+    # read signal now rides a USER turn, superseding a18's role='tool' for this loop), and the old
+    # map/reduce summarizer did NOT fire (relevance-select replaced it when the embedder is wired).
+    assert any("relevant passages in this source" in t for t in transport.user_turns), (
         "d109 relevance-select read did not fire on the served generic research node"
+    )
+    # d199: it is NOT hiding on the role='tool' lane (which this model would ignore).
+    assert not any("relevant passages in this source" in t for t in transport.tool_turns), (
+        "the relevance-select read rode role='tool' (d199 requires role='user' for the gather loop)"
     )
     assert not transport.summarizer_calls, (
         "the map/reduce summarizer fired; relevance-select should have replaced it"

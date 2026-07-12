@@ -8,6 +8,7 @@
  * `any` leaks past it.
  */
 import type {
+  ApproveShapeChatResponse,
   ApproveSpecResponse,
   AuthorShapeRequest,
   ChatRecord,
@@ -22,6 +23,7 @@ import type {
   ResumeRequest,
   RunRecord,
   SetShapeMaxIterRequest,
+  ShapeChatView,
   ShapeListResponse,
   ShapeView,
   SpecChatMessageResponse,
@@ -345,4 +347,38 @@ export function refineShape(name: string, instruction: string): Promise<ShapeVie
     body,
     timeoutMs: SHAPE_AUTHOR_TIMEOUT_MS,
   });
+}
+
+// (s17, d18a/d249 parity) SHAPE CHAT — the conversational draft-based authoring
+// surface. Each message is a blocking live authoring turn (same ceiling as the
+// one-shot author above); approve/deny are cheap (approve writes the file).
+export function openShapeChat(refineOf?: string): Promise<ShapeChatView> {
+  return request<ShapeChatView>("/shape-chat", {
+    method: "POST",
+    body: refineOf && refineOf.trim() ? { refine_of: refineOf.trim() } : {},
+  });
+}
+
+export function sendShapeChatMessage(
+  sessionId: string,
+  message: string,
+): Promise<ShapeChatView> {
+  return request<ShapeChatView>(
+    `/shape-chat/${encodeURIComponent(sessionId)}/message`,
+    { method: "POST", body: { message }, timeoutMs: SHAPE_AUTHOR_TIMEOUT_MS },
+  );
+}
+
+export function approveShapeChat(sessionId: string): Promise<ApproveShapeChatResponse> {
+  return request<ApproveShapeChatResponse>(
+    `/shape-chat/${encodeURIComponent(sessionId)}/approve`,
+    { method: "POST" },
+  );
+}
+
+export function denyShapeChat(sessionId: string): Promise<{ denied: boolean }> {
+  return request<{ denied: boolean }>(
+    `/shape-chat/${encodeURIComponent(sessionId)}/deny`,
+    { method: "POST" },
+  );
 }

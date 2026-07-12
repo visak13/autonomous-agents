@@ -61,8 +61,6 @@ def _deep_research_shape() -> ShapeSpec:
         max_iter=2,
         hard_cap=4,
         execution="deep-research",
-        round_roles=["research", "critic"],
-        final_roles=["research", "synthesis", "verify"],
         completeness_stop="Fill ALL the blanks before stopping.",
     )
 
@@ -191,26 +189,30 @@ class _DepthOnlyConfig:
 
 
 def test_s13_run_agentic_reads_depth_from_shape_config(monkeypatch, tmp_path):
-    """Driven through the REAL run_agentic: the multi-page file route reads the depth
-    override from the shape config and hands it to run_plan_chain as research_depth."""
+    """Driven through the REAL run_agentic: the LLM-selected deep-research shape (s15 routing
+    purity) SEEDS the one generic loop with a research plan (as1/d239) and hands it the depth
+    override read from the shape config as research_depth."""
     plane = EventPlane()
     hook = build_default_hook(plane)
     register_agentic_tools(hook, file_base=tmp_path, cron_data_dir=tmp_path)
     registry = RegistryForWiring(tmp_path / "specs")
 
     async def fake_select(self, goal):
-        return ShapeSelection(shape="plan-chain", escalate=False, wants_file=True,
-                              multi_page=True, search_allowed=True)
+        # a real is_deep_research shape → SEEDS the research plan by SHAPE alone (the
+        # retired wants_file/multi_page booleans no longer gate the route).
+        return ShapeSelection(shape="deep-research", escalate=False, wants_file=False,
+                              multi_page=False, search_allowed=True)
 
     monkeypatch.setattr(agentic.ShapeSelector, "select", fake_select)
 
     captured = {}
 
-    async def fake_chain(query, sel, **kw):
+    async def fake_loop(query, sel, *, first_plan_kind, **kw):
+        captured["first_plan_kind"] = first_plan_kind
         captured["research_depth"] = kw.get("research_depth")
         return AgenticResult(rationale="chained", ok=True, final_response="CHAINED")
 
-    monkeypatch.setattr(agentic, "run_plan_chain", fake_chain)
+    monkeypatch.setattr(agentic, "_run_generic_loop", fake_loop)
 
     res = asyncio.run(run_agentic(
         "write me a big multi-page report and save it as report.md",
@@ -220,7 +222,8 @@ def test_s13_run_agentic_reads_depth_from_shape_config(monkeypatch, tmp_path):
         shape_config=_DepthOnlyConfig(6),
     ))
     assert res.final_response == "CHAINED"
-    assert captured["research_depth"] == 6  # the shapes/specs depth reached run_plan_chain
+    assert captured["first_plan_kind"] == "research"  # deep-research → the research seed
+    assert captured["research_depth"] == 6  # the shapes/specs depth reached the generic loop
 
 
 # --------------------------------------------------------------------------- #
@@ -256,10 +259,11 @@ def test_s13_shape_config_store_depth_round_trip(tmp_path):
 # (4) AUDIT (P2-5c): the GENERIC research engine is the flag-free DEFAULT on run_plan_chain
 # --------------------------------------------------------------------------- #
 def test_s13_no_scaffolding_flag_gates_research_engine_on_default_route():
-    """P2-5c audit: run_plan_chain drives the GENERIC research engine UNCONDITIONALLY (no
-    enable/scaffolding flag gates it on the served report route), and depth is clamped to
-    the proven [1, N4_TREE_DEPTH_CEILING] bound."""
-    src = inspect.getsource(run_plan_chain)
+    """P2-5c audit (as1/d239): the ONE generic loop drives the GENERIC research engine
+    UNCONDITIONALLY (no enable/scaffolding flag gates it on the served report route), and depth
+    is clamped to the proven [1, N4_TREE_DEPTH_CEILING] bound. The research call now lives in
+    ``_run_generic_loop`` (run_plan_chain is a thin research-seed shim into it)."""
+    src = inspect.getsource(agentic._run_generic_loop)
 
     # The GENERIC research engine IS reached on this route (called, not behind a flag);
     # the bespoke tree runner is retired (not referenced).

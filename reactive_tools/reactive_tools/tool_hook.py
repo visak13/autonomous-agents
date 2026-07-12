@@ -139,6 +139,16 @@ class ToolRegistry:
                 f"unknown tool {name!r}; registered: {sorted(self._tools)}"
             ) from None
 
+    def resolve(self, name: str) -> ToolSpec:
+        """Resolve ``name`` to its dispatchable :class:`ToolSpec`.
+
+        The DISPATCH seam :class:`ToolHook` uses to find a callable spec — kept
+        SEPARATE from :meth:`get` so a registry whose ``get`` returns a different
+        record (the :class:`~reactive_tools.tool_registry.GrowableToolRegistry`
+        returns a selection ``ToolDef`` from ``get``) can still serve dispatch.
+        For the base registry ``resolve`` is exactly ``get``."""
+        return self.get(name)
+
     def __contains__(self, name: object) -> bool:
         return name in self._tools
 
@@ -187,7 +197,7 @@ class ToolHook:
         call ``.unwrap()`` for raise-on-error semantics. The lookup itself
         raises :class:`ToolError` for an unknown name (that is a programming
         error, not a tool failure, so it is not turned into an event)."""
-        spec = self.registry.get(name)  # raises ToolError on unknown name
+        spec = self.registry.resolve(name)  # raises ToolError on unknown name
         call_id = self._next_call_id()
 
         await self.plane.publish(
@@ -228,7 +238,7 @@ class ToolHook:
         Uses :meth:`EventPlane.publish_nowait` so it never awaits — subscribers
         pick the events up on their next loop turn. The tool body runs inline
         (no thread hop) since the caller is already synchronous."""
-        spec = self.registry.get(name)
+        spec = self.registry.resolve(name)
         if spec.is_async:
             raise ToolError(
                 f"tool {name!r} is async; use `await hook.invoke({name!r}, ...)`"

@@ -472,40 +472,57 @@ export interface UpdateSpecRequest {
 }
 
 // --------------------------------------------------------------------------- //
-// (s4/a5, d5/d9) SHAPES screen — the DEDICATED view over the TEXT-FILE-defined
-// plan shapes. Lists every shape, surfaces its REAL structure (execution
-// discipline; the deep-research round_roles/final_roles bounded unroll), and lets
-// the user set a per-shape MAX_ITER override (persisted to the shared SQLite via
-// the a4 backend, honored by the s3 deep-research unroll). Backend:
-// chat_app/shape_config.py — GET /shapes, GET /shapes/{name},
-// PUT /shapes/{name}/max_iter. A shape's view = ShapeSpec.as_dict() PLUS the
-// stored override + the effective round count the runtime will actually run.
+// (s4/a5, d5/d9; REDESIGNED s17, d247/d248/d249) SHAPES screen — the DEDICATED
+// view over the TEXT-FILE-defined plan shapes. A shape is an execution DISCIPLINE
+// + DOCTRINE — it declares NO fixed node topology (the planner/grower AUTHORS the
+// topology at runtime by reasoning). The screen lists every shape, surfaces its
+// discipline, doctrine and declared phase flow, and lets the user set a per-shape
+// MAX_ITER override (persisted to the shared SQLite via the a4 backend — the
+// deep-research grow loop's depth ceiling). Backend: chat_app/shape_config.py —
+// GET /shapes, GET /shapes/{name}, PUT /shapes/{name}/max_iter. A shape's view =
+// ShapeSpec.as_dict() PLUS the stored override + the effective ceiling.
+// The old round_roles/final_roles bounded-unroll preview (and its transitional
+// empty-[] API shim) is REMOVED — no fixed round topology exists anymore.
 // --------------------------------------------------------------------------- //
 
 /** A shape's declared execution discipline (agent_runtime/shapes.py). `sequential`
- * = strict single-file; `concurrent` = wave fan-out; `deep-research` = the bounded
- * cyclic unroll driven by its own executor. Consumed via an EXHAUSTIVE switch with
- * a `never` default so a new discipline is a COMPILE error here (spec [required]). */
+ * = strict single-file; `concurrent` = wave fan-out; `deep-research` = iterative
+ * deepening research GROWN at runtime by the planner/grower (no fixed rounds).
+ * Consumed via an EXHAUSTIVE switch with a `never` default so a new discipline is
+ * a COMPILE error here (spec [required]). */
 export type ShapeExecution = "sequential" | "concurrent" | "deep-research";
+
+/** One declared phase of a shape's flow (RP-6b d359/d361): the phase KIND
+ * (research/write/…) + the spec_role the engine routes that phase's specs by. */
+export interface ShapePhase {
+  kind: string;
+  spec_role: string;
+}
 
 /** One text-file shape merged with its stored override (shape_config.py
  * ShapeConfigService._view = ShapeSpec.as_dict() + max_iter_override +
- * effective_max_iter). `round_roles`/`final_roles` are non-empty only for the
- * iterative deep-research shape; `edges` is the declared (informational) edge
- * policy the executor unrolls. `max_iter` is the file DEFAULT ceiling, `hard_cap`
- * the absolute safety bound the runtime never exceeds, `max_iter_override` the
- * UI-set value (or null), `effective_max_iter` the override clamped to hard_cap —
- * the exact round count an iterative unroll honors. */
+ * effective_max_iter). The shape carries DISCIPLINE (`execution`), DOCTRINE
+ * (`completeness_stop`, `decompose_methodology`), declared `phases` flow and the
+ * deep-research growth bounds (`fan_out`/`max_layers`/`max_sources` — safety
+ * ceilings, not a topology). `max_iter` is the file DEFAULT depth ceiling,
+ * `hard_cap` the absolute safety bound, `max_iter_override` the UI-set value (or
+ * null), `effective_max_iter` the override clamped to hard_cap. */
 export interface ShapeView {
   name: string;
   description: string;
   max_iter: number;
   hard_cap: number;
-  round_roles: string[];
-  final_roles: string[];
   edges: Record<string, unknown>;
   source: string;
   execution: ShapeExecution;
+  completeness_stop: string;
+  decompose_methodology: string;
+  deny_domains: string[];
+  expand_on_gaps: boolean;
+  fan_out: number;
+  max_layers: number;
+  max_sources: number;
+  phases: ShapePhase[];
   max_iter_override: number | null;
   effective_max_iter: number;
 }
@@ -537,4 +554,42 @@ export interface AuthorShapeRequest {
  * refined shape's full ShapeView (the file is overwritten in place). */
 export interface RefineShapeRequest {
   instruction: string;
+}
+
+// --------------------------------------------------------------------------- //
+// (s17, d18a/d249 parity) SHAPE CHAT — the conversational, draft-based shape
+// authoring surface (chat_app/shape_chat.py). Mirrors the spec chat: each message
+// drives one live authoring turn over an IN-SESSION draft; nothing persists until
+// approve (create-collision → 409); deny discards. `mode` is "create" for a fresh
+// draft, "refine" when the session was opened on an existing shape (refine_of).
+// --------------------------------------------------------------------------- //
+
+/** One transcript turn of a shape chat. */
+export interface ShapeChatTurn {
+  role: string;
+  text: string;
+}
+
+/** The compact draft preview the chat renders (null before the first turn). */
+export interface ShapeChatDraft {
+  name: string;
+  description: string;
+  execution: ShapeExecution;
+  max_iter: number;
+}
+
+/** GET/POST /shape-chat views (shape_chat.py ShapeChatView). */
+export interface ShapeChatView {
+  session_id: string;
+  mode: "create" | "refine";
+  state: "open" | "approved" | "denied";
+  refine_of: string | null;
+  turns: ShapeChatTurn[];
+  draft: ShapeChatDraft | null;
+}
+
+/** POST /shape-chat/{sid}/approve body response. */
+export interface ApproveShapeChatResponse {
+  approved: boolean;
+  shape: ShapeView;
 }

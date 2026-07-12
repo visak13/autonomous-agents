@@ -52,8 +52,6 @@ def _deep_research_reply(name: str = "deep-dive") -> str:
             "description": "iterative depth-first research with a critic each round",
             "execution": "deep-research",
             "max_iter": 9,
-            "round_roles": ["research", "critic"],
-            "final_roles": ["research", "synthesis", "verify"],
         }
     )
 
@@ -65,8 +63,6 @@ def _parallel_reply(name: str = "parallel-news") -> str:
             "description": "gather several sources at once then email the digest",
             "execution": "concurrent",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
@@ -79,8 +75,6 @@ def _bad_execution_reply() -> str:
             "description": "x",
             "execution": "teleport",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
@@ -107,13 +101,17 @@ def test_service_authors_writes_and_returns_view(tmp_path):
     # the returned view IS the merged catalog view the list renders
     assert view["name"] == "deep-dive"
     assert view["execution"] == "deep-research"
-    assert view["round_roles"] == ["research", "critic"]
-    assert view["final_roles"] == ["research", "synthesis", "verify"]
+    # s17 (d248/d249): the transitional round_roles/final_roles empty-[] shim is REMOVED —
+    # the view carries no fixed round topology; the deep-research identity is the execution token.
+    assert "round_roles" not in view
+    assert "final_roles" not in view
     assert view["effective_max_iter"] == 9
 
     # the authored shape is on disk in the dir the runtime loads (round-trips loader)
     reloaded = load_shape("deep-dive", shapes_dir=tmp_path)
-    assert reloaded.is_unrollable
+    assert reloaded.is_deep_research
+    # authored deep-research shapes are growable (the engine builds a tool-less growable seed)
+    assert reloaded.expand_on_gaps
     # and it appears in the catalog the Shapes list reads
     assert any(s["name"] == "deep-dive" for s in config.list_shapes())
 
@@ -246,8 +244,6 @@ def _collapsed_compositional_reply(name: str = "linear-plus-modular-parallel") -
             ),
             "execution": "sequential",
             "max_iter": 1,
-            "round_roles": [],
-            "final_roles": [],
         }
     )
 
