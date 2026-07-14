@@ -491,6 +491,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pass
         app.state.warmup_task = asyncio.create_task(_warm_model())
 
+    # Read-embedder warm-up (live 2026-07-13 catch): onnxruntime's native DLL load
+    # was measured at ~20 MINUTES on this host, so the shared MiniLM read-embedder
+    # is warmed on a daemon thread AT BOOT — off the critical path. Until it lands,
+    # research reads use the bounded map/reduce fallback (never block); once warm,
+    # the dense relevance-select takes over. Best-effort by construction.
+    try:
+        from agent_runtime.runtime import _warm_read_embedder_async
+
+        _warm_read_embedder_async()
+    except Exception:  # pragma: no cover - warm-up is best-effort
+        pass
+
     try:
         yield
     finally:

@@ -88,6 +88,11 @@ _COHERENT_ARTIFACT_DOCTRINE = (
     "no-ungrounded-source guarantee is YOURS to uphold.\n"
     "- FINISH YOUR SENTENCES: end every sentence, and the artifact as a whole, cleanly — never "
     "stop on a mid-sentence fragment or a truncated tail.\n"
+    "- IMAGES ONLY FROM REAL GATHERED RECORDS: when the artifact embeds images, use ONLY image "
+    "URLs actually returned by an image search/gather for THIS task — the record's image_url "
+    "VERBATIM (attribute its source_url where the format supports it). NEVER invent, guess or "
+    "placeholder an image path (no 'placeholder_map.jpg'); if no suitable image record was "
+    "gathered, ship the artifact WITHOUT images rather than fabricate one.\n"
     "- SELF-REVIEW BEFORE YOU FINISH: before you emit your final token, RE-READ the whole artifact "
     "you just wrote and CHECK it against every point above, then CORRECT what you find — this review "
     "is the last, non-optional part of authoring, NOT a separate step anyone downstream runs for you. "
@@ -475,6 +480,29 @@ RECURRING_SCHEDULER_RULESET = (
 # GATHER specs (research-analyst / research-methodology / web-research) are deliberately EXCLUDED:
 # they never author the deliverable, so the artifact doctrine does not apply to them.
 MARKDOWN_WRITER_RULESET = MARKDOWN_WRITER_RULESET + _COHERENT_ARTIFACT_DOCTRINE
+
+# AUTONOMY REBUILD P2C — the destination for the DELETED engine CSV rider (the raw
+# write loop's ``_is_csv_ext`` branch that pinned "tabular only, no prose" as an
+# engine prompt injection). The discipline now lives where behavior belongs: a SPEC
+# the planner binds to a CSV deliverable node. Format-shaping only; the model
+# authors every byte (the engine composes/fixes nothing).
+CSV_WRITER_RULESET = (
+    "You are an OUTPUT-SHAPING ruleset, not a task. Do the task described in the "
+    "user message using the inputs and tool findings provided there, then shape "
+    "your answer to follow these rules:\n"
+    "\n"
+    "- Emit PURE tabular CSV data: a single header row naming the columns, then "
+    "one data row per record — nothing else.\n"
+    "- NO prose, no title line, no explanations, no markdown fences, no trailing "
+    "commentary — a CSV file that a parser reads directly.\n"
+    "- Quote a field with double quotes only when it contains a comma, quote or "
+    "newline; escape embedded quotes by doubling them.\n"
+    "- Keep every row's column count equal to the header's; leave a genuinely "
+    "unknown value EMPTY rather than inventing one.\n"
+    "\n"
+    "Shape ONLY the form. The values must be the real findings from the task — "
+    "never fabricate rows to fill the table."
+)
 HTML_WRITER_RULESET = HTML_WRITER_RULESET + _COHERENT_ARTIFACT_DOCTRINE
 SECTION_HTML_WRITER_RULESET = SECTION_HTML_WRITER_RULESET + _COHERENT_ARTIFACT_DOCTRINE
 CLAUDE_SKILL_RULESET = CLAUDE_SKILL_RULESET + _COHERENT_ARTIFACT_DOCTRINE
@@ -493,6 +521,15 @@ CANONICAL_RULESETS: dict[str, tuple[str, str]] = {
         "for the WRITE/deliverable node only; NEVER bind it to a research/gather/"
         "analysis node.",
         MARKDOWN_WRITER_RULESET,
+    ),
+    "csv-writer": (
+        "Format the final deliverable as PURE tabular CSV — one header row naming "
+        "the columns, one data row per record, correct quoting/escaping, and NO "
+        "prose, titles or commentary around the data. Bind to the node that "
+        "PRODUCES a .csv deliverable (a data table the user will open in a "
+        "spreadsheet or parse). This is a document-FORMAT spec for the WRITE/"
+        "deliverable node only; NEVER bind it to a research/gather/analysis node.",
+        CSV_WRITER_RULESET,
     ),
     "html-writer": (
         "Format the final deliverable as ONE self-contained, semantic HTML5 "

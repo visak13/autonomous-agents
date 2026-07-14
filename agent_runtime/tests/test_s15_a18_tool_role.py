@@ -120,14 +120,15 @@ _SOURCES = [
 # --------------------------------------------------------------------------- #
 # 1. RESEARCH GATHER loop — search/fetch results ride role 'tool', findings stop it
 # --------------------------------------------------------------------------- #
-def test_gather_loop_feeds_tool_results_as_role_user_d199_and_terminates():
-    # s15/a25 (d199, supersedes a18/d189 for THIS gather loop ONLY): live gemma4-e4b uses a
-    # '{{ .Prompt }}' chat template with NO role handling, so a role:'tool' message is IGNORED —
-    # fed as 'tool' the model never reads the SEARCH RESULTS / FETCHED article and FABRICATES dead
-    # urls, so 0 sources/notes land. d199 feeds the observations the model must GROUND on back
-    # role:'user' so it actually reads them. The fix is NARROW: only the research GATHER loop
-    # flips — the write / reviewer / planner loops below KEEP role:'tool' (a18 stands; those
-    # observations are acknowledged, not grounded on). This test now asserts the d199 contract.
+def test_gather_loop_feeds_tool_results_as_role_tool_enveloped_and_terminates():
+    # MESSAGING-LAYER contract (supersedes the d199 per-site role:'user' inversion): gather
+    # observations are fed role:'tool' IN MEMORY — the semantic label — and the LIVE
+    # OllamaTransport chokepoint renders them as ENVELOPED user turns
+    # ([TOOL RESULT]…[/TOOL RESULT]) so the prompt-only model both SEES them (d199's
+    # grounding intent) and can DISTINGUISH tool output from the user speaking. This
+    # offline test asserts the in-memory contract on the FakeTransport seam (which does
+    # not normalize — the envelope is a live-transport rendering, covered by
+    # llm_framework/tests/test_observation_envelope.py).
     world = "https://news.example.com/world"
     hook = _FakeHook({world: "WORLD ARTICLE\n\nbody text."})
     transport = FakeTransport([
@@ -148,47 +149,24 @@ def test_gather_loop_feeds_tool_results_as_role_user_d199_and_terminates():
     assert transport.call_count == 4
     assert "real answer grounded" in (res.output or "")
 
-    # d199: the search + fetch RESULTS were fed back role 'user' (the grounding lever), so the
-    # findings call sees both on the lane this model actually reads.
+    # The search + fetch RESULTS ride the role:'tool' lane in memory (the semantic
+    # label; the live transport renders them as enveloped user turns).
     final_msgs = transport.calls[-1]["messages"]
-    user_turns = _by_role(final_msgs, "user")
-    assert any("SEARCH RESULTS" in t for t in user_turns)
-    assert any("WORLD ARTICLE" in t for t in user_turns)
-    # They were NOT fed role 'tool' (which this model's template ignores) — the d199 inversion
-    # of a18 for the gather loop. No grounded observation hides on the role:'tool' lane.
-    tool_turns = "\n".join(_by_role(final_msgs, "tool"))
-    assert "SEARCH RESULTS" not in tool_turns
-    assert "WORLD ARTICLE" not in tool_turns
+    tool_turns = _by_role(final_msgs, "tool")
+    assert any("SEARCH RESULTS" in t for t in tool_turns)
+    assert any("WORLD ARTICLE" in t for t in tool_turns)
+    # Genuine USER turns carry no tool observation — the lanes are now distinct.
+    user_turns = "\n".join(_by_role(final_msgs, "user"))
+    assert "SEARCH RESULTS" not in user_turns
+    assert "WORLD ARTICLE" not in user_turns
 
 
 # --------------------------------------------------------------------------- #
 # 2. SYNTHESIS / WRITE loop — the saved-file observation rides role 'tool', DONE stops it
 # --------------------------------------------------------------------------- #
-def test_write_loop_feeds_saved_state_as_role_tool_and_terminates(tmp_path):
-    transport = FakeTransport([_write_reply])
-    rt = AgentRuntime(
-        transport=transport, hook=_file_hook(tmp_path),
-        subagent_call_opts={"think": True, "temperature": 0},
-    )
-    rt.chain_sources = _SOURCES
-    dag = PlanDAG(
-        nodes=[PlanNode(id="w", task="Write the notes to notes.txt.", tool="file_write")],
-        rationale="r", goal="Write notes to notes.txt.",
-    )
-    out = _run(rt.run(dag))
-    assert out.ok
-
-    on_disk = open(out.results["w"].tool_value["path"], encoding="utf-8").read()
-    assert "First section" in on_disk and "Second section" in on_disk
-
-    # The "Saved part N … file ENDS with …" file observation was fed back role 'tool'
-    # (the file_read-echo / never-terminate root); it NEVER rode role 'user'.
-    tool_turns = "\n".join(_all_turns(transport, "tool"))
-    user_turns = "\n".join(_all_turns(transport, "user"))
-    assert "Saved part 1" in tool_turns
-    assert "Saved part" not in user_turns
-    # The continuation DIRECTIVE that follows the observation DOES stay role 'user'.
-    assert "Continue the deliverable" in user_turns
+# AUTONOMY REBUILD P2: test_write_loop_feeds_saved_state_as_role_tool_and_terminates RETIRED — it exercised the deleted raw write loop /
+# deliverable_path routing (write nodes now run the unified self-select pull-writer;
+# see test_sb6_write_fold_antifab.py::test_write_route_has_no_flag_every_worker_takes_the_unified_loop).
 
 
 def _write_reply(messages, **opts):

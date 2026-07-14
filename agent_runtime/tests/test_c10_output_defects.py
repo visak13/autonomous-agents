@@ -76,61 +76,12 @@ def _html_dag(task: str, goal: str = "Write a detailed HTML report on US-Iran.")
     return PlanDAG(nodes=[PlanNode(id="s1", task=task, role="synthesizer")], goal=goal)
 
 
-def test_reemitted_full_document_is_dropped_single_doc_on_disk(tmp_path):
-    # turn0: a COMPLETE closed document; turn1 (after the continuation nudge): a SECOND
-    # fresh full document (the defect trigger); turn2: DONE. The re-emission guard must
-    # recognise the file already holds a complete closed doc and STOP — so the second
-    # document never lands and the file holds EXACTLY ONE top-level document.
-    def reply(messages, **opts):
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        if n == 0:
-            return _FULL_DOC_1
-        if n == 1:
-            return _FULL_DOC_2  # re-emission of a whole new document
-        return DONE_SENTINEL
-
-    transport = FakeTransport([reply])
-    rt = AgentRuntime(transport=transport, hook=_hook(tmp_path),
-                      subagent_call_opts={"think": True, "temperature": 0})
-    out = _run(rt.run(_html_dag("Write a detailed HTML report to us-iran.html.")))
-
-    assert out.ok
-    doc = out.results["s1"].output or ""
-    written = tmp_path / "us-iran.html"
-    assert written.is_file()
-    # EXACTLY ONE top-level document reached disk (the defect was 2)
-    assert _top_level_html_doc_count(written.read_text(encoding="utf-8")) == 1
-    assert _top_level_html_doc_count(doc) == 1
-    assert "Different second pass" not in doc  # the duplicate was dropped
+# AUTONOMY REBUILD P2C — the raw-loop output-defect tests (re-emission drop,
+# two-docs-ship-raw, csv-tabular rider) are RETIRED with the deleted raw write
+# loop; duplicate/restart writes are now governed at the TOOL BOUNDARY
+# (file_write no-clobber refusal) and delivery by the target-artifact gate.
 
 
-def test_two_documents_in_one_emission_ship_raw_no_engine_dedup(tmp_path):
-    # RP-1 (d319/d311): the engine SINGLE-DOCUMENT GATE (enforce_single_html_document +
-    # collapse_duplicate_sections normalization of the assembled bytes) is RETIRED — the
-    # engine authors/fixes NOTHING. If the model crams TWO documents into one emission, both
-    # ship VERBATIM (raw model output; single-document coherence is the model's own job,
-    # hardened via the writer spec in RP-2). The served doc equals the on-disk bytes.
-    def reply(messages, **opts):
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        return (_FULL_DOC_1 + _FULL_DOC_2) if n == 0 else DONE_SENTINEL
-
-    transport = FakeTransport([reply])
-    rt = AgentRuntime(transport=transport, hook=_hook(tmp_path),
-                      subagent_call_opts={"think": False, "temperature": 0})
-    out = _run(rt.run(_html_dag("Write the report to combined.html.")))
-
-    assert out.ok
-    doc = out.results["s1"].output or ""
-    on_disk = (tmp_path / "combined.html").read_text(encoding="utf-8")
-    # both documents survive — the engine did NOT dedup them (the retired gate would have).
-    assert _top_level_html_doc_count(on_disk) == 2
-    assert doc == on_disk                      # served bytes == on-disk bytes (raw pass-through)
-    assert "Different second pass" in on_disk  # the second doc's content is NOT stripped
-
-
-# --------------------------------------------------------------------------- #
-# #3 — RP-1 (d319/d311): format INFERENCE from a request keyword is RETIRED.
-# --------------------------------------------------------------------------- #
 def test_format_inference_retired_explicit_name_still_honored():
     # RP-1: deliverable_extension no longer maps a request keyword (.txt / markdown / CSV /
     # HTML) to an extension — the engine does not infer a FORMAT; it returns the neutral
@@ -145,34 +96,3 @@ def test_format_inference_retired_explicit_name_still_honored():
 # --------------------------------------------------------------------------- #
 # #4 — a CSV is tabular-only (the SOURCES nudge no longer fires)
 # --------------------------------------------------------------------------- #
-def test_csv_is_tabular_only_no_trailing_prose(tmp_path):
-    # turn0: clean CSV rows. turn1 WOULD be the prose+sources the old continuation nudge
-    # provoked — but a CSV is single-shot, so the loop accepts after the rows and never
-    # asks for more. The file must be tabular-only (no "Source 1: https://" tail).
-    rows = "Planet,Moons\nMercury,0\nVenus,0\nEarth,1\nMars,2\nJupiter,95"
-    prose = "\nThe distribution of moons varies widely. Source 1: https://example.com/x"
-
-    def reply(messages, **opts):
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        if n == 0:
-            return rows
-        if n == 1:
-            return prose  # the trailing-prose defect — must never be requested/written
-        return DONE_SENTINEL
-
-    transport = FakeTransport([reply])
-    rt = AgentRuntime(transport=transport, hook=_hook(tmp_path),
-                      subagent_call_opts={"think": False, "temperature": 0})
-    dag = PlanDAG(
-        nodes=[PlanNode(id="s1", task="Give me a CSV of the first 5 planets to planets.csv.",
-                        role="synthesizer")],
-        goal="Give me a CSV of the first 5 planets and their moons.",
-    )
-    out = _run(rt.run(dag))
-
-    assert out.ok
-    on_disk = (tmp_path / "planets.csv").read_text(encoding="utf-8")
-    assert "Mercury,0" in on_disk and "Jupiter,95" in on_disk   # the real rows are there
-    assert "Source 1" not in on_disk                            # NO trailing prose
-    assert "distribution of moons" not in on_disk
-    assert out.results["s1"].output.strip() == rows

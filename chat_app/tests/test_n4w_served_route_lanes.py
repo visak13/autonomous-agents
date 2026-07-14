@@ -127,12 +127,34 @@ def _served_research_node() -> PlanNode:
                     depends_on=(), tool="web_search", role="worker")
 
 
-def test_served_generic_research_fires_note_and_chunked_read_lanes():
+def test_served_generic_research_fires_note_and_chunked_read_lanes(monkeypatch):
     """The EXACT served research config (emit_article_notes + chunked_read + breadth, the lanes
     ``_run_generic_research_phase`` wires) lights BOTH lanes through the real runtime + ToolHook
     seam: a note is recorded (the grower's decision-node input) AND the long source is read via
     the d109 relevance-select read (the honest coverage signal reaches the convo and the
-    map/reduce summarizer does NOT fire — relevance-select replaced it)."""
+    map/reduce summarizer does NOT fire — relevance-select replaced it).
+
+    The shared read-embedder seam is patched to a fast bag-of-words fake: the REAL
+    ``CpuEmbedder`` pulls onnxruntime's native DLL, whose load was measured at ~20
+    MINUTES on this host (2026-07-13) — this one test was silently paying it. The
+    lane wiring under test is identical; only the vector backend is faked."""
+    import numpy as _np
+
+    class _BagEmbedder:
+        _VOCAB = "casualties conflict escalated june ministry figures".split()
+
+        def embed(self, texts):
+            rows = []
+            for t in texts:
+                tl = str(t).lower()
+                v = _np.array([float(tl.count(w)) for w in self._VOCAB], dtype=_np.float32)
+                n = _np.linalg.norm(v)
+                rows.append(v / n if n else v)
+            return _np.stack(rows) if rows else _np.empty((0, len(self._VOCAB)), dtype=_np.float32)
+
+    import agent_runtime.runtime as _rt
+
+    monkeypatch.setattr(_rt, "_READ_EMBEDDER", _BagEmbedder())
     hook, plane, calls = _web_seam()
     transport = _LaneTransport(_research_turns())
     runtime = AgentRuntime(
@@ -153,16 +175,19 @@ def test_served_generic_research_fires_note_and_chunked_read_lanes():
     assert notes, "emit_article_notes lane did not fire on the served generic research node"
     assert notes[0]["key_claims"] == ["June 13 escalation", "1,200 casualties"]
     # read lane FIRED via d109 relevance-select: the honest coverage signal reached the convo
-    # (s15/a25 d199: the research GATHER loop feeds observations the model must ground on back as
-    # a role='user' turn — live gemma4-e4b's '{{ .Prompt }}' template ignores role='tool' — so the
-    # read signal now rides a USER turn, superseding a18's role='tool' for this loop), and the old
-    # map/reduce summarizer did NOT fire (relevance-select replaced it when the embedder is wired).
-    assert any("relevant passages in this source" in t for t in transport.user_turns), (
+    # on the role='tool' lane (MESSAGING-LAYER contract, supersedes the d199 per-site
+    # role='user' inversion: observations keep the semantic tool label in memory; the LIVE
+    # OllamaTransport renders them as ENVELOPED user turns — [TOOL RESULT]… — so the model
+    # both sees them and can tell tool output from the user; see
+    # llm_framework/tests/test_observation_envelope.py). The old map/reduce summarizer did
+    # NOT fire (relevance-select replaced it when the embedder is wired).
+    assert any("relevant passages in this source" in t for t in transport.tool_turns), (
         "d109 relevance-select read did not fire on the served generic research node"
     )
-    # d199: it is NOT hiding on the role='tool' lane (which this model would ignore).
-    assert not any("relevant passages in this source" in t for t in transport.tool_turns), (
-        "the relevance-select read rode role='tool' (d199 requires role='user' for the gather loop)"
+    # The genuine USER lane carries no tool observation — the lanes are distinct now.
+    assert not any("relevant passages in this source" in t for t in transport.user_turns), (
+        "the relevance-select read leaked onto the role='user' lane (observations must ride "
+        "role='tool'; the transport envelope owns their rendering)"
     )
     assert not transport.summarizer_calls, (
         "the map/reduce summarizer fired; relevance-select should have replaced it"

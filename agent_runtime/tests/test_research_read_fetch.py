@@ -178,7 +178,7 @@ def test_fetch_cap_is_a_non_flow_bound():
     )
     res = asyncio.run(agent.run({}))
     assert hook.fetches == [_URLS[0]]  # the 2nd fetch was capped, never invoked
-    assert "Fetch limit (1) reached" in _full_convo(transport)
+    assert "fetch limit (1) reached" in _full_convo(transport).lower()
     assert res.tool_value["fetched_count"] == 1
 
 

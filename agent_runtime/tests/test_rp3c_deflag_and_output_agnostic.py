@@ -149,29 +149,8 @@ def _md_dag(task: str) -> PlanDAG:
                    goal="Write a detailed report on the US-Iran conflict.")
 
 
-def test_reemission_guard_is_output_agnostic_and_decision_only_on_markdown(tmp_path):
-    """The re-emission guard fires on a NON-HTML (Markdown) deliverable: when the model RESTARTS
-    the already-complete document, the guard DROPS the re-emission and STOPS. It is DECISION-ONLY
-    — the on-disk bytes are EXACTLY the model's first-pass authored document (the guard never
-    edited/reshaped them), proving the HTML pin is gone AND the engine still fixes nothing."""
-    def reply(messages, **opts):
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        if n == 0:
-            return _MD_DOC          # a complete markdown document
-        if n == 1:
-            return _MD_DOC          # RESTART: re-emit the whole document from the top
-        return "<<DONE>>"
-
-    transport = FakeTransport([reply])
-    rt = AgentRuntime(transport=transport, hook=_hook(tmp_path),
-                      subagent_call_opts={"think": True, "temperature": 0})
-    out = _run(rt.run(_md_dag("Write a detailed report to us-iran.md.")))
-
-    assert out.ok
-    on_disk = (tmp_path / "us-iran.md").read_text(encoding="utf-8")
-    # the restart was DROPPED — the document appears exactly ONCE (no concatenated duplicate)
-    assert on_disk.count("# The 2025 US-Iran Conflict") == 1
-    # DECISION-ONLY: the on-disk bytes are the model's first-pass document AS AUTHORED (the guard
-    # dropped the duplicate but never edited/reshaped the content — only the write loop's standard
-    # trailing-whitespace .strip() applied, exactly as it does for every format incl. HTML).
-    assert on_disk == _MD_DOC.strip()
+# AUTONOMY REBUILD P2C — the LIVE re-emission-guard drive test is RETIRED with the
+# deleted raw write loop it exercised. The unit tests above keep the DECIDE-ONLY
+# helpers (section_reemission / document_restart / html_close_gap) honest; on the
+# unified loop a restart duplicate is governed at the TOOL BOUNDARY (file_write
+# no-clobber refusal) and delivery by the target-artifact gate.

@@ -127,14 +127,14 @@ HTML_SPEC = "html-writer"
 # the env contract + its band are unchanged.
 DEEP_RESEARCH_FETCH_BREADTH = max(1, int(os.getenv("RA_RESEARCH_FETCH_BREADTH", "10")))
 
-# D97 (s13/B1) — the REPORT path (:func:`run_plan_chain`) PINS the research-tree per-leaf
-# fetch BREADTH to 3, independent of the deep-research N1 breadth knob above (default 10).
-# The user fixed breadth at 3 ("BREADTH stays FIXED at 3") so the agentic loop DEPTH — not
-# a wide fan-of-fetches — is the quality lever on this served route; DEPTH stays the
-# live-tuneable knob (``RA_TREE_DEPTH`` via :meth:`TreeConfig.from_env`; the shapes/specs
-# depth wiring lands in B6). Hard-pinned (not env-overridable): breadth is a fixed contract
-# here per D97, so it does not track the shared ``RA_RESEARCH_FETCH_BREADTH``.
-PLAN_CHAIN_TREE_BREADTH = 3
+# D97 SUPERSEDED (autonomy rebuild P4, owner decision 2026-07-13): breadth 3 starved the
+# frontier — live Maratha forensics showed genuinely-needed facets (maps, modern influence)
+# created in all 5 epochs and EXECUTED IN 0 because the hard cap silently swallowed them.
+# The report path now defaults to 10 and tracks the SHARED env knob
+# (``RA_RESEARCH_FETCH_BREADTH``), same contract as the deep-research N1 breadth above.
+# The cap also becomes VISIBLE DATA to the model (the decision observation carries the
+# remaining branch budget) instead of an invisible truncation.
+PLAN_CHAIN_TREE_BREADTH = DEEP_RESEARCH_FETCH_BREADTH
 
 # DEEP-RESEARCH SUBAGENT num_ctx (s9/N1 REVISE, d62/d63 Option B). The two
 # deep-research call sites ran the generic runtime at num_ctx=16384, but the
@@ -1552,13 +1552,20 @@ def _compose_write_planner_inputs(
     # s14/a9 — the per-turn SOURCE-ID directive (the strongest lever for E4B); only when there is
     # a SOURCE INDEX to assign FROM. The model still reasons which ``[S#]`` each section uses.
     source_id_directive = _WRITE_SOURCE_ID_DIRECTIVE if sources else ""
-    # UNIVERSAL FINALIZE HANDOFF (d285 SB-4): the write planner reads the research phase's
-    # ``(summary, memory_index)`` pair so it can CONTINUE the research memory on the write nodes.
-    prior_memory = (
-        [{"summary": (findings or "").strip()[:1200],
-          "memory_index": research_memory_handle}]
-        if research_memory_handle else None
-    )
+    # UNIVERSAL FINALIZE HANDOFF (d285 SB-4), P2 de-fabrication: the handoff summary is
+    # now the code-assembled bounded DIGEST (index + note gists + pull cursor) — not the
+    # retired engine truncation of raw findings (`findings[:1200]`), which was the exact
+    # engine-extracted push the owner rejected. The digest tells the write planner what
+    # EXISTS and how nodes PULL it (read_notes/load_source).
+    if research_memory_handle:
+        from chat_app.digest import build_research_digest
+
+        prior_memory = [{
+            "summary": build_research_digest(sources, research_notes, token_budget=800),
+            "memory_index": research_memory_handle,
+        }]
+    else:
+        prior_memory = None
     return write_goal, prior_memory, source_id_directive
 
 
@@ -1576,8 +1583,12 @@ _ONE_WRITE_NODE_DIRECTIVE = (
     "continue -> finish loop accumulates every part of that one document IN ORDER, so the "
     "'sections' are that single node's WITHIN-NODE structure, never separate nodes. Do NOT author "
     "one node per section, and do NOT chain N whole-document nodes (that re-emits and DUPLICATES "
-    "the document). You MAY additionally author ONE 'final_review' node that depends_on the write "
-    "node (a single review over the finished document); author NO other write nodes."
+    "the document). ALSO author EXACTLY ONE 'final_review' node with role='reviewer' that "
+    "depends_on the write node, binding the SAME format spec as its review rubric: the reviewer "
+    "READS the finished file itself (file_read), verifies it against the goal and that spec, "
+    "FIXES any defect it finds ITSELF via file_update (grounded, minimal edits — never a rewrite "
+    "from scratch), and reports an honest final status of what the document actually contains "
+    "(and anything still missing). Author NO other nodes."
 )
 
 
@@ -1754,10 +1765,18 @@ async def run_section_write_phase(
     # SF-1 (d310/d311) — the framework review injection is RETIRED (the model authors the whole
     # document; no engine reviewer edits it), so the write planner authors the body-node DAG
     # with no review twins.
+    # P2 (Gate-2d live catch): the write planner gets the ONE-write-node directive on
+    # THIS (two-drive) path too — 4 write nodes × (~62s/call self-select + pull + write
+    # turns) starve each node to ~5 turns inside the phase budget, yielding one thin
+    # section apiece. ONE node accumulating the whole document through its own
+    # write → read-back → continue loop (exactly the file doctrine's design) spends
+    # the same budget on ONE coherent artifact. Planner-directive prompt lever
+    # (sanctioned, same as the one-drive hook) — the model still authors the topology.
     write_planner = _build_incremental_planner(
         transport=transport, registry=registry, hook=hook,
         shape_spec=_WRITE_FILE_SHAPE, allow_web=False, requested_specs=requested_specs,
-        authoring_directive=write_directive,
+        authoring_directive=(_ONE_WRITE_NODE_DIRECTIVE + "\n\n" + write_directive
+                             if write_directive else _ONE_WRITE_NODE_DIRECTIVE),
     )
     write_runtime, _ = _build_acyclic_runtime(
         transport=transport, registry=registry, hook=hook, plane=plane,
@@ -2292,15 +2311,27 @@ def _compose_reviewer_summary(status) -> str:
 
 
 def _write_reviewer_status(w_result) -> str:
-    """READ the write plan's overall run outcome as the deliverable status.
+    """READ the write plan's deliverable status — the REVIEWER's own words when it ran.
 
-    SF-1 (d310/d311): the framework ``final_review`` reviewer node is RETIRED — the MODEL
-    authors the whole document and no engine reviewer edits it — so the status derives purely
-    from whether the write run itself succeeded: ``deliverable_complete`` when the write plan
-    ran ok, ``deliverable_thin`` when it failed outright (so the planner can reason a corrective
-    follow-up)."""
+    AUTONOMY REBUILD P3: the write planner now authors a model-driven ``final_review``
+    node (role='reviewer', unified loop, same-spec rubric, fixes via file_update) — when
+    that node produced output, its model-authored status prose IS the deliverable status
+    (parse-to-read: the engine extracts, never composes). It grounds the finalize summary
+    in what the artifact ACTUALLY contains (killing the counted-not-read overclaiming).
+    Fallback (no reviewer node / no output): the run-outcome heuristic —
+    ``deliverable_complete`` when the write plan ran ok, ``deliverable_thin`` on failure."""
     if w_result is None:
         return "deliverable_thin"
+    try:
+        results = getattr(w_result, "results", None) or {}
+        for node_id, res in results.items():
+            role = str(getattr(res, "role", "") or "")
+            if role == "reviewer" or "review" in str(node_id).lower():
+                prose = str(getattr(res, "output", "") or "").strip()
+                if prose:
+                    return prose[:2000]
+    except Exception:  # noqa: BLE001 — status read is best-effort, never breaks the run
+        pass
     return "deliverable_complete" if getattr(w_result, "ok", True) else "deliverable_thin"
 
 
@@ -2308,6 +2339,7 @@ async def _run_terminal_synthesizer(
     *, plane, query: str, out_name: str, sources: Sequence[Mapping[str, Any]],
     write_dag, plans_authored: Sequence[str], span,
     planner: Optional[Planner] = None, overall_goal: Optional[str] = None,
+    reviewer_status: str = "",
 ) -> str:
     """The TERMINAL SYNTHESIZER stage (D4, d215): runs ONCE after the planner loop EXITS.
 
@@ -2336,6 +2368,9 @@ async def _run_terminal_synthesizer(
             plans_authored=list(plans_authored),
             sources=n_sources, sections=n_sections,
             artifact=out_name if has_artifact else "",
+            # P3 GROUNDED FINALIZE: the reviewer's model-authored account of what the
+            # artifact ACTUALLY contains — the summary must claim ⊆ this, not counts.
+            memory_index=(reviewer_status or "").strip(),
         )
     else:
         # Offline streaming seam (no planner) — a minimal DERIVED factual summary.
@@ -2597,6 +2632,9 @@ async def _run_generic_loop(
         cum_notes: list[Any] = []
         fresh_source_count = 0
         grow_trace: dict[str, Any] = {}
+        deliverable_doc = ""
+        out_name = ""
+        write_reviewer_prose = ""  # P3: the final_review node's model-authored status
         while next_kind != "done" and iters < max_iterations:
             iters += 1
             if next_kind in ("research", "research_plan"):
@@ -2699,6 +2737,21 @@ async def _run_generic_loop(
                         overall_goal or query, "", requested_specs or None
                     )
                 span.set_attribute("plan_chain.out_file", out_name)
+                # STALENESS SNAPSHOT (autonomy rebuild P2 — the Gate-2e lesson): the
+                # workspace sandbox persists across runs and chats, so a target file
+                # left by a PREVIOUS session can sit at ``out_name``. Snapshot its
+                # bytes BEFORE the write plan; if the plan finishes with the content
+                # unchanged, no deliverable was produced THIS run — report that
+                # honestly instead of shipping last session's file as fresh work.
+                pre_plan_doc = ""
+                try:
+                    _rb0 = await hook.invoke(
+                        "file_read", path=out_name, max_bytes=4_000_000
+                    )
+                    if getattr(_rb0, "ok", False) and isinstance(_rb0.value, Mapping):
+                        pre_plan_doc = str(_rb0.value.get("text") or "")
+                except Exception:  # noqa: BLE001 — snapshot is best-effort
+                    pre_plan_doc = ""
                 write_dag, w_result = await run_section_write_phase(
                     query, out_name, findings, sources,
                     transport=transport, registry=registry, hook=hook, plane=plane,
@@ -2716,9 +2769,34 @@ async def _run_generic_loop(
                 plans_authored.append("write")
                 produced = "write"
                 span.set_attribute("plan_chain.write_nodes", len(write_dag.nodes))
+                # PULL-WRITER (autonomy rebuild P2): the deliverable now lives ONLY on
+                # disk, authored by the model driving file_write itself — read the real
+                # bytes back for artifact persistence (engine reads, never edits). An
+                # absent/empty file is surfaced honestly downstream, never synthesized.
+                deliverable_doc = ""
+                try:
+                    _rb = await hook.invoke(
+                        "file_read", path=out_name, max_bytes=4_000_000
+                    )
+                    if getattr(_rb, "ok", False) and isinstance(_rb.value, Mapping):
+                        deliverable_doc = str(_rb.value.get("text") or "")
+                except Exception:  # noqa: BLE001 — persistence read is best-effort
+                    deliverable_doc = ""
+                # STALENESS GUARD (pairs with the pre-plan snapshot above): identical
+                # bytes before and after the write plan = the plan never touched the
+                # file → there is NO deliverable from this run. Dropping it here keeps
+                # the downstream honest (no artifact card, no final_response document)
+                # instead of dressing a previous session's file up as fresh output.
+                if deliverable_doc and deliverable_doc == pre_plan_doc:
+                    span.set_attribute("plan_chain.deliverable_stale", True)
+                    deliverable_doc = ""
+                span.set_attribute(
+                    "plan_chain.deliverable_bytes", len(deliverable_doc)
+                )
                 # READ the write plan's final_review node status (replaces the faked
                 # _write_plan_final_status hardcoded deliverable_complete).
                 reviewer_status_str = _write_reviewer_status(w_result)
+                write_reviewer_prose = reviewer_status_str  # P3: grounds the finalize summary
                 span.set_attribute("plan_chain.write_reviewer_status", reviewer_status_str)
                 last_plan_kind = "write"
                 findings_digest = ""
@@ -2818,6 +2896,20 @@ async def _run_generic_loop(
                 rationale=(selection.rationale or (write_dag.rationale if write_dag else "")
                            or "plan-chain: research → write (iterative planner loop)"),
             )
+            # PULL-WRITER (autonomy rebuild P2): the deliverable is the FILE the model
+            # wrote (read back above), not a node's chat emission — surface it as the
+            # response/artifact from the real bytes. (Phase 3 swaps final_response to
+            # the synthesizer summary; the artifact stays the file.)
+            if deliverable_doc and out_name:
+                agentic.final_response = deliverable_doc
+                agentic.md_report = deliverable_doc
+                agentic.html_report = (
+                    deliverable_doc if out_name.lower().endswith((".html", ".htm"))
+                    else agentic.html_report
+                )
+                agentic.artifacts = [
+                    (out_name, mime_for_path(out_name), deliverable_doc)
+                ]
             # SERVED-route loop trace (s13/B1) — the generic growable engine control snapshot.
             agentic.deep_research = {
                 "shape": (selection.shape or "plan-chain"),
@@ -2845,11 +2937,21 @@ async def _run_generic_loop(
 
         # ---- TERMINAL SYNTHESIZER (d215): runs ONCE after the loop EXITS. NOT an add_step node.
         # It STREAMS the planner's LLM finalize summary (+ the artifact when a file was produced).
+        # P3 GROUNDED FINALIZE: the write reviewer's model-authored status prose (what the
+        # artifact ACTUALLY contains) rides the finalize call's memory_index input, so the
+        # summary claims what was reviewed-in, never bare counts (kills the overclaiming).
         agentic.synthesis_summary = await _run_terminal_synthesizer(
             plane=plane, query=query, out_name=out_name, sources=sources,
             write_dag=write_dag, plans_authored=plans_authored, span=span,
             planner=reasoning_planner, overall_goal=overall_goal,
+            reviewer_status=write_reviewer_prose,
         )
+        # P3 CHAT TURN = SUMMARY + DOWNLOAD CARD (owner decision): when a file deliverable
+        # exists, the persisted chat response is the model-authored finalize SUMMARY; the
+        # document itself stays artifact-only (the artifact list drives the download card).
+        # A run with no fresh deliverable keeps its honest node-output response unchanged.
+        if deliverable_doc and out_name and agentic.synthesis_summary:
+            agentic.final_response = agentic.synthesis_summary
         return agentic
 
 

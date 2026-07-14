@@ -136,7 +136,7 @@ def test_s13_run_plan_chain_runs_generic_engine_and_feeds_write_phase(monkeypatc
     assert "Fill ALL the blanks" in (g.get("completeness_stop") or "")
 
     # D97: breadth stays PINNED to 3 on this path (the served-route trace value).
-    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 3
+    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 10  # P4 (owner 2026-07-13): D97's pin-3 SUPERSEDED — breadth defaults 10, tracks the shared env knob
 
     # (findings, sources) FLOWED into PHASE-2 (run_section_write_phase) — d89 hand-off.
     assert len(write_calls) == 1
@@ -163,5 +163,5 @@ def test_s13_breadth_pinned_3_ignores_n1_breadth_env(monkeypatch, tmp_path):
         catalog={"deep-research": _deep_research_shape()},
     ))
 
-    assert result.deep_research["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 3
+    assert result.deep_research["leaf_breadth"] == 10  # P4: tracks RA_RESEARCH_FETCH_BREADTH (set to 10 above)
     assert len(write_calls) == 1  # still completed end-to-end

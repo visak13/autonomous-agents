@@ -144,7 +144,7 @@ def test_s13_depth_set_via_shape_store_reaches_generic_phase(monkeypatch, tmp_pa
     # and it shows on the served-route depth_configured trace (within the cap).
     assert dr["depth_configured"] == 7
     # BREADTH stayed pinned at 3 (D97).
-    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 3
+    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 10  # P4 (owner 2026-07-13): D97's pin-3 SUPERSEDED — breadth defaults 10, tracks the shared env knob
     store.close()
 
 
@@ -169,7 +169,7 @@ def test_s13_no_depth_override_uses_env_baseline(monkeypatch, tmp_path):
     assert seen_depth == [None]
     # ... and the served-route trace reflects the env baseline depth.
     assert result.deep_research["depth_configured"] == 4
-    assert result.deep_research["leaf_breadth"] == 3  # breadth still pinned
+    assert result.deep_research["leaf_breadth"] == 10  # P4: breadth default (D97 pin superseded)
 
 
 # --------------------------------------------------------------------------- #

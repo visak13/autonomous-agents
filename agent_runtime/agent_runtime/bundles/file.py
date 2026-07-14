@@ -72,7 +72,19 @@ _FILE_DOCTRINE = (
     "WRITE ONLY DELIVERABLE CONTENT INTO THE FILE (d218): never put planning notes, "
     "status/meta commentary, TODO or 'to be added later' markers, or a <script> block "
     "carrying such a note into file_write — if you need to reason about what to write next, "
-    "do it in your REPLY, not in the deliverable."
+    "do it in your REPLY, not in the deliverable. "
+    "GROUND FROM THE RESEARCH MEMORY, DON'T GUESS (P2 pull discipline): when your run "
+    "carries gathered research (a source index / note gists were handed to you), ALSO load "
+    "the research_read bundle (get_bundles name=\"research_read\") and PULL your material — "
+    "read_notes first for each source's cheap gist, then load_source for the exact figures, "
+    "dates and quotes you will cite. A substantive section is written FROM pulled evidence; "
+    "writing a thin section from memory of the task text alone is the failure this rule "
+    "exists to prevent. "
+    "IMAGES ARE REAL OR ABSENT (no-fabrication): if the goal calls for images/maps/photos, "
+    "load the research bundle (get_bundles name=\"research\") and use image_search — an <img> "
+    "src must be an image_url COPIED VERBATIM from an image_search result. NEVER write a "
+    "placeholder, invented or relative image path (placeholder_*.jpg is a defect); if no "
+    "real image was found, OMIT the image and say so in the surrounding text."
 )
 
 
@@ -111,8 +123,12 @@ class FileBundle(ObjectBundle):
                 "multi-part document opens the shell (e.g. <!DOCTYPE html>/<head>+styles), "
                 "middle parts append ONLY their own section markup, and ONLY the final "
                 "part closes the document — never re-open or re-close mid-document, and "
-                "do NOT write planning/meta notes or <script> comments into the content.",
-                {"path": {"type": "string"}, "content": {"type": "string"}},
+                "do NOT write planning/meta notes or <script> comments into the content. "
+                "Set append=true on EVERY call after the file exists (only the very "
+                "first write of a new file omits it) — a non-append write to an "
+                "existing file is refused, never a silent overwrite.",
+                {"path": {"type": "string"}, "content": {"type": "string"},
+                 "append": {"type": "boolean"}},
                 ["path", "content"],
             ),
             make_tool_spec(

@@ -398,7 +398,12 @@ def make_file_write(root: Path):
         path: str,
         content: str = "",
         append: bool = False,
-        overwrite: bool = True,
+        # P2 (Gate-2c live catch): overwrite now defaults FALSE — a silent
+        # last-writer-wins overwrite let one part of a multi-part document clobber
+        # every earlier part. A non-append write to an existing file is refused
+        # with an actionable error; the caller states append=true (continue) or
+        # overwrite=true (replace) EXPLICITLY.
+        overwrite: bool = False,
         encoding: str = "utf-8",
     ) -> dict[str, Any]:
         """Write ``content`` to ``path`` INSIDE the workspace sandbox (stepwise).
@@ -433,7 +438,11 @@ def make_file_write(root: Path):
         target = _safe_resolve(path, root)
         existed = target.exists()
         if existed and not append and not overwrite:
-            raise ToolInputError(f"refusing to overwrite existing file: {path!r}")
+            raise ToolInputError(
+                f"{path!r} already exists — refusing a silent overwrite. To CONTINUE "
+                "the document, resend the SAME call with append=true; to REPLACE the "
+                "whole file, resend with overwrite=true."
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode(encoding)
         if append and existed:
@@ -443,13 +452,32 @@ def make_file_write(root: Path):
             # First step (create/open) or a full (over)write — both land here; an
             # empty ``content`` simply creates/truncates the file at the chosen name.
             target.write_bytes(data)
+        # TOOL-AUTHORED result note (eda-base3 tool-framing discipline; replaces the
+        # retired engine per-turn continuation riders): the structured result itself
+        # carries the file's REAL current tail + the neutral next-action cursor, so
+        # the model sees exactly where the file stands without any engine loop
+        # steering. Read from actual bytes; states facts, decides nothing.
+        size = target.stat().st_size
+        tail = ""
+        try:
+            with target.open("rb") as fh:
+                fh.seek(max(0, size - 240))
+                tail = fh.read().decode(encoding, errors="replace")
+        except OSError:  # pragma: no cover - tail is advisory, never fails the write
+            tail = ""
         return {
             "path": str(target),
             "bytes": len(data),
             "created": not existed,
             "mime": mime_for_path(str(target)),
-            "size": target.stat().st_size,
+            "size": size,
             "appended": bool(append and existed),
+            "note": (
+                f"file is now {size} bytes and ends with:\n…{tail}\n"
+                "Continue it (file_write append=true), correct a span "
+                "(file_update), read it back (file_read), or finish if the "
+                "deliverable is complete."
+            ),
         }
 
     return file_write

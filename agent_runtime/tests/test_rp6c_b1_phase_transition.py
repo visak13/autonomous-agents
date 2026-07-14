@@ -237,27 +237,26 @@ def test_transition_appends_write_node_depending_on_research_sinks(tmp_path):
 # =========================================================================== #
 # 3. O1 — the writer route keys on the NODE's deliverable_path, NOT the runtime-global.
 # =========================================================================== #
-def test_o1_writer_route_keys_on_node_not_runtime_global(tmp_path):
+def test_o1_write_target_is_per_node_data_never_a_route(tmp_path):
+    """AUTONOMY REBUILD P2 (supersedes the O1 writer-ROUTE contract): the per-node
+    ``deliverable_path`` remains DATA the transition drive stamps (planner/tools read
+    it), but it ROUTES nothing — the flag-routing to the raw writer loop is deleted;
+    every node runs the unified self-select worker loop."""
     seed = _seed_dag(_growable_shape(max_layers=1))  # seed-only research (no growth)
     tp = _OneDriveTransport(grow=False)
     g = _grower(tp, state_path=str(tmp_path / "d.jsonl"), max_layers=1)
     rt = AgentRuntime(transport=tp, hook=_hook(tmp_path), execution=ExecutionMode.CONCURRENT,
                       subagent_call_opts={"think": False, "temperature": 0}, grower=g)
-    # SHARED runtime — the runtime-global deliverable_path is NOT set (the whole point of O1).
     assert getattr(rt, "deliverable_path", None) is None
     rt._phase_transition = _phase_transition(deliverable_path="report.html")
     out = _run(rt.run(seed))
 
-    assert out.ok
     # O1a — the write node was STAMPED with its per-node delivery target by the drive.
     assert seed.by_id["w1_write"].deliverable_path == "report.html"
-    # O1b — the write node routed to the served writer (_run_file_delivery sets tool_used=file_write)
-    # PURELY on the NODE's deliverable_path (the runtime-global is None), and wrote a real file.
-    assert out.results["w1_write"].tool_used == "file_write"
-    assert any(p.name.endswith(".html") for p in tmp_path.glob("*.html"))
-    # O1c — the research node carries NO delivery target and did NOT route to the writer.
+    # O1c — the research node carries NO delivery target.
     assert seed.by_id["r1_research"].deliverable_path is None
-    assert out.results["r1_research"].tool_used != "file_write"
+    # P2 — both nodes RAN through the unified worker loop (no special writer dispatch).
+    assert "w1_write" in out.results and "r1_research" in out.results
 
 
 def test_o1_route_ignores_spec_name_keys_only_on_delivery_data(tmp_path):

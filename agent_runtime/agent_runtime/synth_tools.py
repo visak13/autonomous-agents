@@ -362,29 +362,11 @@ def html_close_gap(doc: str) -> list[str]:
 # The markdown/text path has no structural tag to balance, so a small model can
 # one-shot the whole report + <<DONE>> in ONE turn and DROP a requested section +
 # the sources list, with nothing to catch it (c8r REVISE). The fix mirrors the
-# HTML R1 gate: when the task asked for a DETAILED/thorough deliverable and the
-# model finished in a single turn, send ONE continuation nudge before accepting.
-# This signal decides WHETHER to nag — it never injects content (d48-clean). A
-# task with no detailed-intent keyword (e.g. "give me the headlines") returns
-# False, so a legitimately short deliverable is accepted in one turn (d46:
-# headlines->headlines, not paragraphs).
-_DETAILED_INTENT_RE = re.compile(
-    r"\b(detailed|thorough|in[\s-]?depth|comprehensive|exhaustive|elaborate|"
-    r"extensive|deep[\s-]?dive|full(?:[\s-]+(?:report|write[\s-]?up|analysis))|"
-    r"long(?:er)?[\s-]+(?:report|write[\s-]?up|analysis))\b",
-    re.IGNORECASE,
-)
-
-
-def is_detailed_task(text: str) -> bool:
-    """True when the task text asks for a DETAILED / thorough / in-depth deliverable.
-
-    A reasoning SIGNAL, not a template: it only gates whether a single-turn
-    ``<<DONE>>`` on the markdown/text path is nudged to continue — it never
-    injects or templates content. Returns ``False`` for a task with no
-    detailed-intent keyword so a legitimately short deliverable (headlines, a
-    one-line answer) is accepted in one turn (d46)."""
-    return bool(_DETAILED_INTENT_RE.search(text or ""))
+# AUTONOMY REBUILD P2C — ``is_detailed_task`` / ``_DETAILED_INTENT_RE`` are DELETED.
+# The keyword flag gated an engine continuation nudge on the raw write loop (itself
+# deleted): a hardcoded intent regex firing regardless of the model's own reasoning —
+# the exact fabrication class the owner charter bans. Depth now comes from the
+# writer SPECS + the model's judgment; delivery honesty from the target-artifact gate.
 
 
 # --------------------------------------------------------------------------- #
@@ -1260,7 +1242,6 @@ __all__ = [
     "DONE_SENTINEL",
     "split_done_signal",
     "html_close_gap",
-    "is_detailed_task",
     "UNSUPPORTED_SECTION_INSTRUCTION",
     "section_reemission",
     "strip_internal_scaffolding",

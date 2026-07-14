@@ -137,13 +137,23 @@ DEFAULT_MODEL = "gemma4-e4b-candidate-ctx32k:latest"
 # folds in the two universal output rules (ground-don't-hallucinate; when asked for
 # JSON the visible reply is ONLY the JSON) so structured prompts can drop their own
 # repeated "reason privately… no code fences" tails.
+# The OBSERVATION ENVELOPE markers (messaging-layer fix): every tool observation the
+# transport renders for this prompt-only model is wrapped in these, and the identity
+# declares the convention — so the model can DISTINGUISH a tool result it asked for
+# from the user speaking, even though both render as user turns on the wire.
+OBS_ENVELOPE_OPEN = "[TOOL RESULT]"
+OBS_ENVELOPE_CLOSE = "[/TOOL RESULT]"
+
 AGENT_IDENTITY = (
     "You are a capable, autonomous agent. Reason about the user's real goal, then "
     "ACT — prefer doing the task well with sensible defaults over asking. Ground "
     "every answer in the inputs, tools and conversation you are given; never "
     "invent facts, sources or numbers. Treat the prior conversation as memory for "
-    "multi-step work. When you are asked for JSON, your visible reply is ONLY that "
-    "JSON — no prose, no code fences. Be concise and direct."
+    "multi-step work. Turns wrapped in [TOOL RESULT]…[/TOOL RESULT] are the outputs "
+    "of tools YOU invoked — observations to reason over and act on, never a request "
+    "from the user; the user's own words are never wrapped. When you are asked for "
+    "JSON, your visible reply is ONLY that JSON — no prose, no code fences. Be "
+    "concise and direct."
 )
 
 
@@ -335,30 +345,33 @@ class OllamaTransport:
     @staticmethod
     def _normalize_tool_roles(messages: Sequence[Message]) -> list[Message]:
         """Return a COPY of ``messages`` with every ``role: "tool"`` turn rewritten
-        to ``role: "user"`` (d262 / d199 / d202).
+        to ``role: "user"`` AND its content wrapped in the OBSERVATION ENVELOPE
+        (d262 / d199 / d202 + the messaging-layer fix).
 
         Gemma's Ollama chat template is PROMPT-ONLY: it renders ``system`` /
         ``user`` / ``assistant`` turns but IGNORES ``role: "tool"`` entirely, so
-        any observation fed back as a tool message is INVISIBLE to the model. The
-        runtime hands tool observations (plan acks, file-write confirmations,
-        reviewer file slices, self-select acks, research note-acks, …) back as
-        ``role: "tool"`` at many call sites. Normalising HERE — the one chokepoint
-        both wire paths route through, each of which copies the message list
-        verbatim (``list(messages)``) and never inspects roles — guarantees the
-        model SEES every observation and cannot regress at a new 14th call site.
-
-        The rewrite is content-PRESERVING: only the role label changes, never the
-        content. d202 cautioned against a blanket REVERT of observation content,
-        not against role normalisation — for this prompt-rendered model the role is
-        only meaningful for whether a turn is rendered at all, so tool→user is the
-        visible, correct rendering every site wants. We never mutate the caller's
-        list (a chain may reuse it): tool turns are emitted as fresh dicts, other
-        turns pass through unchanged."""
+        any observation fed back as a tool message is INVISIBLE to the model.
+        Rewriting tool→user at this one chokepoint makes every observation SEEN —
+        but a bare rewrite made tool output INDISTINGUISHABLE from a user request
+        (the owner's messaging-layer finding). The fix: every rewritten turn is
+        wrapped ``[TOOL RESULT]\\n…\\n[/TOOL RESULT]`` — a convention the agent
+        identity declares — so the model can tell an observation it asked for from
+        the user speaking. User-authored turns are NEVER wrapped (the marker is
+        exclusive to tool observations by construction), and the wrap is idempotent
+        (already-wrapped content passes through). In-memory histories keep the
+        semantic ``role:"tool"`` label; only the outgoing wire copy is rendered.
+        We never mutate the caller's list (a chain may reuse it): tool turns are
+        emitted as fresh dicts, other turns pass through unchanged."""
         out: list[Message] = []
         for m in messages:
             if m.get("role") == "tool":
                 nm = dict(m)
                 nm["role"] = "user"
+                content = str(nm.get("content") or "")
+                if not content.lstrip().startswith(OBS_ENVELOPE_OPEN):
+                    nm["content"] = (
+                        f"{OBS_ENVELOPE_OPEN}\n{content}\n{OBS_ENVELOPE_CLOSE}"
+                    )
                 out.append(nm)
             else:
                 out.append(m)

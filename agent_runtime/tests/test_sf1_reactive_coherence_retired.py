@@ -127,23 +127,14 @@ def test_rp1_engine_output_fixing_and_ext_maps_gone_from_synth_tools():
 
 
 def test_rp1_second_fold_output_fixing_gone_from_run_raw_file_loop():
-    # The 2nd fold site: no engine output-fixing / structure-authoring calls survive inside
-    # the raw-file write loop. (The MAIN-loop wrapper hygiene is asserted gone SEPARATELY by
-    # test_rp2_main_loop_wrapper_hygiene_gone; the model-driven verify/revise self-review is KEPT.)
-    src = inspect.getsource(SubAgent._run_raw_file_loop)
-    for banned in (
-        "enforce_single_html_document(",
-        "collapse_duplicate_sections(",
-        "has_duplicate_html_structure(",
-        "reconcile_doc_structure(",
-        "ensure_source_coverage(",
-        "strip_ungrounded_urls(",
-        "plant_section_anchor(",
-        "choose_section_anchor(",
-        "anchored_insert_args(",
-        "strip_section_anchor(",
-    ):
-        assert banned not in src, f"{banned} must stay retired from _run_raw_file_loop (RP-1)"
+    # AUTONOMY REBUILD P2C — the 2nd fold site no longer merely keeps its output-fixing
+    # retired: the ENTIRE raw write loop is deleted from SubAgent. Every node (write,
+    # synthesizer-terminal, gather, trivial) runs the ONE unified self-select loop and
+    # authors its file via file_write; the strongest form of the RP-1 guarantee.
+    for gone in ("_run_raw_file_loop", "_run_synthesis", "_run_file_delivery",
+                 "_dispatch_writer_tool", "_parse_writer_call",
+                 "_tool_calling_writer_tool_specs"):
+        assert not hasattr(SubAgent, gone), f"SubAgent.{gone} must stay DELETED (P2C)"
 
 
 def test_rp1_doc_structure_fabrications_and_format_pins_gone_from_agentic():
@@ -230,13 +221,14 @@ def test_rp2_writer_specs_carry_coherence_doctrine_output_agnostic():
 
 
 def test_rp2_main_loop_wrapper_hygiene_gone_from_run_raw_file_loop():
-    # RP-2/d326 borderline-1: the MAIN-loop plan-chaining wrapper-hygiene STRIP calls are removed
-    # from the raw-file write loop — the model authors ONE well-formed artifact, so the engine no
-    # longer strips per-page wrapper OPEN/CLOSE tags. (Checked on the call form ``name(`` so the
-    # retirement comments naming the helpers never false-trip this.)
-    src = inspect.getsource(SubAgent._run_raw_file_loop)
+    # RP-2/d326 borderline-1 → AUTONOMY REBUILD P2C: the wrapper-hygiene strips are gone
+    # in the strongest form — the raw write loop that hosted them is DELETED, and no
+    # surviving SubAgent source calls them (the F3 test below separately keeps the
+    # helpers themselves deleted from synth_tools).
+    assert not hasattr(SubAgent, "_run_raw_file_loop")
+    src = inspect.getsource(SubAgent)
     for banned in ("strip_wrapper_openers(", "strip_wrapper_closers("):
-        assert banned not in src, f"{banned} must stay retired from the main write loop (RP-2)"
+        assert banned not in src, f"{banned} must stay retired from SubAgent (RP-2/P2C)"
 
 
 # =========================================================================== #

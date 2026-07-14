@@ -62,8 +62,11 @@ def test_tool_role_rewritten_to_user_on_native_path():
     # No tool role survives to the wire; the observation now rides as a user turn.
     assert "tool" not in roles
     assert roles[-1] == "user"
-    # The observation CONTENT is preserved verbatim (only the label changed).
-    assert captured[0]["messages"][-1]["content"] == "OBSERVATION: file written to out.md"
+    # The observation CONTENT is preserved INSIDE the envelope (messaging-layer fix:
+    # the wrap lets the model tell tool output from the user speaking).
+    wire = captured[0]["messages"][-1]["content"]
+    assert "OBSERVATION: file written to out.md" in wire
+    assert wire.startswith("[TOOL RESULT]") and wire.rstrip().endswith("[/TOOL RESULT]")
 
 
 def test_tool_role_rewritten_to_user_on_openai_path():
@@ -79,7 +82,9 @@ def test_tool_role_rewritten_to_user_on_openai_path():
     roles = _roles(captured[0])
     assert "tool" not in roles
     assert roles[-1] == "user"
-    assert captured[0]["messages"][-1]["content"] == "OBSERVATION: plan accepted"
+    wire = captured[0]["messages"][-1]["content"]
+    assert "OBSERVATION: plan accepted" in wire
+    assert wire.startswith("[TOOL RESULT]")
 
 
 def test_multiple_tool_turns_all_rewritten():
@@ -94,9 +99,12 @@ def test_multiple_tool_turns_all_rewritten():
     )
     roles = _roles(captured[0])
     assert "tool" not in roles
-    # Order is preserved; both observations are now visible user turns.
+    # Order is preserved; both observations are now visible ENVELOPED user turns,
+    # while the genuine user turn stays bare.
     contents = [m["content"] for m in captured[0]["messages"] if m["role"] == "user"]
-    assert "obs 1" in contents and "obs 2" in contents
+    assert any("obs 1" in c and c.startswith("[TOOL RESULT]") for c in contents)
+    assert any("obs 2" in c and c.startswith("[TOOL RESULT]") for c in contents)
+    assert "continue" in contents  # user text: bare, never wrapped
 
 
 # --------------------------------------------------------------------------- #

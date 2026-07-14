@@ -249,6 +249,18 @@ class ResearchBundle(ObjectBundle):
                 {"url": {"type": "string"}},
                 ["url"],
             ),
+            make_tool_spec(
+                "image_search",
+                "OPTIONAL — when the goal calls for VISUALS (maps, portraits, "
+                "diagrams, photos), find REAL image URLs for a focused query. "
+                "Returns {title, image_url, source_url, width, height} records. "
+                "NOTE the image_url(s) you choose so downstream work can embed "
+                "them VERBATIM — never invent, guess, or placeholder an image "
+                "path; if no suitable record is returned, proceed without images.",
+                {"query": {"type": "string"},
+                 "max_results": {"type": "integer"}},
+                ["query"],
+            ),
         ]
         if emit_notes:
             specs.append(

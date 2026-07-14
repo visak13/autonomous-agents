@@ -257,40 +257,38 @@ def test_email_channel_fires_and_locks_recipient_to_self(fake_smtp, tmp_path):
 
 
 def test_file_channel_writes_into_the_sandbox(fake_smtp, tmp_path):
-    """FILE plan → the terminal file_write node is a TRUE AGENT (d50 route-indep).
+    """FILE plan → the explicit ``file_write`` node writes the deliverable (P2).
 
-    Route-independence: the acyclic ``file_write`` TOOL node authors the deliverable
-    via the SAME shared raw-content read-back loop the synthesis role uses — it emits
-    RAW content (no JSON envelope, no schema-serialized ``content`` arg) which the
-    loop WRITES then READS BACK before accepting ``<<DONE>>``. The CHOSEN name from
-    the goal/task reaches disk, and NO email fires."""
-    from agent_runtime.synth_tools import DONE_SENTINEL
-
+    AUTONOMY REBUILD P2 (supersedes the raw read-back-loop mechanics, which are
+    deleted with the deliverable_path routing): an acyclic node the planner
+    explicitly bound to ``file_write`` takes the GENERIC single-tool path — its
+    args are grounded from the upstream body (a2-recipe: ``content`` = the real
+    upstream report, ``path`` from the plan) and the tool writes ONCE. The
+    upstream-grounded content reaches disk raw, and NO email fires."""
     hook = _hook(tmp_path)
-    # The goal names the file explicitly → the shared loop derives ``us-iran.md``.
-    dag = _deliver_dag("file_write", {})
+    dag = _deliver_dag("file_write", {"path": "us-iran.md"})
     dag.goal = "Write a report on the US-Iran situation to us-iran.md"
 
     def reply(messages, **opts):
-        # n1 (the body worker) gets the first plain reply; the n2 file-delivery loop
-        # then emits ONE raw content section, and on the next turn signals DONE.
-        assistant_turns = sum(1 for m in messages if m.get("role") == "assistant")
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
-        )
-        # The delivery loop's turns carry the bounded-parts intro / continue prompt.
-        if "raw content" in last_user.lower() or "deliverable" in last_user.lower():
-            return "# US-Iran report\nthe body" if assistant_turns == 0 else DONE_SENTINEL
-        return "the report body"  # n1's produce output
+        # n1 (the body worker) produces the report body; n2's post-tool scoped
+        # call gets a plain ack emission.
+        return "# US-Iran report\nthe body"
 
     transport = FakeTransport([reply])
-    result = _run(AgentRuntime(transport=transport, hook=hook).run(dag))
+    # Mirror the SERVED wiring: the schema emitter grounds file_write.content from
+    # the REAL upstream body (a2-recipe) with no extra model call.
+    from agent_runtime.toolargs import SchemaToolArgEmitter
+
+    result = _run(AgentRuntime(
+        transport=transport, hook=hook,
+        tool_arg_emitter=SchemaToolArgEmitter(transport),
+    ).run(dag))
 
     assert result.states["n2"]["status"] == NodeStatus.DONE.value
     assert result.results["n2"].tool_used == "file_write"
     written = tmp_path / "us-iran.md"
     assert written.is_file()
-    # the RAW content the agent emitted landed on disk (not a static arg, not JSON)
+    # the upstream-grounded content landed on disk, raw (never a JSON envelope)
     body = written.read_text(encoding="utf-8")
     assert "US-Iran report" in body
     assert not body.lstrip().startswith("{"), "content must be RAW, never a JSON envelope"

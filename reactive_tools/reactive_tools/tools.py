@@ -627,6 +627,11 @@ def register_core_tools(hook: "Any", *, file_base: Any = None,
                   description="Free no-key web search (DuckDuckGo via ddgs); ranked titles+urls+snippets; cached + rate-limit backoff.")
     hook.register("web_fetch", make_web_fetch_md(timeout=http_timeout),
                   description="Fetch a public URL and extract clean content as MARKDOWN (httpx + Trafilatura).")
+    from .web_tools import make_image_search as make_image_search_ddgs
+    hook.register("image_search", make_image_search_ddgs(timeout=http_timeout),
+                  description=("Find REAL image URLs for a topic (DuckDuckGo images); returns "
+                               "{title,image_url,source_url,width,height} records — embed a "
+                               "chosen record's image_url VERBATIM, never a placeholder path."))
     return hook
 
 

@@ -674,6 +674,124 @@ WEB_FETCH_TOOL = ToolDef(
 
 
 # --------------------------------------------------------------------------- #
+# image_search — ddgs images + cache + backoff. GENERIC + single-purpose: find
+# REAL image URLs for a topic. It knows nothing about reports/HTML/any use case —
+# the model decides whether and how to embed a returned record.
+# --------------------------------------------------------------------------- #
+
+
+def ddgs_images_backend(query: str, max_results: int, region: str,
+                        timeout: float) -> list[dict[str, Any]]:
+    """Default image backend — free, key-LESS DuckDuckGo images via ``ddgs``.
+
+    Normalises ddgs' image rows to the tool's stable
+    ``{title, image_url, source_url, width, height}`` contract (``image`` is the
+    direct image URL; ``url`` is the page it appears on). Raises the ddgs typed
+    exceptions straight up so the caller's backoff can react."""
+    if DDGS is None:  # pragma: no cover - only if the lib failed to import
+        raise ToolInputError("ddgs library is not available; cannot run image_search")
+    with DDGS(timeout=timeout) as ddgs:
+        rows = ddgs.images(query, region=region, max_results=max_results)
+    out: list[dict[str, Any]] = []
+    for r in rows or []:
+        image_url = r.get("image") or ""
+        if not image_url:
+            continue
+        out.append({
+            "title": (r.get("title") or "").strip(),
+            "image_url": image_url,
+            "source_url": r.get("url") or "",
+            "width": int(r.get("width") or 0),
+            "height": int(r.get("height") or 0),
+        })
+    return out
+
+
+class ImageSearchArgs(BaseModel):
+    """Args for :data:`IMAGE_SEARCH_TOOL`."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "what the image should show, as a focused search query "
+            "(e.g. 'Maratha empire map 1760', 'Shivaji portrait painting')"))
+    max_results: int = Field(
+        6, ge=1, le=16,
+        description="maximum number of candidate image records to return (1-16)")
+    region: str = Field(
+        DEFAULT_SEARCH_REGION,
+        description="DuckDuckGo region code, e.g. 'us-en', 'wt-wt' (worldwide)")
+
+
+_IMAGE_SEARCH_DESC = (
+    "Find REAL image URLs for a topic (free DuckDuckGo image search). Returns "
+    "candidate records {title, image_url, source_url, width, height}; when you "
+    "embed one, use its image_url VERBATIM (and attribute source_url) — never "
+    "invent, guess, or placeholder an image path. Cached + rate-limit backoff; "
+    "deny-listed source domains are never returned.")
+
+
+def make_image_search(
+    *,
+    backend: Optional[Callable[..., list[dict[str, Any]]]] = None,
+    cache: Optional[ResultCache] = None,
+    timeout: float = 20.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    backoff_base: float = DEFAULT_BACKOFF_BASE,
+    sleep: Callable[[float], None] = time.sleep,
+    deny_domains: Any = DEFAULT_DENY_DOMAINS,
+) -> Callable[..., dict[str, Any]]:
+    """Build the ``image_search`` handler (mirrors :func:`make_web_search`:
+    swappable backend, shared TTL cache, exponential backoff, tool-enforced
+    source deny-list applied to the record's ``source_url``)."""
+    _backend = backend or ddgs_images_backend
+    _cache = cache if cache is not None else ResultCache()
+    _baseline_deny = _normalise_deny(deny_domains)
+
+    def image_search(query: str, max_results: int = 6,
+                     region: str = DEFAULT_SEARCH_REGION) -> dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            raise ToolInputError("query must be a non-empty string")
+        max_results = max(1, min(int(max_results), 16))
+        key = ("images", query.strip(), max_results, region)
+        cached = _cache.get(key)
+        if cached is not None:
+            return {"query": query, "results": cached, "count": len(cached),
+                    "cached": True, "region": region}
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                raw = _backend(query.strip(), max_results, region, timeout)
+                results = [r for r in (raw or [])
+                           if not _domain_denied(r.get("source_url", ""),
+                                                 _baseline_deny)]
+                _cache.put(key, results)
+                return {"query": query, "results": results,
+                        "count": len(results), "cached": False, "region": region}
+            except (RatelimitException, TimeoutException) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    sleep(backoff_base * (2 ** attempt))
+                    continue
+                break
+            except DDGSException as exc:  # non-transient ddgs failure
+                raise ToolInputError(f"image_search failed: {exc}") from exc
+        raise ToolInputError(
+            f"image_search rate-limited after {max_retries + 1} attempts: {last_exc}")
+
+    return image_search
+
+
+IMAGE_SEARCH_TOOL = ToolDef(
+    name="image_search",
+    description=_IMAGE_SEARCH_DESC,
+    args_model=ImageSearchArgs,
+    handler=make_image_search(),
+)
+
+
+# --------------------------------------------------------------------------- #
 # Registration — add both web tools to a GrowableToolRegistry (one entry each)
 # --------------------------------------------------------------------------- #
 
@@ -704,19 +822,29 @@ def register_web_tools(registry: Any, *, search_backend: Optional[SearchBackend]
         handler=make_web_fetch(timeout=timeout, deny_domains=deny_domains,
                                cache=fetch_cache),
     ))
+    registry.add(ToolDef(
+        name="image_search",
+        description=IMAGE_SEARCH_TOOL.description,
+        args_model=ImageSearchArgs,
+        handler=make_image_search(timeout=timeout, deny_domains=deny_domains),
+    ))
     return registry
 
 
 __all__ = [
     "WebSearchArgs",
     "WebFetchArgs",
+    "ImageSearchArgs",
     "ResultCache",
     "SearchBackend",
     "ddgs_backend",
+    "ddgs_images_backend",
     "make_web_search",
     "make_web_fetch",
+    "make_image_search",
     "WEB_SEARCH_TOOL",
     "WEB_FETCH_TOOL",
+    "IMAGE_SEARCH_TOOL",
     "register_web_tools",
     "DEFAULT_SEARCH_TTL_SECONDS",
     "DEFAULT_FETCH_TTL_SECONDS",

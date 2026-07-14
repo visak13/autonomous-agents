@@ -35,8 +35,10 @@ import json
 import os
 import re
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from llm_framework import Chain, Context, Transport
@@ -83,7 +85,10 @@ from .roles import (
     READ_NOT_DESCRIBE,
     # SB-RR (d293): ROLE_RESEARCHER + ROLE_WORKER are no longer referenced here — gather is a
     # self-selected specialization (not a role) and every worker shares ONE unified loop, so the
-    # engine branches on neither. Only ROLE_SYNTHESIZER (terminal delivery, d215) survives.
+    # engine branches on neither. Only ROLE_SYNTHESIZER (terminal delivery, d215) survives —
+    # plus ROLE_REVIEWER as the DATA the target-artifact gate reads: a reviewer verifies the
+    # deliverable, it is not the node that must produce it (P3; planner-declared role).
+    ROLE_REVIEWER,
     ROLE_SYNTHESIZER,
     role_framing,
 )
@@ -118,7 +123,6 @@ from .synth_tools import (
     derive_output_path,
     document_restart,
     html_close_gap,
-    is_detailed_task,
     render_scoped_sources,
     resolve_writer_source_budget,
     READ_RANKING_CHUNK_CHARS,
@@ -128,7 +132,6 @@ from .synth_tools import (
     render_source_index,
     sanitize_write_path,
     split_done_signal,
-    strip_internal_scaffolding,
 )
 from .scheduler import ExecutionMode, next_dispatch
 from .scope import ScopedSpec
@@ -226,19 +229,47 @@ _CHARS_PER_TOKEN = 3.5
 # the read falls back to the bounded map/reduce (never lexical).
 _UNSET_EMBEDDER: Any = object()
 _READ_EMBEDDER: Any = _UNSET_EMBEDDER
+_EMBEDDER_WARM_LOCK = threading.Lock()
+_EMBEDDER_WARM_THREAD: Any = None
+
+
+def _warm_read_embedder_async() -> None:
+    """Kick the embedder build on a DAEMON thread (idempotent; live 2026-07-13 catch:
+    onnxruntime's native DLL load was measured at ~20 MINUTES on this host — a
+    synchronous first-use build would freeze a live research read for that long).
+    While warming, :func:`_load_read_embedder` returns ``None`` and callers use the
+    bounded map/reduce fallback; once the thread lands, later reads get the real
+    dense relevance-select. Call this at process startup (the app wiring does) so
+    the cost runs off the critical path."""
+    global _EMBEDDER_WARM_THREAD
+    with _EMBEDDER_WARM_LOCK:
+        if _READ_EMBEDDER is not _UNSET_EMBEDDER or _EMBEDDER_WARM_THREAD is not None:
+            return
+
+        def _build() -> None:
+            global _READ_EMBEDDER
+            try:
+                from memory.embedder import CpuEmbedder
+
+                built = CpuEmbedder()
+            except Exception:  # noqa: BLE001 - optional embedder must never crash
+                built = None
+            with _EMBEDDER_WARM_LOCK:
+                _READ_EMBEDDER = built
+
+        _EMBEDDER_WARM_THREAD = threading.Thread(
+            target=_build, name="read-embedder-warm", daemon=True
+        )
+        _EMBEDDER_WARM_THREAD.start()
 
 
 def _load_read_embedder() -> Any:
-    """The shared MiniLM ``CpuEmbedder`` (memory store's), lazily built once; ``None`` if
-    fastembed/memory cannot load (caller then uses the map/reduce fallback)."""
-    global _READ_EMBEDDER
+    """The shared MiniLM ``CpuEmbedder``, built ONCE on a background warm thread;
+    ``None`` while warming or if fastembed/memory cannot load (caller then uses the
+    bounded map/reduce fallback — reads NEVER block on the embedder build)."""
     if _READ_EMBEDDER is _UNSET_EMBEDDER:
-        try:
-            from memory.embedder import CpuEmbedder
-
-            _READ_EMBEDDER = CpuEmbedder()
-        except Exception:  # noqa: BLE001 - missing optional embedder must not crash a read
-            _READ_EMBEDDER = None
+        _warm_read_embedder_async()
+        return None
     return _READ_EMBEDDER
 # Fraction of the write window the TOTAL of a section's source excerpts may occupy,
 # leaving the rest for the section prompt scaffolding + the num_predict output.
@@ -306,11 +337,22 @@ _RESEARCH_NUDGE = (
     "Reply with EITHER a single tool-call JSON object (to search or fetch), OR your "
     "FINDINGS as plain prose — nothing else."
 )
+# The bundle-NEUTRAL twin (autonomy rebuild P2): a worker that did NOT load the
+# research bundle (e.g. a writer driving file tools) gets format guidance only —
+# never research vocabulary.
+_WORKER_NUDGE = (
+    "Reply with EITHER a single tool-call JSON object (one of the tools you loaded), "
+    "OR your final output as plain prose — nothing else."
+)
 _RESEARCH_FINALIZE = (
     "Stop searching. Write your FINDINGS now as plain prose, drawn from the sources you "
     "have already read — the key facts and figures, each attributed to its source URL, and "
     "end with a line naming WHAT IS STILL MISSING or UNVERIFIED so the next layer can pursue "
     "it. Output ONLY the findings (no JSON, no preamble)."
+)
+_WORKER_FINALIZE = (
+    "Turn budget reached. Emit your final output now as plain prose — what you completed "
+    "and anything left undone. Output ONLY that (no JSON, no preamble)."
 )
 # s9/N5 (d62/c15 part-e): the no-fabrication GATHER-MORE nudge — sent when a research
 # stage that self-selected the gather bundle wrote substantive findings with ZERO real
@@ -321,6 +363,11 @@ _RESEARCH_FINALIZE = (
 # cannot loop forever — after the budget the findings stand (the writer-doctrine self-review
 # is what grounds-or-drops any remaining unbacked claim).
 _RESEARCH_GATHER_MORE_MAX = 2
+
+# TARGET-ARTIFACT gate bound (autonomy rebuild P2): how many times a node with a
+# declared deliverable file may be bounced for concluding without writing it before
+# its prose findings are accepted anyway (honest failure downstream, never a loop).
+_TARGET_GATE_MAX = 2
 _RESEARCH_GATHER_MORE = (
     "You answered from MEMORY — you fetched NO real source. A research task may NOT be "
     "answered from memory: every fact must come from a source you actually read. SEARCH "
@@ -990,6 +1037,17 @@ class SubAgent:
                 "(load_source by [S#], or the source index) when you need a fact, figure, "
                 "or URL; do not expect it pasted in full here, and never invent a source."
             )
+            # P2 pull-targeting (Gate-2b live catch): telling the model to "load_source
+            # by [S#]" without SHOWING which [S#] exist left it nothing to aim at — it
+            # wrote from its own knowledge and even emitted placeholder timeline rows.
+            # Render the COMPACT index (titles+urls ONLY, never bodies — the s14 read
+            # contract) so every pull has a concrete target. Data, not steering.
+            if self._chain_sources:
+                from .research_tree import render_verbatim_source_index
+
+                parts.append(
+                    "\n" + render_verbatim_source_index(self._chain_sources)
+                )
         # UNIVERSAL FINALIZE HANDOFF (d285 SB-4): the SOLE inter-node context payload is the
         # DIRECT-upstream ``(summary, memory_index)`` PAIR(s). For every dep that carries a pair
         # we render the pair here and DROP that dep's clipped-prose input (ch1) AND its folded
@@ -2070,6 +2128,16 @@ class SubAgent:
         )
         if self._emit_article_notes:
             operational += _RESEARCH_NOTE_CLAUSE
+        # PURE DELIVERY (d299 DP2 — the same ruling as chat_app's _normalize_write_dag):
+        # a node with a DECLARED deliverable target whose task does not already name it
+        # is told WHERE to write — the file name is delivery data (tool dispatch), never
+        # methodology. Reached by the folded SYNTHESIZER terminal (its acyclic-plan task
+        # rarely names the derived file); write-plan tasks already carry the name.
+        if self._deliverable_path and self._deliverable_path not in (self.node.task or ""):
+            operational += (
+                f" Your deliverable is the FILE '{self._deliverable_path}' — load the "
+                'file tools (get_bundles(name="file")) and write it there.'
+            )
         convo: list[dict[str, Any]] = [{
             "role": "user",
             "content": base_user + "\n\n" + operational,
@@ -2097,6 +2165,11 @@ class SubAgent:
         note_gate_max = max(2, fetch_cap) if self._emit_article_notes else 0
         pending_findings = ""
         findings = ""
+        # TARGET-ARTIFACT gate state (autonomy rebuild P2, Gate-2e lesson): whether any
+        # write-shaped tool result landed on this node's declared deliverable path, and
+        # how many times a no-write conclusion was bounced (bounded like the other gates).
+        wrote_target = False
+        target_gate = 0
 
         # The turn ceiling rises proportionally with the fetch cap so a high-breadth
         # gather can read MANY sources without the flat ceiling clipping it (N1). A
@@ -2110,6 +2183,12 @@ class SubAgent:
         max_turns = max(
             RESEARCH_MAX_TURNS, fetch_cap + RESEARCH_SEARCH_HEADROOM + note_budget
         ) + 2
+        # DELIVERABLE headroom (autonomy rebuild P2): a node writing a declared file
+        # spends turns on pulls (read_notes/load_source) plus one file_write per part
+        # plus the target-gate bounces — the gather-sized ceiling would clip a whole-
+        # document write loop. Data-gated on the declared target; still a NON-FLOW cap.
+        if self._deliverable_path:
+            max_turns += _TARGET_GATE_MAX + 8
 
         tracer = get_tracer("agent_runtime.research")
         with tracer.start_as_current_span("research.react") as span:
@@ -2135,16 +2214,29 @@ class SubAgent:
                 convo.append({"role": "assistant", "content": raw or (
                     json.dumps({"tool": call[0], "args": call[1]}) if call else "")})
                 # SELF-SELECT turn: a get_bundles call LOADS a bundle (its tools appear next
-                # turn); it is not a gather action, so handle + continue. Fed role:'user' so
-                # the live model grounds on the 'tools now available' ack (d199).
+                # turn); it is not a gather action, so handle + continue. Fed role:'tool' —
+                # the transport renders it as an ENVELOPED user turn ([TOOL RESULT]…), so the
+                # model both SEES it (d199's intent) and can tell it is a tool observation,
+                # not the user speaking (the messaging-layer fix).
                 if call is not None and call[0] == "get_bundles":
                     obs = await self._handle_self_select(call[0], call[1])
                     span.set_attribute(f"research.turn.{turn + 1}.tool", "get_bundles")
-                    convo.append({"role": "user", "content": obs or ""})
+                    convo.append({"role": "tool", "content": obs or ""})
                     continue
                 # A finish call is the model signalling done → fold into the 'no tool call'
                 # path so the findings-acceptance logic runs (research output is RAW prose).
+                # PARSE-TO-READ (Gate-2f wart): when the finish call carries a textual
+                # reason/summary, THAT model-authored text is the node's findings — not the
+                # raw tool-call JSON syntax it rode in on (which leaked verbatim into the
+                # node output on the live run). Extraction only; no engine wording.
                 if call is not None and call[0] == "finish":
+                    _fin_args = call[1] or {}
+                    _fin_text = str(
+                        _fin_args.get("reason") or _fin_args.get("summary")
+                        or _fin_args.get("result") or ""
+                    ).strip()
+                    if _fin_text:
+                        raw = _fin_text
                     call = None
                 # TRUE self-select guard (d242): a gather tool the node has NOT yet loaded is
                 # not callable — the string parser can name one before its bundle is loaded,
@@ -2221,12 +2313,55 @@ class SubAgent:
                                     remaining=len(missing),
                                 )})
                                 continue
+                        # TARGET-ARTIFACT ACCEPTANCE GATE (autonomy rebuild P2 — the
+                        # Gate-2e lesson): the node's plan declared a deliverable FILE
+                        # (``deliverable_path`` — model-named via name_deliverable and
+                        # stamped by the write phase as DATA, never an engine regex),
+                        # but the node is concluding without EVER having written it.
+                        # Live Gate-2e: the one-node write plan answered turn 1 with
+                        # the whole document as PROSE — never loaded the file bundle —
+                        # and the run then shipped a STALE file from a previous session.
+                        # Same KEEP-class as the no-fab GATHER-MORE gate above: it
+                        # verifies a planner-declared postcondition with an actionable
+                        # TOOL error; it never edits or composes the model's bytes.
+                        # Bounded; on exhaustion the prose findings stand and the
+                        # persistence layer reports honestly that no file was produced.
+                        if (
+                            self._deliverable_path
+                            and not wrote_target
+                            and target_gate < _TARGET_GATE_MAX
+                            # P3: a REVIEWER verifies/fixes the deliverable — it is not
+                            # the node that must PRODUCE it, so a clean-artifact review
+                            # legitimately concludes with no write (role = planner data).
+                            and self.node.role != ROLE_REVIEWER
+                        ):
+                            target_gate += 1
+                            pending_findings = findings  # salvage; never discard prose
+                            findings = ""
+                            span.set_attribute(
+                                f"research.turn.{turn + 1}", "target_gate"
+                            )
+                            convo.append({"role": "tool", "content": (
+                                f"ERROR: nothing has been written to "
+                                f"'{self._deliverable_path}' — text in this "
+                                "conversation is NOT saved to disk, so finishing now "
+                                "delivers NOTHING. Load the file tools first: "
+                                'get_bundles(name="file"). Then write your document '
+                                f"to '{self._deliverable_path}' with file_write, and "
+                                "finish only after the write is acknowledged."
+                            )})
+                            continue
                         span.set_attribute(f"research.turn.{turn + 1}", "findings")
                         break
                     unproductive += 1
                     if unproductive >= 2:
                         break
-                    convo.append({"role": "user", "content": _RESEARCH_NUDGE})
+                    # Bundle-aware wording: research vocabulary only for a node that
+                    # actually loaded the research bundle (autonomy rebuild P2).
+                    convo.append({"role": "user", "content": (
+                        _RESEARCH_NUDGE if BUNDLE_RESEARCH in self._loaded_bundles
+                        else _WORKER_NUDGE
+                    )})
                     continue
                 tool, args = call
                 if tool == self._note_tool:
@@ -2235,12 +2370,10 @@ class SubAgent:
                     # NOT touch the fetch/search budget (it is not a gather call).
                     obs = self._record_article_note(args, fetched, notes)
                     span.set_attribute(f"research.turn.{turn + 1}.tool", "note")
-                    # s15/a25 (d199, SUPERSEDES a18/d189 for this model): the note ack carries
-                    # the open follow-ups the model must ACT on (steer the next search). Live
-                    # Gemma (:11434) uses a '{{ .Prompt }}' chat template with NO role handling,
-                    # so role:'tool' content is IGNORED — fed as 'tool' the model never reads the
-                    # ack and fabricates. Feed it role:'user' so the model actually grounds on it.
-                    convo.append({"role": "user", "content": obs})
+                    # Observation fed role:'tool' — the transport renders it as an ENVELOPED
+                    # user turn ([TOOL RESULT]…), so the model grounds on the ack (d199's
+                    # intent) AND can tell it is tool output, not the user (messaging fix).
+                    convo.append({"role": "tool", "content": obs})
                     continue
                 # SoC ENGINE-THIN (SA-4/d254 — the Tier-2 gap fix): a self-selected gather tool
                 # that is NOT the configured web search/fetch/note is a NON-WEB bundle's tool
@@ -2253,12 +2386,26 @@ class SubAgent:
                 # so it stays byte-identical (contrastive gate, SA-4 (a)).
                 if tool not in (self._search_tool, self._fetch_tool, self._note_tool):
                     obs, value = await self._invoke_loaded_tool(tool, args)
-                    if value is not None:
+                    # Capture a downstream-pullable RECORD only for a READ-shaped value
+                    # (it carries content). A WRITE-shaped result — {path, bytes, …},
+                    # e.g. the pull-writer's file_write acks — is an action receipt,
+                    # not a source; recording it would pollute chain_sources with
+                    # pseudo-sources. Shape-based (data), never a tool-name gate.
+                    write_shaped = (
+                        isinstance(value, Mapping)
+                        and "bytes" in value
+                        and not (value.get("markdown") or value.get("text"))
+                    )
+                    if write_shaped and self._deliverable_path:
+                        _wp = str((args or {}).get("path") or "").strip()
+                        if _wp and Path(_wp).name == Path(self._deliverable_path).name:
+                            wrote_target = True
+                    if value is not None and not write_shaped:
                         records.append(self._gather_record(tool, args, value))
                     span.set_attribute(f"research.turn.{turn + 1}.tool", tool)
-                    # role:'user' for the observation (d199 — this prompt-only model grounds
-                    # only on user turns), mirroring the web search/fetch observation feed.
-                    convo.append({"role": "user", "content": obs})
+                    # Observation fed role:'tool' → transport-enveloped ([TOOL RESULT]…),
+                    # mirroring the web search/fetch observation feed (messaging fix).
+                    convo.append({"role": "tool", "content": obs})
                     continue
                 if tool == self._fetch_tool:
                     # s15/a25 grounding guard (d186; d199-consistent): VALIDATE the chosen url is
@@ -2266,27 +2413,25 @@ class SubAgent:
                     # URLs (live: every fetch failed, 0 sources); when it targets a url NOT in
                     # ``offered_urls`` (and the node HAS been offered some), return an ERROR
                     # observation listing the real candidates so it RE-GROUNDS and retries — robust
-                    # feedback, NOT a hard seatbelt, and it does NOT burn the fetch cap (a fabricated
-                    # attempt never reached the network). Fed role:'user' per d199 (this model only
-                    # grounds on user turns; a role:'tool' correction would be ignored). Bounded by
-                    # ``max_turns``. The LOAD-BEARING grounding lever is role:'user'-for-observations
-                    # below; this guard is defense-in-depth on top.
+                    # single-retry actionable feedback (a TOOL error result, so fed role:'tool' →
+                    # transport-enveloped), NOT a hard seatbelt; it does NOT burn the fetch cap
+                    # (a fabricated attempt never reached the network). Bounded by ``max_turns``.
                     want = str(args.get("url") or args.get("link") or "").strip()
                     if offered_urls and want and not _url_offered(want, offered_urls):
                         span.set_attribute(
                             f"research.turn.{turn + 1}.tool", "fetch_ungrounded"
                         )
                         cand = "\n".join(f"- {u}" for u in list(offered_urls)[:8])
-                        convo.append({"role": "user", "content": (
-                            f"<{want}> was NOT in the search results — do not invent or guess a "
-                            "URL. web_fetch ONLY a url COPIED VERBATIM from the search results. "
-                            f"Choose one of:\n{cand}"
+                        convo.append({"role": "tool", "content": (
+                            f"ERROR: <{want}> was NOT in the search results — do not invent or "
+                            "guess a URL. web_fetch ONLY a url COPIED VERBATIM from the search "
+                            f"results. Choose one of:\n{cand}"
                         )})
                         continue
                     if fetches >= fetch_cap:
-                        convo.append({"role": "user", "content": (
-                            f"Fetch limit ({fetch_cap}) reached. Write your FINDINGS now "
-                            "from the sources you have read."
+                        convo.append({"role": "tool", "content": (
+                            f"ERROR: fetch limit ({fetch_cap}) reached. Write your FINDINGS "
+                            "now from the sources you have read."
                         )})
                         continue
                 obs = await self._dispatch_research_tool(
@@ -2297,16 +2442,13 @@ class SubAgent:
                 else:
                     fetches += 1
                 span.set_attribute(f"research.turn.{turn + 1}.tool", tool)
-                # s15/a25 (d199, SUPERSEDES a18/d189 for this model — the LOAD-BEARING fix): the
-                # web_search RESULTS (the URLs to choose from) and the web_fetch BODY are
-                # observations the model must GROUND on — pick a real url, then read the article.
-                # Live Gemma (:11434) uses a '{{ .Prompt }}' chat template with NO role handling,
-                # so role:'tool' content is IGNORED: fed as 'tool' the model never reads the offered
-                # URLs and FABRICATES the fetch url (the exact FAIL_2 — 0 sources/notes). Feed the
-                # result back role:'user' so the model actually sees and grounds on it. a18 moved
-                # this to role:'tool' to stop a runaway loop, but that runaway was the WRITE loop
-                # echoing its OWN output, NOT this research observation (d199).
-                convo.append({"role": "user", "content": obs})
+                # The web_search RESULTS and web_fetch BODY are observations the model must
+                # GROUND on. Fed role:'tool': the transport renders them as ENVELOPED user
+                # turns ([TOOL RESULT]…[/TOOL RESULT]) so the prompt-only model both SEES
+                # them (d199's grounding intent — a bare role:'tool' turn is invisible to
+                # gemma's template) AND can tell tool output from the user speaking (the
+                # messaging-layer fix). In-memory history keeps the semantic tool label.
+                convo.append({"role": "tool", "content": obs})
 
             # Fallback: the model never wrote findings (kept calling tools / stalled) →
             # salvage ONE final emission grounded in whatever it has read. s15/a27: if the NOTE
@@ -2316,7 +2458,10 @@ class SubAgent:
             if not findings and pending_findings:
                 findings = pending_findings
             if not findings:
-                convo.append({"role": "user", "content": _RESEARCH_FINALIZE})
+                convo.append({"role": "user", "content": (
+                    _RESEARCH_FINALIZE if BUNDLE_RESEARCH in self._loaded_bundles
+                    else _WORKER_FINALIZE
+                )})
                 final_raw, _ = await self._research_emit(system, convo, opts)
                 findings = _strip_synth_fence(final_raw or "").strip()
             span.set_attribute("research.searches", searches)
@@ -2435,38 +2580,16 @@ class SubAgent:
         validator rejects raises :class:`InvalidStepError` (both self-heal
         classes). A transport-level error propagates unchanged."""
         inputs = inputs or {}
-        # SB-6 (a)/d299/d301 — the served REPORT WRITE node is now TOOL-LESS (the engine no longer
-        # stamps tool=file_write / role=None; ``_normalize_write_dag`` retired its structure
-        # authoring). Route it to the EXISTING served writer (:meth:`_run_file_delivery` ->
-        # :meth:`_run_raw_file_loop`, which SELF-SELECTS 'file'+'research_read') by DELIVERY-CONTEXT
-        # DATA: the runtime's ``deliverable_path`` (set ONLY on the write runtime). This is the
-        # WRITE-PHASE-EXCLUSIVE signal — NOT ``chain_sources``, which a follow-up READER also
-        # carries to resolve prior sources (routing on chain_sources alone was OVER-BROAD: it forced
-        # a non-writer follow-up worker to write a file — d301, caught by
-        # test_bundle_self_select_d221). It is structural DATA (this runtime is delivering one file)
-        # plus the review/synthesizer carve-outs — NOT a spec-name/role-name/tool-name conditional,
-        # so it passes the d293 anti-fabrication grep gate. The write METHODOLOGY rides the
-        # ``section-html-writer`` SPEC BODY (read via ``_compose_system``) + the FILE bundle doctrine
-        # (surfaced on self-select) — never an engine stamp; the planner authors the section topology
-        # + chain by reasoning (d10/d246). Soundness rests on the ALL-WRITERS INVARIANT: only writers
-        # run in a runtime with deliverable_path set (research/gather/follow-up run in a SEPARATE
-        # runtime with no deliverable_path → they fall through to the unified loop below).
-        if (
-            self.hook is not None
-            and self.node.role != ROLE_SYNTHESIZER
-            and self._deliverable_path
-        ):
-            return await self._run_file_delivery(inputs)
-        # ROUTE-INDEPENDENCE (d50): the legacy acyclic ``web_search``->``file_write`` terminal
-        # node (an EXPLICIT planner/user-authored file tool, NO chain_sources) authors the
-        # deliverable via the SAME raw-content read-back loop the synthesizer uses
-        # (:meth:`_run_raw_file_loop`).
-        if (
-            self.hook is not None
-            and self.node.role != ROLE_SYNTHESIZER
-            and (self.node.tool or "") in ("file_write", "write_file")
-        ):
-            return await self._run_file_delivery(inputs)
+        # AUTONOMY REBUILD Phase 2 (owner charter): the d299 `deliverable_path` routing
+        # flag and the legacy explicit-file_write raw-loop route are DELETED. A write
+        # node is a WORKER like any other: it enters the unified self-select loop below,
+        # loads the `file` (+ `research_read`) bundles itself, PULLS its grounding
+        # (read_notes → load_source) and DRIVES file_write/file_update per its
+        # specialization — the live probe measured E4B emitting 8/8 well-formed
+        # section-sized file_write tool calls, falsifying the d49 premise the raw push
+        # loop was built on. The deliverable target is TASK DATA (the planner names the
+        # file in the node task); `sanitize_write_path` at the tool boundary remains the
+        # only path guard. No role/spec/tool-name conditional routes anything.
         # UNIFIED WORKER LOOP (d273/d292/d293 — SB-RR retires ROLE_RESEARCHER): every spawned
         # node is a WORKER (d273); gather is a SELF-SELECTED specialization, never a role. A
         # WORKER that did not bind a terminal tool (the common case: gather nodes, research
@@ -2484,9 +2607,20 @@ class SubAgent:
         # the ONLY structural role dispatch that survives — handled above/below.)
         if (
             self.hook is not None
-            and self.node.role != ROLE_SYNTHESIZER
             and (self.node.tool == self._search_tool or not self.node.tool)
         ):
+            # SYNTHESIZER FOLD (autonomy rebuild P2C): the terminal delivery role no
+            # longer routes to the raw push loop (_run_synthesis → _run_raw_file_loop —
+            # both deleted) — it is a WORKER in the same unified self-select loop as
+            # everyone else: it loads the file (+ research_read) bundles itself and
+            # DRIVES file_write per its spec. Its target resolves exactly as
+            # _run_synthesis resolved it (the c1b continuation path, else the derived
+            # name) and rides as DELIVERY DATA (deliverable_path + the operational
+            # delivery line, d299 DP2) — the target-artifact gate verifies delivery.
+            if self.node.role == ROLE_SYNTHESIZER and not self._deliverable_path:
+                self._deliverable_path = self._chain_continue_path or derive_output_path(
+                    self._overall_goal, self.node.task, self.spec_names
+                )
             return await self._run_research_loop(inputs)
         tool_value: Any = None
         # A non-research tool node (e.g. a standalone web_fetch step) invokes its single
@@ -2539,124 +2673,44 @@ class SubAgent:
         # RULESET-SHAPING composed at the produce step, never conflated.
         system = self._compose_system()
         user = self._compose_task(inputs, tool_value)
-        if self.node.role == ROLE_SYNTHESIZER:
-            # SYNTHESIZER (d48): the terminal output stage. It authors the deliverable
-            # via the shared raw-content read-back file loop (:meth:`_run_synthesis` →
-            # :meth:`_run_raw_file_loop`), emitting RAW content (no ``format=<schema>``,
-            # d50.1) so a long report can never truncate as an escaped JSON string. It
-            # surfaces the written file as a ``file_write`` tool result so the chat
-            # artifact carries the CHOSEN filename+extension (cats.html stays cats.html).
-            # c12 #5: append the authoritative REAL-SOURCE-URL index so the deliverable
-            # cites the actual fetched URLs verbatim, never a fabricated placeholder.
-            user = self._with_source_index(user)
-            raw, parsed, _verdict, _repairs = await self._run_synthesis(system, user)
-            tool_used = self.node.tool
-            result_tool_value = tool_value
-            if isinstance(parsed, Mapping):
-                syn_path = parsed.get("written_path")
-                if syn_path:
-                    tool_used = "file_write"
-                    result_tool_value = {"path": str(syn_path)}
-            result = SubAgentResult(
-                node_id=self.node.id,
-                spec=self.node.primary_spec,
-                specs=self.spec_names,
-                output=raw,
-                tool_used=tool_used,
-                tool_value=result_tool_value,
-                role=self.node.role,
-                parsed=parsed,
-            )
-        else:
-            # PRODUCE fall-through. After SB-RR (d293) every HOOKED, tool-less WORKER — gather,
-            # research follow-up, or trivial producer — is routed to the unified worker loop
-            # ABOVE (self-select decides its behavior), so this path is NOT a role=None /
-            # ROLE_WORKER routing branch. It is reached ONLY by (a) an OFFLINE node (no hook —
-            # it has no tool surface to self-select, so it stays a single bounded chain call,
-            # back-compat) or (b) an explicit non-search single-tool node that already invoked
-            # its one tool above and now produces prose from that ``tool_value``. The
-            # role-execution SWITCH (flag #5) stays retired — it emits RAW free-text (no per-role
-            # output schema, no enum-verdict path; d50.1 content is RAW); behavior comes from its
-            # SPEC(s) + task framing + reasoning, NOT a code switch.
-            chain = Chain()
-            chain.use(prompt_assembly())
-            chain.use(call_stage(self.transport, **self._call_opts))
-            ctx = Context(system=system, user=user, transport=self.transport)
-            # FREEZE FIX (decouple): chain.run drives the SYNCHRONOUS, blocking phi
-            # HTTP round-trip (call_stage -> transport.chat). This node coroutine
-            # runs ON the shared event loop, so calling it inline would block the
-            # loop for the whole phi latency and freeze the server (incl /health).
-            # Offload to a worker thread so the loop keeps serving other nodes, SSE
-            # streams and /health while phi works (mirrors toolargs.py). TRACING
-            # (s6/b2): run_blocking_in_span re-attaches the active OTel context (the
-            # per-node span) inside that worker thread, so the b1 per-phi-call LLM
-            # span nests UNDER this node's span instead of detaching into a root trace.
-            ctx = await run_blocking_in_span(chain.run, ctx)
-            result = SubAgentResult(
-                node_id=self.node.id,
-                spec=self.node.primary_spec,
-                specs=self.spec_names,
-                output=ctx.raw_output,
-                tool_used=self.node.tool,
-                tool_value=tool_value,
-                role=self.node.role,
-            )
-        if self._validate is not None:
-            reason = self._validate(self.node, result)
-            if reason:
-                raise InvalidStepError(
-                    f"node {self.node.id!r} produced a logically-invalid result: {reason}",
-                    node_id=self.node.id,
-                    reason=reason,
-                )
-        return result
-
-    async def _run_file_delivery(self, inputs: Mapping[str, Any]) -> "SubAgentResult":
-        """Run a terminal FILE-DELIVERY tool node as a TRUE AGENT (d50).
-
-        The acyclic ``web_search``->``file_write`` route's terminal writer is now
-        route-independent with the deep-research synthesizer: it authors the
-        deliverable via the SAME shared raw-content read-back loop
-        (:meth:`_run_raw_file_loop`) instead of a single deterministic content-dump.
-
-        The SHAPING-framed spec ruleset is the system turn (``_compose_system``) and
-        the user turn (``_compose_task``) carries the OVERALL GOAL + the upstream
-        INPUTS prose + the upstream SOURCES & FINDINGS (the research the loop writes
-        FROM) — so the node grounds in the real research, RAW, never a JSON envelope.
-        The CHOSEN filename+extension (``derive_output_path``) reaches disk so the
-        artifact carries the requested type verbatim (cats.html stays cats.html) on
-        the tool route exactly as on the synthesis route. The written path is surfaced
-        as a ``file_write`` result so the chat artifact name is correct (parity with
-        the synthesis role surfacing). The result-validator gate runs as in
-        :meth:`run`."""
-        # NODE-SELF-SELECT (d242 — TRUE self-select): a file-delivery writer SELF-SELECTS its
-        # AUTHORING capability ('file') + read-a-source ('research_read') in the raw loop's
-        # self-select front (no prime, no role->bundle table) so its doctrine arrives by LOAD
-        # (in the load observation). The raw write phase then emits content (the loop drives
-        # the file tools).
-        system = self._compose_system()
-        user = self._compose_task(inputs, None)
-        # c12 #5: carry the REAL fetched source URLs into the deliverable's citations on
-        # the acyclic web_search->file_write route too (parity with the synthesis role).
-        user = self._with_source_index(user)
-        # PLAN-CHAINING (c1b): a continuation page appends to the file an upstream
-        # writer started; otherwise the chosen filename is derived as before.
-        out_path = self._chain_continue_path or derive_output_path(
-            self._overall_goal, self.node.task, self.spec_names
-        )
-        doc, written_path, finished = await self._run_raw_file_loop(
-            system, user, out_path,
-            continue_existing=self._chain_continue_path is not None,
-            is_final=self._chain_is_final,
-        )
+        # SYNTHESIZER FOLD (autonomy rebuild P2C): the ROLE_SYNTHESIZER special case
+        # (_with_source_index → _run_synthesis → _run_raw_file_loop, the engine-steered
+        # raw push loop with its riders/flags) is DELETED. A hooked tool-less synthesizer
+        # routes to the unified self-select loop ABOVE with its target as deliverable
+        # DATA; an offline or single-tool synthesizer produces prose here like any node.
+        #
+        # PRODUCE fall-through. After SB-RR (d293) every HOOKED, tool-less WORKER — gather,
+        # research follow-up, or trivial producer — is routed to the unified worker loop
+        # ABOVE (self-select decides its behavior), so this path is NOT a role=None /
+        # ROLE_WORKER routing branch. It is reached ONLY by (a) an OFFLINE node (no hook —
+        # it has no tool surface to self-select, so it stays a single bounded chain call,
+        # back-compat) or (b) an explicit non-search single-tool node that already invoked
+        # its one tool above and now produces prose from that ``tool_value``. The
+        # role-execution SWITCH (flag #5) stays retired — it emits RAW free-text (no per-role
+        # output schema, no enum-verdict path; d50.1 content is RAW); behavior comes from its
+        # SPEC(s) + task framing + reasoning, NOT a code switch.
+        chain = Chain()
+        chain.use(prompt_assembly())
+        chain.use(call_stage(self.transport, **self._call_opts))
+        ctx = Context(system=system, user=user, transport=self.transport)
+        # FREEZE FIX (decouple): chain.run drives the SYNCHRONOUS, blocking phi
+        # HTTP round-trip (call_stage -> transport.chat). This node coroutine
+        # runs ON the shared event loop, so calling it inline would block the
+        # loop for the whole phi latency and freeze the server (incl /health).
+        # Offload to a worker thread so the loop keeps serving other nodes, SSE
+        # streams and /health while phi works (mirrors toolargs.py). TRACING
+        # (s6/b2): run_blocking_in_span re-attaches the active OTel context (the
+        # per-node span) inside that worker thread, so the b1 per-phi-call LLM
+        # span nests UNDER this node's span instead of detaching into a root trace.
+        ctx = await run_blocking_in_span(chain.run, ctx)
         result = SubAgentResult(
             node_id=self.node.id,
             spec=self.node.primary_spec,
             specs=self.spec_names,
-            output=doc,
-            tool_used="file_write",
-            tool_value=({"path": written_path} if written_path else None),
-            parsed={"output": doc, "written_path": written_path, "converged": finished},
+            output=ctx.raw_output,
+            tool_used=self.node.tool,
+            tool_value=tool_value,
+            role=self.node.role,
         )
         if self._validate is not None:
             reason = self._validate(self.node, result)
@@ -2668,937 +2722,17 @@ class SubAgent:
                 )
         return result
 
-
-    # ------------------------------------------------------------------ #
-    # Pass-D (d216) — the TOOL-CALLING WRITE WORKER (the core ruling).
-    # The served write worker is a TRUE READER: it PULLS the verbatim text of
-    # the sources it needs with load_source (research_read bundle) and AUTHORS its
-    # section to the deliverable with file_write (file bundle), running the SAME
-    # proven ReAct loop the anchored reviewer uses — native tool call + balanced-
-    # brace string fallback, observations fed back as role:'tool'. This RETIRES the
-    # _inject_section_notes PUSH (a bounded push is still the verbatim dump the user
-    # rejected, d216): the writer reads its own grounding ON DEMAND instead of being
-    # handed it. Strong load_source/file tool descriptions + the TOP-N chunk return
-    # (source_tools) are the substance lever that keeps a raw-can't-pull small model
-    # from going thin — it pulls ENOUGH to be substantive.
-    # ------------------------------------------------------------------ #
-    _TOOL_WRITER_MAX_TURNS = 8
-    # The tail one file_read hands the writer so it can continue from what it has
-    # written without ever being fed the whole accumulating document.
-    _TOOL_WRITER_READ_TAIL = 1500
-
-    def _tool_calling_writer_tool_specs(self) -> list[dict[str, Any]]:
-        """NOTE (d242/d244): NOT wired anymore — under TRUE self-select the writer's tools are
-        offered only after it loads 'file'+'research_read', and d244 removed the per-role
-        curation entirely (``_offered_tool_specs()`` with NO ``only=`` subset, file_update
-        included). Retained only as the reference for the writer's phase-tuned tool
-        descriptions.
-
-        The write worker's native tool surface (d216): PULL a source's verbatim text +
-        APPEND the authored section to the deliverable + READ BACK the tail.
-
-        ``file_write`` here APPENDS one section per call (the runtime forces append onto the
-        single deliverable path); the writer composes the document section by section, READING
-        its grounding on the cost hierarchy first — ``read_notes`` (cheap gist) to see which
-        source has what, then ``load_source`` (expensive verbatim) for the exact figures it
-        cites. No ``file_update`` (that is the reviewer's surgical tool) — the writer only adds
-        content."""
-        return [
-            make_tool_spec(
-                "read_notes",
-                "CHEAP — use FIRST. Read the article-note gist of the fetched sources (each "
-                "[S#] source's summary, key_claims and gaps) to plan the section and see WHICH "
-                "source has the figures you need, WITHOUT pulling verbatim text. read_notes() "
-                "for all, or read_notes(sid='S3') for one. THEN load_source the [S#] you cite.",
-                {"sid": {"type": "string"}},
-                [],
-            ),
-            make_tool_spec(
-                "load_source",
-                "EXPENSIVE — use read_notes first. PULL the verbatim text of one fetched source "
-                "so you cite the REAL figure/quote, not memory. Pass sid='S3' to get its opening "
-                "AND next section (the cited passage with surrounding verbatim text), or "
-                "chunk='S3.c2' for one section. Returns the verbatim excerpt + its url; "
-                "'more':true means more is available by chunk id. Load a section's cited sources "
-                "before writing the figures; cite only [S#] in the INDEX.",
-                {"sid": {"type": "string"}, "chunk": {"type": "string"}},
-                ["sid"],
-            ),
-            make_tool_spec(
-                "file_write",
-                "Append the next section you have written to the deliverable. Pass 'content' = "
-                "that section's finished body (markdown or HTML as the task asks), grounded in "
-                "the sources you loaded and citing their [S#]. Write ONE section per call, then "
-                "call file_write again for the next section. Do NOT re-emit earlier sections.",
-                {"path": {"type": "string"}, "content": {"type": "string"}},
-                ["content"],
-            ),
-            make_tool_spec(
-                "file_read",
-                "Read the END (tail) of the deliverable so far to see what you have already "
-                "written and continue from it — never the whole file.",
-                {"path": {"type": "string"}, "tail": {"type": "integer"}},
-                ["path"],
-            ),
-        ]
-
-    async def _dispatch_writer_tool(
-        self, tool: str, args: Mapping[str, Any], path: str
-    ) -> str:
-        """Execute ONE write-worker tool call against the deliverable → an observation string.
-
-        The target ``path`` is FORCED to the single deliverable (the writer cannot aim a write
-        at another file). ``file_write`` APPENDS when the file already has content and CREATES it
-        on the first write (size probe), so sequential section nodes accumulate into one file. A
-        ``file_read`` is clamped to the tail. A failed call returns a corrective note, never
-        raises — a write turn must not crash the node into self-heal."""
-        a = dict(args)
-        if tool == "read_notes":
-            try:
-                res = await self.hook.invoke("read_notes", sid=a.get("sid"))
-            except Exception as exc:  # noqa: BLE001 - note read is non-fatal
-                return f"read_notes failed: {exc}."
-            if not getattr(res, "ok", False):
-                return f"read_notes unavailable: {getattr(res, 'error', '')}."
-            return f"NOTES: {res.value}"
-        if tool == "load_source":
-            sid = str(a.get("sid") or "")
-            if not sid:
-                return "load_source needs a [S#] sid from the SOURCE INDEX."
-            try:
-                res = await self.hook.invoke("load_source", sid=sid, chunk=a.get("chunk"))
-            except Exception as exc:  # noqa: BLE001 - load failure is non-fatal
-                return f"load_source failed: {exc}."
-            if not getattr(res, "ok", False):
-                return f"load_source unavailable: {getattr(res, 'error', '')}."
-            return f"SOURCE {sid}: {res.value}"
-        if tool == "file_write":
-            content = str(a.get("content") or a.get("text") or "")
-            if not content.strip():
-                return ("file_write needs non-empty 'content' — the finished section body. "
-                        "Load the sources you need, write the section, then file_write it.")
-            # d218 — coherence is the WRITER's DOCTRINE + the REVIEWER's reasoning, NOT
-            # deterministic surgery on the model's HTML (the retired d196 regex-assembly
-            # babysitting). The writer's doctrine (its tool/system prompt) instructs it to
-            # append ONLY a section FRAGMENT — never the page wrapper or a </body>/</html>
-            # close (the document stays open until done) — so there is no premature close to
-            # strip here; if one slips through, the plan's last-step REVIEWER reads the
-            # assembled HTML and fixes the fold by reasoning (no code edits the model's bytes).
-            size = 0
-            try:
-                rb0 = await self.hook.invoke("file_read", path=path, length=0)
-                if getattr(rb0, "ok", False) and isinstance(rb0.value, Mapping):
-                    size = int(rb0.value.get("size") or 0)
-            except Exception:  # noqa: BLE001 - size probe is best-effort
-                size = 0
-            append = size > 0
-            try:
-                res = await self.hook.invoke(
-                    "file_write", path=path, content=(("\n\n" + content) if append else content),
-                    append=append, overwrite=not append,
-                )
-            except Exception as exc:  # noqa: BLE001 - a write error is a retry signal, not a crash
-                return f"file_write failed: {exc}. Try again with the section content."
-            if not getattr(res, "ok", False):
-                return f"file_write failed: {getattr(res, 'error', '')}."
-            return (f"SECTION WRITTEN ({len(content)} chars appended). Continue with the next "
-                    "section (load its sources first), or reply DONE if the document is complete.")
-        if tool == "file_read":
-            try:
-                tail = int(a.get("tail")) if a.get("tail") not in (None, "") else self._TOOL_WRITER_READ_TAIL
-            except (TypeError, ValueError):
-                tail = self._TOOL_WRITER_READ_TAIL
-            try:
-                res = await self.hook.invoke(
-                    "file_read", path=path, tail=max(1, min(tail, self._TOOL_WRITER_READ_TAIL)),
-                )
-            except Exception as exc:  # noqa: BLE001 - a read error is non-fatal
-                return f"file_read failed: {exc}."
-            if not getattr(res, "ok", False):
-                return f"file_read failed: {getattr(res, 'error', '')}."
-            v = res.value if isinstance(res.value, Mapping) else {}
-            return f"FILE TAIL (last {v.get('bytes')} of {v.get('size')} chars):\n{v.get('text')}"
-        # d244 — FULL unrestricted self-select: the per-role writer_tools allow-list is GONE,
-        # so the writer may now call ANY tool it self-selects (file_update included). A tool
-        # this loop does not specially handle above is dispatched GENERICALLY through the
-        # on_load hook (:meth:`_dispatch_loaded_tool`, keyed on the TOOL — never a curated
-        # subset), so a writer calling file_update FIRES through the hook and WORKS instead of
-        # an 'unknown tool' no-op or a wrong-loop re-entry. A file_* write/edit is still FORCED
-        # to the single deliverable ``path`` (the single-deliverable invariant, applied
-        # uniformly to every loop, NOT a per-role restriction).
-        if tool.startswith("file_"):
-            a["path"] = path
-        return await self._dispatch_loaded_tool(tool, a)
-
-    def _parse_writer_call(self, raw: str) -> Optional[tuple[str, dict[str, Any]]]:
-        """Recover a lightweight ``(tool, args)`` WRITE call from a turn, or None.
-
-        The balanced-brace STRING fallback paired with :func:`first_native_call` for the
-        writer tools ``load_source`` / ``file_write`` / ``file_read``. A non-call turn
-        (DONE / prose) returns None → the loop ends. d244:
-        ``file_update`` is now recoverable too (the writer may self-select it under full
-        unrestricted self-select), so an E4B string-fallback file_update call also dispatches."""
-        accepted = ("read_notes", "load_source", "file_write", "file_update", "file_read")
-        s = _strip_synth_fence(raw or "").strip()
-        if not s.startswith("{"):
-            return None
-        blob = _first_json_object(s)
-        if not blob:
-            return None
-        try:
-            parsed = json.loads(blob)
-        except (ValueError, TypeError):
-            return None
-        if not isinstance(parsed, Mapping):
-            return None
-        tool = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
-        args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters")
-        if not (isinstance(tool, str) and tool.strip()):
-            for key, val in parsed.items():
-                if str(key).strip() in accepted:
-                    tool, args = str(key).strip(), val
-                    break
-        name = str(tool).strip() if isinstance(tool, str) else ""
-        if name not in accepted:
-            return None
-        if not isinstance(args, Mapping):
-            args = {
-                k: v for k, v in parsed.items()
-                if k not in ("tool", "name", "tool_name", "args", "arguments", "parameters")
-            }
-        return name, dict(args)
-
-    async def _run_synthesis(
-        self, system: Optional[str], user: str
-    ) -> tuple[Optional[str], Any, Optional[str], int]:
-        """SYNTHESIS role: author the terminal deliverable via the SHARED agentic
-        raw-content file loop (:meth:`_run_raw_file_loop`), then wrap its result in
-        the role-return tuple.
-
-        The CHOSEN filename+extension (``derive_output_path``) reaches disk, so the
-        artifact carries the requested type (cats.html, not findings.md). Returns
-        ``(raw_doc, {"output": doc, "written_path": path|None, "converged": bool},
-        None, 0)`` so the downstream ``_render_parsed`` rendering is unchanged and
-        ``run`` can surface the written path as a ``file_write`` result."""
-        # NODE-SELF-SELECT (d242 — TRUE self-select): the synthesizer SELF-SELECTS 'file'
-        # (author the deliverable) + 'research_read' (carry/cite the sources) in the raw
-        # loop's self-select front (no prime, no role->bundle table) so its doctrine
-        # arrives by LOAD (in the load observation). (The catalog advert already rides ``system``.)
-        # PLAN-CHAINING (c1b): a continuation page appends to the file an upstream
-        # writer started; otherwise the chosen filename is derived as before.
-        out_path = self._chain_continue_path or derive_output_path(
-            self._overall_goal, self.node.task, self.spec_names
-        )
-        doc, written_path, finished = await self._run_raw_file_loop(
-            system, user, out_path,
-            continue_existing=self._chain_continue_path is not None,
-            is_final=self._chain_is_final,
-        )
-        return doc, {"output": doc, "written_path": written_path, "converged": finished}, None, 0
-
-    async def _run_raw_file_loop(
-        self,
-        system: Optional[str],
-        user: str,
-        out_path: str,
-        *,
-        continue_existing: bool = False,
-        is_final: bool = True,
-    ) -> tuple[str, Optional[str], bool]:
-        """The SHARED agentic raw-content file loop — ROUTE-INDEPENDENT (d49 → d50).
-
-        A PLANNER-IN-THE-LOOP ReAct loop the ORCHESTRATION drives over the REAL file
-        tools (``reactive_tools.file_tools`` — ``file_write``/``file_read``). It is
-        called by BOTH terminal-deliverable routes so file output is reliable
-        REGARDLESS of how the planner authored the writer (d50):
-
-          * the deep-research SYNTHESIS *role* node (:meth:`_run_synthesis`);
-          * the acyclic ``web_search``->``file_write`` *tool* node
-            (:meth:`_run_file_delivery`).
-
-        MEASURED on E4B (d49): asking a small model to EMIT ``file_write``/``file_read``
-        JSON tool calls with embedded content fails for a real deliverable (0 parseable
-        calls — the same escaped-string friction as D1). So the model emits its
-        STRENGTH — RAW content sections (NO JSON, no ``format=<schema>``) — and the loop
-        ACTS ON each emission: it WRITES the section to the real file (``file_write``
-        append) and READS THE FILE BACK (``file_read`` tail), feeding the ACTUAL on-disk
-        state to the next turn. The model continues from what it actually sees and
-        signals completion with ``<<DONE>>`` — judged from the real file (ground truth),
-        not a hard-coded heuristic (d48). Even when the model one-shots the whole
-        document, the loop still WRITES it then READS IT BACK before the model confirms
-        — so read-back fires unconditionally and kills BOTH false-finish and truncation
-        (a truncated emission shows its real end on the read-back, and the next turn
-        appends the rest).
-
-        temp=0 (d35) and ``num_predict`` is floored. If the model emits nothing usable,
-        ONE raw fallback emission is salvaged AND persisted to the chosen path. With no
-        tool hook wired (offline unit callers) it degrades to that single raw emission.
-        Returns ``(doc, written_path|None, finished)`` — the deliverable text read from
-        the REAL file (ground truth), the path it landed at, and whether the loop
-        converged on a clean ``<<DONE>>``."""
-        # Off the schema role-path: drop any inherited format schema, force temp=0 for
-        # write determinism (d35), and floor num_predict so the CoT + one section never
-        # starve. ``think`` stays whatever the caller set (deep-research: think=True).
-        base_opts = dict(self._call_opts)
-        base_opts.pop("format", None)
-        base_opts["temperature"] = 0
-        base_opts["num_predict"] = max(
-            int(base_opts.get("num_predict", 0) or 0), SYNTH_NUM_PREDICT
-        )
-
-        async def emit(
-            convo: list[Mapping[str, Any]], num_predict: Optional[int] = None
-        ) -> str:
-            """ONE raw model turn (NO format schema): return the model's text verbatim.
-
-            The model emits RAW content (its strength), not a JSON tool call — so
-            there is no escaped-string friction. The loop, not the model, drives the
-            file tools."""
-            opts = dict(base_opts)
-            if num_predict is not None:
-                opts["num_predict"] = int(num_predict)
-            chain = Chain()
-            chain.use(prompt_assembly())
-            chain.use(call_stage(self.transport, **opts))
-            # PER-NODE bounded memory (d263): compact=False — the write loop already windows
-            # its own convo via _bound_chat_convo (the file on disk is the ground truth, re-fed
-            # each turn), so the convo passes through unchanged. The goal rides convo[0] ONCE
-            # and the file/read doctrine rode the get_bundles load observation ONCE (the retired
-            # pinned head + SWA tail no longer re-paste them or re-summarise the file tail).
-            history = self._node_history(
-                convo, system, compact=False,
-                reserve_predict=int(opts.get("num_predict", 0) or 0),
-            )
-            ctx = Context(system=system, history=history, transport=self.transport)
-            ctx = await run_blocking_in_span(chain.run, ctx)
-            return ctx.raw_output or ""
-
-        async def raw_emission() -> str:
-            """ONE full schema-less emission (the fallback / no-hook path)."""
-            return strip_internal_scaffolding(_strip_synth_fence(
-                await emit(
-                    [
-                        {
-                            "role": "user",
-                            "content": (
-                                user
-                                + "\n\n----\nWrite the COMPLETE deliverable now, in full, "
-                                "in the format the task asks for. Output ONLY the "
-                                "deliverable content itself — no preamble, no JSON, no "
-                                + DONE_SENTINEL + "."
-                            ),
-                        }
-                    ]
-                )
-            ))
-
-        tracer = get_tracer("agent_runtime.synthesis")
-        with tracer.start_as_current_span("synthesis.react_file") as span:
-            span.set_attribute("synthesis.node", str(self.node.id))
-            span.set_attribute("synthesis.out_path", out_path)
-
-            # No file hook (offline unit callers): degrade to a single raw emission —
-            # there is no real file to read back, but the deliverable is still produced.
-            if self.hook is None:
-                span.set_attribute("synthesis.mode", "raw_no_hook")
-                doc = await raw_emission()
-                span.set_attribute("synthesis.chars", len(doc))
-                return doc, None, False
-
-            span.set_attribute("synthesis.mode", "react_file")
-            span.set_attribute("synthesis.chain_continue", bool(continue_existing))
-            span.set_attribute("synthesis.chain_final", bool(is_final))
-
-            # d242 SELF-SELECT FRONT: this raw-emission loop drives the file tools itself
-            # (the model emits content, never tool calls), so the model has no in-loop chance
-            # to self-select. Give it one HERE — load 'file' (+ 'research_read' to cite) so
-            # the file-authoring + read doctrine arrives for the write phase, by LOAD (in the
-            # load observation) not a prime. A model that loads nothing degrades to the object
-            # floor (raw emission
-            # still produces the deliverable).
-            await self._self_select_front(system, suggest=(
-                "You are authoring a deliverable FILE, so you will need the 'file' bundle "
-                "(to write it); if you must quote or cite already-fetched sources, also load "
-                "'research_read'."))
-            span.set_attribute(
-                "synthesis.loaded_bundles", ",".join(sorted(self._loaded_bundles))
-            )
-
-            writes = 0
-            unproductive = 0
-            written_path: Optional[str] = None
-            finished = False
-            size: Any = 0
-            # s13/P2.3 (d130/d132.C): the ROOT-CAUSE structural fix for the
-            # RP-1 (d319/d311): the anchored plant/insert write scheme is RETIRED — the
-            # engine appends each authored emission VERBATIM and never modifies the model's
-            # document (the model owns coherence; the write phase ships raw model output).
-            # R1 (c1r): the chosen type drives the closing-tag well-formedness gate —
-            # but ONLY on the FINAL page (c1b). A non-final page of a multi-page chain
-            # must NOT close the document wrapper (more pages follow); the gate is
-            # deferred to the terminal page so the assembled file is closed exactly once.
-            _ext = ("." + out_path.rsplit(".", 1)[-1].lower()) if "." in out_path else ""
-            _is_html_ext = _ext in (".html", ".htm")
-            # c10 #4: a CSV deliverable is TABULAR-ONLY. The multi-turn "keep going /
-            # close with a SOURCES section listing URLs" continuation machinery (built
-            # for prose/HTML reports) injects explanatory prose + a "Source 1: https://"
-            # tail INTO the .csv. So a CSV is treated as single-shot: emit the full table
-            # in one turn, no detailed/sources nudge, accept once the rows are written.
-            _is_csv_ext = _ext == ".csv"
-            # The close-tag well-formedness GATE runs only on the FINAL page (a
-            # non-final page must leave the wrapper open); but the wrapper-closer STRIP
-            # below (c1b) keys off ``_is_html_ext`` so it fires on every NON-final HTML
-            # page, regardless of final status.
-            is_html = _is_html_ext and is_final
-            close_fix_sent = False
-            # c8 R2: the markdown/text analogue of the HTML close-gap gate. A
-            # detailed/thorough task that the model one-shots + <<DONE>> in a single
-            # turn very likely dropped a requested section + the sources list (c8r);
-            # there is no tag to balance, so detect the detailed INTENT from the task
-            # and, on a first-turn finish, send ONE continuation nudge before
-            # accepting. Scoped to a fresh single-file final deliverable (not a
-            # continuation page, which may legitimately be short).
-            md_completeness_eligible = (
-                not is_html and not _is_csv_ext and is_final and not continue_existing
-                and is_detailed_task(user)
-            )
-            md_continue_sent = False
-            # The closing instruction is only given when this page may finish the
-            # document; a non-final chain page is told to leave the wrapper open.
-            # FORMAT-NEUTRAL (d317/d319 flex): named in the format's own terms by the model
-            # (an HTML doc balances its tags; other formats have no wrapper to balance).
-            _close_clause = (
-                "close/balance every structural element you open (e.g. every HTML tag)."
-                if is_final
-                else "do NOT close the document wrapper — later parts continue it."
-            )
-
-            # PLAN-CHAINING (c1b): a CONTINUATION page resumes the file an upstream
-            # writer already started. Read the real on-disk tail and frame the model to
-            # APPEND the NEXT page/section (never re-open/re-close the wrapper, never
-            # repeat earlier pages). Mark the file already-written so the first write
-            # APPENDS (append = written_path is not None) instead of clobbering it.
-            if continue_existing:
-                tail0 = ""
-                rb0 = await self.hook.invoke("file_read", path=out_path, tail=1200)
-                if rb0.ok and isinstance(rb0.value, Mapping):
-                    tail0 = str(rb0.value.get("text") or "")
-                    size = rb0.value.get("size", size)
-                    written_path = out_path
-                # DUPLICATION RCA (live runs 2/4): a continuation node saw ONLY the
-                # 1200-char tail, so it could not know which sections already exist
-                # above the window and re-authored them (duplicate section families /
-                # repeated Sources). Feed it the document's REAL section inventory —
-                # headings read from the actual bytes (d48-clean: read-to-inform,
-                # never edited) — so "do NOT repeat" is decidable by the model.
-                existing_heads: list[str] = []
-                rb_full = await self.hook.invoke(
-                    "file_read", path=out_path, max_bytes=4_000_000
-                )
-                if rb_full.ok and isinstance(rb_full.value, Mapping):
-                    existing_heads = _section_headings(
-                        str(rb_full.value.get("text") or "")
-                    )[:40]
-                heads_block = (
-                    "SECTIONS ALREADY ON THE FILE (do NOT write any of these again):\n- "
-                    + "\n- ".join(h.strip() for h in existing_heads if h.strip())
-                    + "\n"
-                    if existing_heads
-                    else ""
-                )
-                intro = (
-                    "\n\n----\nA document is being written ACROSS PARTS; earlier "
-                    "pages/sections are ALREADY on the file.\n"
-                    + heads_block
-                    + "Its current end is:\n-----\n"
-                    f"{tail0}\n-----\nWrite the NEXT page/section NOW as RAW content in "
-                    "the document's format (real HTML tags / markdown / plain text) — NO "
-                    "JSON, no tool call, no preamble. Continue seamlessly from the end "
-                    "shown; do NOT repeat earlier content or re-cover a listed section; "
-                    "if the file already has a sources/references section, NEVER add "
-                    "another; " + _close_clause
-                    + " When THIS page/section is fully written, reply with EXACTLY "
-                    + DONE_SENTINEL + "."
-                )
-            elif _is_csv_ext:
-                # c10 #4: CSV is tabular-only and single-shot. NO multi-turn section
-                # build, NO "add a SOURCES section" nudge (that is what appended the
-                # "Source 1: https://" prose to the .csv). Ask for clean rows only.
-                intro = (
-                    "\n\n----\nWrite the deliverable as a CSV file. Output ONLY valid "
-                    "CSV — a header row, then one comma-separated data row per record, "
-                    "and NOTHING else. Do NOT add any prose, explanation, commentary, "
-                    "title, markdown, code fence, or a 'Sources' section — the file must "
-                    "be tabular data ONLY. Emit the COMPLETE table now in one turn, then "
-                    "reply with EXACTLY " + DONE_SENTINEL + " on the next turn."
-                )
-            else:
-                # d163/d165 WRITE-PHASE MANDATE (the figures+table prong): the SOURCE INDEX
-                # below carries CONCRETE FIGURES/DATES PUSHED from the real sources — the
-                # writer must USE them verbatim, or the report is hollow/plain (the a15
-                # failure). FORMAT-NEUTRAL (d317/d319 flex): the mandate names the deliverable
-                # format's OWN tabular idiom; the format-specific styling craft (e.g. the
-                # zebra/striped <table> CSS) lives in the writer SPEC (html-writer), never here.
-                _figures_mandate = (
-                    " USE THE CONCRETE FIGURES: the SOURCE INDEX below carries specific "
-                    "numbers, $ amounts, quantity counts and DATED events from the real "
-                    "sources — state them VERBATIM (exact figures and dates), never vague "
-                    "phrasing like 'significant losses'; a detailed report with no concrete "
-                    "figures is INCOMPLETE. Present the key quantitative data in the "
-                    "deliverable format's OWN tabular/structured idiom (one row per data "
-                    "point) with each row's [S#] citation. CITE EACH source you use by its "
-                    "[S#] and draw on a MAJORITY of the provided sources, not just one or two."
-                )
-                # PROMPT-POSITION (live run-8 catch, d186): the FIRST imperative wins on
-                # this model — the document-shell instruction must BE the opening
-                # imperative for a multi-part first writer, not a rider 2000 chars later.
-                _open_imperative = (
-                    "Emit the FIRST section NOW as RAW content in the final format the "
-                    "task asks for (real HTML tags / markdown / plain text)"
-                    if is_final
-                    else
-                    "You are writing the document's FIRST part. START with the format's "
-                    "DOCUMENT SHELL per your specialization — for HTML that means "
-                    "<!DOCTYPE html>, <html>, <head> with a real title + styles, <body> — "
-                    "and THEN your first section's content, all in this same turn, as RAW "
-                    "content in the final format"
-                )
-                intro = (
-                    "\n\n----\nWrite the deliverable to a file, built up ACROSS SEVERAL "
-                    "TURNS — one section per turn, not all at once. " + _open_imperative +
-                    " — NO JSON, no tool call, no preamble, "
-                    "just the content itself. Write ONE complete section this turn (start "
-                    "with the headline + introduction), then STOP and wait: after each "
-                    "section I WRITE IT to the file and show you the file's current end, so "
-                    "you continue exactly where it left off (never repeat what is already "
-                    "written). Do NOT put " + DONE_SENTINEL + " in a turn that contains "
-                    "content, and do NOT compress a detailed report into one short turn."
-                    + _figures_mandate +
-                    " CARRY THE SOURCES THROUGH: when the research above attributes facts to "
-                    "source URLs, cite them using the REAL source URLs provided VERBATIM — "
-                    "never a fabricated publication name, date, or '[Name, 2025]'-style "
-                    "placeholder, and never a URL you were not given. The DOCUMENT (not each "
-                    "part) closes with EXACTLY ONE sources/references section per your "
-                    "specialization's structure rules — write it ONLY if this part is the "
-                    "document's final part and it does not exist yet; NEVER add another if "
-                    "one is already on the file. Reply with EXACTLY "
-                    + DONE_SENTINEL + " and nothing else ONLY once "
-                    # SCOPE-FAITHFUL COMPLETION (live run-5 catch): in a MULTI-PART plan
-                    # the old whole-deliverable finish condition invited EVERY part to
-                    # write the whole report (n1 one-shot the full document; a later
-                    # node re-passed it). A non-final part finishes when ITS OWN
-                    # assigned section(s) are written; only the FINAL part owns the
-                    # whole-document completeness bar.
-                    + (
-                        "the WHOLE deliverable is on the file — for a 'detailed'/"
-                        "'thorough'/'in-depth' report that means a substantive intro, "
-                        "the full body (timeline, figures/table), the fallout/analysis, "
-                        "AND the sources are all written, not a short summary; "
-                        if is_final
-                        else
-                        # The FIRST part also OWNS the document OPEN (live run-6 catch:
-                        # with every part scoped to its own section, no part wrote the
-                        # doctype/head shell and the final close orphaned) — this fresh-
-                        # file branch IS the first writer, so it opens per its spec,
-                        # writes its part, and leaves the document open.
-                        "YOUR ASSIGNED section(s) — and ONLY those — are on the file. "
-                        "You are the document's FIRST part: BEGIN the document per your "
-                        "specialization's structure rules (its opening/head/title/styles "
-                        "for the format), then write YOUR part. Your TASK above names "
-                        "your part; write THAT part well and stop. Other sections, the "
-                        "sources list and the document's close belong to LATER parts — "
-                        "do NOT write them; "
-                    )
-                    + _close_clause + _REPORT_SEPARATION_GUIDANCE
-                )
-
-            # SOURCE-SCOPING (s9/c13, d56): for a section node carrying source_ids,
-            # append its scoped sources block at the VERY END of the turn — nearest the
-            # generation cursor — so the real figures/URLs sit inside the model's
-            # ~512-tok sliding window during this section's generation (the SWA fix).
-            # Empty for an unscoped node (degenerate 1-section / single-synth path).
-            scoped_block = self._scoped_source_block()
-            scoped_suffix = ("\n\n----\n" + scoped_block) if scoped_block else ""
-            convo: list[dict[str, Any]] = [
-                {"role": "user", "content": user + intro + scoped_suffix}
-            ]
-            # d156 GATE: the writer's FIRST user turn (the compact SOURCE INDEX + leads, no
-            # full-body dump). Bounded BECAUSE the bodies are pulled chunked via load_source —
-            # the live trace reads this to prove no served write input balloons (vs the
-            # b359a87f 81-85KB full-body dumps).
-            span.set_attribute("synthesis.user_turn_chars", len(convo[0]["content"]))
-            max_turns = SYNTH_MAX_SECTIONS + 4
-
-            async def closing_gap() -> list[str]:
-                """The missing top-level closing tags on the REAL file (HTML only)."""
-                if not is_html or written_path is None:
-                    return []
-                rb = await self.hook.invoke(
-                    "file_read", path=written_path, max_bytes=4_000_000
-                )
-                if rb.ok and isinstance(rb.value, Mapping):
-                    return html_close_gap(str(rb.value.get("text") or ""))
-                return []
-
-            async def accept_done() -> bool:
-                """Gate ``<<DONE>>``: accept it, OR (R1) send ONE close-continuation.
-
-                Before accepting the model's finish, check the REAL file for unclosed
-                top-level HTML tags (ground truth, d48-clean). If any are open and we
-                have not already nudged once, queue ONE "append only the closing tags"
-                continuation and return False (keep looping). On the markdown/text path
-                (no tags to balance), a DETAILED task finished in a single turn
-                (``writes<=1``) very likely dropped a requested section + the sources
-                list — read the real file back and queue ONE completeness continuation
-                (also once). Otherwise accept."""
-                nonlocal close_fix_sent, md_continue_sent
-                # (R1) HTML close-tag gate.
-                if not close_fix_sent:
-                    gaps = await closing_gap()
-                    if gaps:
-                        close_fix_sent = True
-                        convo.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "The document is NOT closed — it is missing the "
-                                    f"closing tag(s) {' '.join(gaps)}. Append ONLY "
-                                    f"{' '.join(gaps)} now (exactly those closing tags, "
-                                    "nothing else), then reply EXACTLY "
-                                    + DONE_SENTINEL + "."
-                                ),
-                            }
-                        )
-                        return False
-                # (R2) markdown/text first-turn completeness gate (c8). A
-                # detailed/thorough task that finished in ONE turn bypasses the per-turn
-                # continuation lever (which only fires on turn>=2); read the REAL file
-                # (ground truth, d48-clean) and nudge ONCE to finish the remaining
-                # requested parts + a Sources list. No content/citation template — the
-                # model decides what is still missing from what it actually wrote (d49).
-                if (
-                    md_completeness_eligible
-                    and not md_continue_sent
-                    and writes <= 1
-                ):
-                    md_continue_sent = True
-                    tail_text = ""
-                    if written_path is not None:
-                        rb = await self.hook.invoke(
-                            "file_read", path=written_path, tail=900
-                        )
-                        if rb.ok and isinstance(rb.value, Mapping):
-                            tail_text = str(rb.value.get("text") or "")
-                    convo.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "You signalled done after a single turn, but a "
-                                "detailed/thorough report is not complete in one pass. "
-                                "The file currently ENDS with:\n-----\n"
-                                f"{tail_text}\n-----\nContinue from exactly there (do NOT "
-                                "repeat what is shown): write any remaining requested "
-                                "parts the report is still missing — the full timeline, "
-                                "the key figures, and the analysis/fallout — AND close "
-                                "with a SOURCES section listing the FULL source URLs you "
-                                "used. Reply EXACTLY " + DONE_SENTINEL + " only once all "
-                                "of that is on the file."
-                            ),
-                        }
-                    )
-                    return False
-                return True
-
-            for _turn in range(max_turns):
-                # R2 (c1r): on the LAST allowed turn, nudge a wrap-up BEFORE the ceiling
-                # so the loop converges (emits <<DONE>> on a closed file) instead of
-                # silently churning to the cap and shipping a thin, never-finished file.
-                if _turn == max_turns - 1 and not finished and convo and convo[-1]["role"] == "user":
-                    convo[-1]["content"] += (
-                        "\n\nThis is the FINAL part — you cannot continue after this. "
-                        "Write whatever remains and CLOSE the document now (close every "
-                        "tag you opened), then reply EXACTLY " + DONE_SENTINEL + "."
-                    )
-                # d162: emit against the WINDOWED convo (system + task/index turn + recent
-                # file-tail turns). The full per-section emissions accumulate in ``convo`` but
-                # are on disk and re-fed via the bounded tail, so each served call stays well
-                # under num_ctx without losing the document (which the model continues from
-                # the tail, not from history).
-                raw = await emit(self._bound_chat_convo(convo, system))
-                convo.append({"role": "assistant", "content": raw or ""})
-                done, content = split_done_signal(_strip_synth_fence(raw))
-                # s14/a8 (d149): strip any internal context-assembly scaffolding / tool-call
-                # text the writer echoed BEFORE it is written to the file, so no
-                # "SOURCES & FINDINGS …", "ACROSS PARTS", "TOOL OUTPUT (file_write): {path}"
-                # header or literal ``file_update(...)`` call can render into the deliverable.
-                content = strip_internal_scaffolding(content).strip()
-                if content and _is_html_ext:
-                    # E4B intermittently ESCAPES a tag close as ``\>`` (e.g. ``</body\>``)
-                    # — a model output artifact, never intended in HTML. De-escape it so
-                    # the on-disk document is well-formed and the R1 close-tag gate reads
-                    # the true tag balance (one stray backslash must not survive to disk).
-                    content = content.replace("\\>", ">")
-                    # RP-2 (d319/d311, borderline-1): the MAIN-loop multi-page wrapper
-                    # hygiene (strip_wrapper_closers on non-final pages) is REMOVED. The
-                    # writer spec now makes the MODEL author ONE well-formed self-contained
-                    # artifact, so the engine no longer strips per-page wrapper CLOSE tags.
-                    # The predicate-only re-emission guard below is KEPT (it decides whether
-                    # to persist a duplicate document — it never edits the model's bytes).
-
-                if content:
-                    # RE-EMISSION GUARD (c10 #2 + c14/d59) — RP-3c (d330) OUTPUT-AGNOSTIC.
-                    # A small model nudged to "continue" an ALREADY-written deliverable often
-                    # RE-EMITS it instead of writing the next section: either it RESTARTS the
-                    # whole document/shell from the top, or it re-emits an already-written
-                    # section set. Appending that concatenates a duplicate into the file — the
-                    # defect tag-BALANCE (2 opens + 2 closes) does NOT catch. RP-3c RETIRED the
-                    # HTML-PINNED predicates (begins_html_document / top_level_html_doc_count /
-                    # the "<h1"/"<h2" string test) for FORMAT-NEUTRAL ones so the guard works
-                    # for ANY output format, not just HTML: ``document_restart`` (the new chunk
-                    # reproduces the real file's own opening) OR ``section_reemission`` (its
-                    # headings — HTML ``<h1>/<h2>`` OR Markdown ``#``/``##`` — are ALL already
-                    # on the file). This is the SAME orchestration DECISION the neuron ruled
-                    # KEEP (RP-2/d319): it only DECIDES persist/stop/nudge from the REAL file's
-                    # bytes (d48-clean) and NEVER edits the model's output. ``html_close_gap`` is
-                    # the already-output-neutral "unclosed structural container" completeness
-                    # check — [] for a balanced HTML document AND for any non-HTML/fragment file,
-                    # so a complete artifact in any format reads as done. A genuine next section
-                    # reproduces neither the opening nor an existing heading set, so it is never
-                    # dropped.
-                    if written_path is not None:
-                        rb_dup = await self.hook.invoke(
-                            "file_read", path=written_path, max_bytes=4_000_000
-                        )
-                        prior_doc = (
-                            str(rb_dup.value.get("text") or "")
-                            if rb_dup.ok and isinstance(rb_dup.value, Mapping)
-                            else ""
-                        )
-                        if prior_doc and (
-                            document_restart(content, prior_doc)
-                            or section_reemission(content, prior_doc)
-                        ):
-                            if not html_close_gap(prior_doc):
-                                # the real file already holds a complete, closed artifact →
-                                # the deliverable is done: DROP the re-emission and STOP.
-                                finished = True
-                                break
-                            # the file is not yet complete → this chunk re-emits written
-                            # content without adding the NEXT section: nudge for it, bounded.
-                            unproductive += 1
-                            if unproductive >= 2:
-                                break
-                            convo.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "Those sections are ALREADY written to the file — "
-                                        "do not repeat them. Write the NEXT, not-yet-written "
-                                        "section's real content now, or reply EXACTLY "
-                                        + DONE_SENTINEL + " if the deliverable is complete."
-                                    ),
-                                }
-                            )
-                            continue
-                    # The ORCHESTRATION acts on the emission: WRITE it to the real file
-                    # (append after the first), then READ IT BACK so the next turn sees
-                    # the ACTUAL on-disk state — read-back fires on every part, even when
-                    # the model one-shots the whole document.
-                    append = written_path is not None
-                    # RP-2 (d319/d311, borderline-1): the MAIN-loop continuation-page
-                    # wrapper-OPENER strip (strip_wrapper_openers) is REMOVED. The writer
-                    # spec now makes the MODEL author ONE well-formed self-contained artifact,
-                    # so the engine no longer strips re-emitted document-wrapper OPEN tags.
-                    # RP-1 (d319/d311): the ANCHORED plant/choose/insert/strip machinery is
-                    # RETIRED — the engine no longer plants a sentinel or does structure-aware
-                    # inserts into the model's document. Each turn's authored content is
-                    # persisted VERBATIM by appending: the MODEL authors the whole document
-                    # across its turns and the engine only relays the bytes (never modifies
-                    # them). ``append`` is False only for the very first physical write of a
-                    # fresh deliverable; every later emission appends.
-                    res = await self.hook.invoke(
-                        "file_write", path=(written_path or out_path),
-                        content=content, append=(append or writes > 0), overwrite=True,
-                    )
-                    if res.ok and isinstance(res.value, Mapping):
-                        writes += 1
-                        unproductive = 0
-                        written_path = str(res.value.get("path") or out_path)
-                        size = res.value.get("size", size)
-                        tail_text = ""
-                        rb = await self.hook.invoke("file_read", path=written_path, tail=900)
-                        if rb.ok and isinstance(rb.value, Mapping):
-                            tail_text = str(rb.value.get("text") or "")
-                            size = rb.value.get("size", size)
-                        if done:
-                            # R1: accept finish only if the real file's top-level tags
-                            # are closed; else accept_done queued ONE close-continuation.
-                            if await accept_done():
-                                finished = True
-                                break
-                            continue
-                        if _is_csv_ext:
-                            # c10 #4: a CSV is tabular-only and single-shot — the table is
-                            # on the file. Do NOT nudge for "more sections / a SOURCES
-                            # list" (that nudge is what appended the "Source 1: https://"
-                            # prose to the .csv). Accept the deliverable now.
-                            finished = True
-                            break
-                        # s15/a18 (d189): the file_write/file_read RESULT (saved-part state +
-                        # the on-disk tail) is a TOOL function-result — feed it role 'tool' so
-                        # the model treats the echoed file tail as an observation to continue
-                        # FROM, not a fresh USER turn to respond to / copy back (the
-                        # file_read-echo leak + the never-terminating multi-write loop root,
-                        # d189). The continuation DIRECTIVE that follows is a genuine
-                        # instruction and stays role 'user'.
-                        convo.append(
-                            {
-                                "role": "tool",
-                                "content": (
-                                    f"Saved part {writes}. The file is now {size} bytes; "
-                                    f"it ENDS with:\n-----\n{tail_text}\n-----"
-                                ),
-                            }
-                        )
-                        convo.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Continue the deliverable from exactly where the file "
-                                    "ENDS above — write the NEXT part as raw content (do NOT "
-                                    "repeat anything shown above). A detailed/thorough report "
-                                    "is NOT complete after a single section: keep going until "
-                                    "the full body (timeline, the key figures/table), the "
-                                    "analysis/fallout, AND a SOURCES section listing the "
-                                    "source URLs are all on the file — cite each claim's "
-                                    "source as you go using the REAL SOURCE URLS verbatim "
-                                    "(never a fabricated '[Name, 2025]' placeholder or a URL "
-                                    "not in that list). Reply with EXACTLY " + DONE_SENTINEL
-                                    + " ONLY once the WHOLE deliverable (all of those parts) "
-                                    "is on the file."
-                                ),
-                            }
-                        )
-                    else:
-                        unproductive += 1
-                        convo.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Saving failed ({getattr(res, 'error', '')!r}). "
-                                    "Re-send the next part as raw content."
-                                ),
-                            }
-                        )
-                else:
-                    # No content this turn. DONE (with something written) ends the loop;
-                    # a DONE before ANY write is rejected (an empty deliverable is never
-                    # acceptable — the only floor, NOT a structural heuristic, d48).
-                    if done and written_path is not None:
-                        # R1: same close-tag gate on a content-less DONE turn.
-                        if await accept_done():
-                            finished = True
-                            break
-                        continue
-                    unproductive += 1
-                    if unproductive >= 2:
-                        break
-                    convo.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Write the next part of the deliverable now as RAW "
-                                "content (no JSON), or reply with EXACTLY "
-                                + DONE_SENTINEL + " if every part is already on the file."
-                            ),
-                        }
-                    )
-
-                if unproductive >= 2:
-                    break
-
-            # RP-1 (d319/d311): the FINALIZE anchor-sentinel strip is RETIRED — no sentinel
-            # is ever planted, so there is nothing to strip; the on-disk document is exactly
-            # the model's authored bytes.
-            span.set_attribute("synthesis.writes", writes)
-            span.set_attribute("synthesis.finished", finished)
-            # R2 (c1r): SURFACE non-convergence — the loop hit the ceiling without the
-            # model ever signalling <<DONE>> on a closed file. Never silently shipped as
-            # a clean finish: a False here flags the trace (and rides the returned parsed
-            # so the chat layer can see the deliverable may be incomplete).
-            span.set_attribute("synthesis.converged", finished)
-            if not finished:
-                span.set_attribute("synthesis.non_convergence", True)
-
-            # RP-3c (d330): the PER-SECTION model VERIFY/REVISE self-review lane (formerly
-            # flag-gated on ``self._verify_lane``) is RETIRED. The model self-review is NOT
-            # dropped — it MOVED to the DEFINITION LAYER: the writer specs' shared
-            # ``_COHERENT_ARTIFACT_DOCTRINE`` now carries a SELF-REVIEW-BEFORE-FINISH clause, so
-            # the model re-reads its OWN artifact against the coherence + no-ungrounded-source
-            # points and grounds-or-drops any unbacked claim as the LAST part of authoring. There
-            # is no engine-run verify turn and no ``verify_lane`` boolean (d311 no-hardcoded-
-            # flags; d319 the engine authors/decides/fixes nothing about the output). A node that
-            # still wants to fact-check a specific claim mid-gather self-selects the model-driven
-            # ``cross_verify`` research tool.
-
-            # Assemble the deliverable from the REAL FILE (ground truth) — not from the
-            # model's reported sections, so the chat surfaces exactly what was written.
-            doc = ""
-            if written_path is not None:
-                rb = await self.hook.invoke(
-                    "file_read", path=written_path, max_bytes=4_000_000
-                )
-                if rb.ok and isinstance(rb.value, Mapping):
-                    doc = str(rb.value.get("text") or "")
-
-            # RP-1 (d319/d311): the SINGLE-DOCUMENT GATE (enforce_single_html_document +
-            # collapse_duplicate_sections normalization of the assembled bytes) is RETIRED —
-            # the engine no longer fixes duplicate top-level structure / repeated sections.
-            # The document ships EXACTLY as the model authored it (raw model output; the
-            # model owns single-document coherence, hardened via the writer spec in RP-2).
-
-            if not doc.strip():
-                # FALLBACK: the model never wrote a usable file — salvage ONE raw
-                # emission AND persist it so the chosen extension still lands on disk.
-                span.set_attribute("synthesis.fallback_raw", True)
-                doc = await raw_emission()
-                if doc.strip():
-                    w = await self.hook.invoke(
-                        "file_write", path=out_path, content=doc, append=False, overwrite=True
-                    )
-                    if w.ok and isinstance(w.value, Mapping):
-                        written_path = str(w.value.get("path") or out_path)
-
-            # RP-3c (d330): the whole-doc REASONING no-fabrication VERIFY/REVISE lane
-            # (formerly flag-gated on ``self._verify_lane``, is_final + chain sources) is
-            # RETIRED alongside the per-section pass above. The no-fabrication guarantee it
-            # enforced — every claim traces to a real fetched source; ground-or-drop any
-            # unbacked claim — MOVED to the DEFINITION LAYER as the SELF-REVIEW-BEFORE-FINISH
-            # clause of ``_COHERENT_ARTIFACT_DOCTRINE``: the model itself re-reads its final
-            # artifact and grounds-or-drops unbacked claims before it finishes. No engine verify
-            # turn, no ``verify_lane`` boolean, no engine rewrite of the model's bytes (d311/d319).
-
-            # RP-1 (d319/d311): three engine output-fixing / structure-authoring passes are
-            # RETIRED here — the engine authors/fixes NOTHING; the deliverable ships EXACTLY
-            # as the model authored it:
-            #   * the NO-FAB URL GUARD (``strip_ungrounded_urls``) — it deleted/unwrapped every
-            #     model-written URL not in the fetched-source set (engine editing the model's
-            #     citations). The no-ungrounded-URL guarantee moves to the writer spec in RP-2
-            #     (the model cites ONLY real fetched URLs, never invents — d310 harden-the-spec).
-            #   * the SOURCE-COVERAGE NET (``ensure_source_coverage``) — it appended an engine-
-            #     authored "Additional sources" block for planner-skipped sources.
-            #   * the DOC-STRUCTURE RECONCILE backstop (``reconcile_doc_structure``) — it
-            #     re-derived the ToC/nav, renamed duplicate ids and rebalanced the wrapper.
-            # (RP-3c/d330: the write-phase engine verify/revise lane is RETIRED above; the model
-            # self-review is now DEFINITION-LAYER — the ``_COHERENT_ARTIFACT_DOCTRINE`` self-review-
-            # before-finish clause the model runs itself. The model-driven ``cross_verify`` research
-            # TOOL a node may self-select mid-gather is a SEPARATE, still-live capability, not this lane.)
-
-            if written_path is not None:
-                span.set_attribute("synthesis.written_path", written_path)
-            span.set_attribute("synthesis.chars", len(doc))
-
-        return doc, written_path, finished
+    # AUTONOMY REBUILD P2C — the served RAW WRITE LOOP IS DELETED.
+    # _run_file_delivery, _tool_calling_writer_tool_specs, _dispatch_writer_tool,
+    # _parse_writer_call, _run_synthesis and _run_raw_file_loop (with their
+    # engine-authored riders: shell imperative, figures/table mandate, scope-faithful
+    # completion, sources-only-final, section inventory, per-turn continuation
+    # directives, is_detailed_task forced continuation, _is_csv_ext/_is_html_ext
+    # branches, strip_internal_scaffolding write-path edits) are all removed. EVERY
+    # node — write, synthesizer-terminal, gather, trivial — runs the ONE unified
+    # self-select loop; write methodology lives in the writer SPECS and the file
+    # BUNDLE doctrine; delivery is verified by the target-artifact gate; the tool
+    # boundary (sanitize_write_path, guard_write_content) is the only engine touch.
 
     async def review_and_fix(
         self,

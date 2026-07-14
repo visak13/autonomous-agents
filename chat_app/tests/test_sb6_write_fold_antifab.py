@@ -85,14 +85,28 @@ def test_write_file_shape_description_is_tool_neutral():
     assert _WRITE_FILE_SHAPE.execution == "sequential"
 
 
-# --- the write ROUTE is DELIVERY-CONTEXT DATA, not a tool/spec stamp; the puller is dead ----- #
-def test_write_route_is_delivery_context_not_spec_or_dead_puller():
+# --- AUTONOMY REBUILD P2: NO routing flag sends a write node anywhere special ------------- #
+def test_write_route_has_no_flag_every_worker_takes_the_unified_loop():
+    """SUPERSEDES the d299 delivery-context routing contract: the `deliverable_path`
+    routing flag and the legacy explicit-file_write raw-loop route are DELETED. A
+    write node is a worker like any other — it enters the unified self-select loop,
+    loads `file`/`research_read` itself and drives the file tools per its spec (the
+    live probe proved E4B tool-calls section-sized file_write reliably). This
+    self-polices that no flag-routing creeps back into SubAgent.run."""
     src = inspect.getsource(SubAgent.run)
-    # the report write route keys on the WRITE-PHASE-EXCLUSIVE deliverable_path DATA signal — NOT
-    # chain_sources (over-broad: a follow-up reader also carries it, d301) and NOT a tool/spec stamp
-    assert "self._deliverable_path" in src
+    # the deleted routing flags must NOT return (no deliverable_path routing, no
+    # raw-loop dispatch, no tool-name file route). P2C refinement: deliverable_path
+    # survives in run() ONLY as data — the synthesizer fold DEFAULTS the target
+    # (`not self._deliverable_path` guard) before entering the SAME unified loop;
+    # what stays banned is dispatching on it to an alternate execution path.
+    assert "if self._deliverable_path" not in src
+    for gone in ("_run_file_delivery", "_run_raw_file_loop", "_run_synthesis"):
+        # call-form check so retirement COMMENTS naming the methods never false-trip
+        assert f"{gone}(" not in src, f"{gone} must stay deleted from the route (P2C)"
+        assert not hasattr(SubAgent, gone), f"SubAgent.{gone} must stay DELETED (P2C)"
+    assert '"file_write", "write_file"' not in src
     # NO spec-name / spec-id conditional decides the route (code patterns, never in prose)
     for banned in ("node.spec ==", ".spec ==", "spec_id ==", "primary_spec ==", "spec_names =="):
         assert banned not in src, f"write route must not branch on {banned!r}"
-    # the prod-dead _run_tool_calling_writer PULLER is NOT dispatched (callsite removed; SB-7 cleanup)
+    # the prod-dead _run_tool_calling_writer PULLER is NOT dispatched (callsite removed)
     assert "_run_tool_calling_writer(inputs)" not in src

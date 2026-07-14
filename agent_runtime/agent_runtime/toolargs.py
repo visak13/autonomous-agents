@@ -104,13 +104,20 @@ TOOL_ARG_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "description": (
                     "a 5-field cron expression TRANSLATED from the time/cadence the "
-                    "USER actually asked for (e.g. 'every day at 8am' -> '0 8 * * *'); "
-                    "never a default time the user did not state"
+                    "USER actually asked for, keeping the EXACT minute (e.g. 'every "
+                    "day at 8am' -> '0 8 * * *'; 'daily at 13:14 UTC' -> "
+                    "'14 13 * * *'); never a default or rounded time the user did "
+                    "not state"
                 ),
             },
             "prompt": {
                 "type": "string",
-                "description": "the plan/prompt to run when the schedule fires",
+                "description": (
+                    "the WHOLE self-contained task to run each fire, INCLUDING the "
+                    "delivery action the user asked for (e.g. 'research the top AI "
+                    "news and EMAIL me a summary') — a fired run sees ONLY this "
+                    "text, so a dropped verb (like emailing) is never performed"
+                ),
             },
             "name": {"type": "string"},
         },

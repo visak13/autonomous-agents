@@ -259,7 +259,11 @@ def test_compose_write_planner_inputs_builds_goal_prior_memory_and_directive():
     assert "report.html" in write_goal
     # prior_memory = the SB-4 (summary, memory_index) pair bound to the research memory.
     assert prior_memory[0]["memory_index"] == MEM_HANDLE
-    assert prior_memory[0]["summary"].startswith("Findings: 4175 killed")
+    # P2 de-fabrication: the summary is the code-assembled bounded DIGEST (verbatim
+    # [S#] index + pull cursor), NOT the retired engine truncation of raw findings.
+    digest = prior_memory[0]["summary"]
+    assert "[S1]" in digest and "load_source" in digest
+    assert "Findings: 4175 killed" not in digest[:40]  # no raw-findings truncation
     # sources present → the per-turn source-id directive fires (the model assigns [S#]).
     assert "source_ids" in source_directive
 

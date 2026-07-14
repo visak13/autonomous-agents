@@ -266,7 +266,7 @@ def test_s13_shape_file_depth_reaches_served_route(monkeypatch, tmp_path):
     assert generic_calls and generic_calls[0]["research_depth"] == shape_depth
     # ... and the served-route trace shows it (clamped to the hard cap).
     assert dr["depth_configured"] == min(shape_depth, N4_TREE_DEPTH_CEILING)
-    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 3
+    assert dr["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 10  # P4 (owner 2026-07-13): D97's pin-3 SUPERSEDED — breadth defaults 10, tracks the shared env knob
 
 
 # --------------------------------------------------------------------------- #
@@ -300,4 +300,4 @@ def test_s13_breadth_pinned_3(monkeypatch, tmp_path):
 
     result = _run_chain(tmp_path)
 
-    assert result.deep_research["leaf_breadth"] == PLAN_CHAIN_TREE_BREADTH == 3
+    assert result.deep_research["leaf_breadth"] == 10  # P4: tracks the shared env knob (10 above)

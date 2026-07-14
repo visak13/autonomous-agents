@@ -284,9 +284,17 @@ class Tree:
             memory_index=normalize_brief_memory_index(args.get("memory_index")),
         )
         self.branches[bid] = branch
+        # BUDGET-AS-DATA (autonomy rebuild P4): the fan-out cap is VISIBLE remaining
+        # budget on every ack — the model prioritizes its highest-value expansions
+        # instead of discovering the invisible cap only after a swallowed call.
+        left = (
+            "" if self._fan_out is None else
+            f" Branch budget: {max(0, self._fan_out - self._layer_expansions)} more "
+            "expansion(s) may be kept this layer — open the most valuable ones first."
+        )
         return (
             f"OK expanded {bid} under {branch.parent}: {branch.question!r}. "
-            f"Live branches: {list(self.branches)}. Continue, or write your plan."
+            f"Live branches: {list(self.branches)}.{left} Continue, or write your plan."
         )
 
     def prune(self, args: Mapping[str, Any]) -> str:
@@ -1510,6 +1518,15 @@ class ResearchState:
         self.outline_path = self.path.parent / (self.path.stem + ".outline.jsonl")
         if not self.session_bound:
             self.outline_path.write_text("", encoding="utf-8")
+        # FRONTIER sidecar (autonomy rebuild P4): the OPEN research branches (model-authored
+        # via expand_branch / decompose, not yet gathered) persisted per decision layer. A
+        # FOLLOW-UP research plan in the same session SEEDS from these instead of
+        # re-decomposing the goal from scratch — the fix for the live prune/re-add loop
+        # (B1→B5 re-decomposed 5×, duplicates grown to B12, starved facets executed in 0
+        # of 5 epochs). Rewritten whole each layer (the frontier is current state, not a log).
+        self.frontier_path = self.path.parent / (self.path.stem + ".frontier.jsonl")
+        if not self.session_bound:
+            self.frontier_path.write_text("", encoding="utf-8")
         if self.session_bound:
             # SESSION READ-BACK (a17): rehydrate this session's prior notes + verbatim
             # sources from disk so the decision loop reasons over (and load_source can pull
@@ -1557,6 +1574,50 @@ class ResearchState:
             key = _normalize_index_url(url)
             if key and key not in self._source_url_index:
                 self._source_url_index[key] = len(self._sources)  # 1-based [S#]
+
+    def record_frontier(self, branches: Sequence[Mapping[str, Any]]) -> None:
+        """Persist the CURRENT open frontier (P4) — model-authored branches not yet gathered.
+
+        Rewritten whole each call (current state, not a log): each entry carries the
+        branch's own id/question/rationale/memory_index verbatim (the model authored
+        them; the engine records, never composes). An empty sequence CLEARS the file
+        (the model settled every concern — nothing to seed a follow-up from)."""
+        try:
+            lines = [
+                json.dumps({
+                    "id": str(b.get("id") or ""),
+                    "question": str(b.get("question") or ""),
+                    "rationale": str(b.get("rationale") or ""),
+                    "memory_index": str(b.get("memory_index") or ""),
+                }, ensure_ascii=False)
+                for b in branches
+                if str(b.get("question") or "").strip()
+            ]
+            self.frontier_path.write_text(
+                "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
+            )
+        except Exception:  # noqa: BLE001 — frontier persistence must never break a layer
+            pass
+
+    def read_frontier(self) -> list[dict[str, Any]]:
+        """Read back the persisted open frontier (P4) — [] when absent/cleared."""
+        try:
+            if not self.frontier_path.exists():
+                return []
+            out: list[dict[str, Any]] = []
+            for line in self.frontier_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa: BLE001 — skip a bad line, never fabricate
+                    continue
+                if isinstance(rec, Mapping) and str(rec.get("question") or "").strip():
+                    out.append(dict(rec))
+            return out
+        except Exception:  # noqa: BLE001
+            return []
 
     def append_outline_ops(self, ops: Sequence[Mapping[str, Any]]) -> None:
         """Append the decision layer's outline ops (add_section/drop_section) to disk (B3)."""
@@ -2499,6 +2560,28 @@ class DagGrower:
         authored child onto an INDEPENDENT research node (the layer-1 frontier gathers
         concurrently, exactly like the tree). Returns ``[]`` when the model authors no child
         → the caller keeps the unrolled whole-goal seed (never an empty research)."""
+        # P4 FRONTIER-FIRST SEED: a follow-up research plan whose session already holds
+        # an OPEN persisted frontier (branches the model authored but never gathered —
+        # a budget-cancelled wave, or a prior plan's unexecuted expansions) RESUMES
+        # those branches verbatim instead of re-decomposing the goal from scratch.
+        # This kills the live prune/re-add loop (every plan rebuilt B1→B5, duplicated
+        # to B12, and starved facets never executed). The questions are the MODEL's
+        # own earlier authorship — the engine replays, never composes. A fresh goal
+        # (no persisted frontier) keeps the decompose-first seed unchanged.
+        persisted = self.state.read_frontier()
+        if persisted:
+            nodes: list[PlanNode] = []
+            for i, rec in enumerate(persisted, start=1):
+                node = self._research_node(
+                    f"s1_F{i}",
+                    str(rec.get("question") or ""),
+                    (),
+                    memory_index=str(rec.get("memory_index") or "") or NEW_MEMORY_SENTINEL,
+                )
+                self._consumed.discard(node.id)
+                nodes.append(node)
+            if nodes:
+                return nodes
         branches = await run_decompose_node(
             self.transport,
             goal=self.goal,
@@ -2509,7 +2592,7 @@ class DagGrower:
         )
         if not branches:
             return []
-        nodes: list[PlanNode] = []
+        nodes = []
         for b in branches:
             # seed frontier nodes are INDEPENDENT (depends_on=()) so they gather concurrently;
             # the decision node reads ALL their persisted notes back (cross-layer visibility).
@@ -2517,6 +2600,13 @@ class DagGrower:
                 f"s1_{b.id}", b.question, (), memory_index=b.memory_index)
             self._consumed.discard(node.id)
             nodes.append(node)
+        # P4: the decomposed seed IS the initial open frontier — persist it so a plan
+        # cancelled before its first grow layer still hands its facets to the follow-up.
+        self.state.record_frontier([
+            {"id": b.id, "question": b.question, "rationale": b.rationale,
+             "memory_index": b.memory_index}
+            for b in branches
+        ])
         return nodes
 
     @staticmethod
@@ -2652,6 +2742,10 @@ class DagGrower:
             else:
                 # STOP — no new branch authored this layer → done (no fabricated structure).
                 self.stop_reason = "no_expansion"
+            # P4: a settled stop CLEARS the persisted frontier (nothing left to seed a
+            # follow-up plan from) — a budget stop outside this loop leaves the last
+            # recorded frontier standing, which is exactly what the follow-up resumes.
+            self.state.record_frontier([])
             return [], self.stop_reason
         # MAP each model-authored branch → a research PlanNode. GROWING VISIBILITY: depend on
         # EVERY prior node so the new layer sees all earlier findings (the §2c semantic the
@@ -2662,6 +2756,16 @@ class DagGrower:
                                 memory_index=b.memory_index)
             for b in decision.new_branches
         ]
+        # P4 FRONTIER PERSISTENCE: the branches about to be dispatched ARE the open
+        # frontier — persist them (model-authored, verbatim) so a follow-up research
+        # plan that lands before they are settled SEEDS from them instead of
+        # re-decomposing (the created-but-never-executed fix: a budget-cancelled wave
+        # is picked up by the next plan, not rebuilt as B1→B5 duplicates).
+        self.state.record_frontier([
+            {"id": b.id, "question": b.question, "rationale": b.rationale,
+             "memory_index": b.memory_index}
+            for b in decision.new_branches
+        ])
         return new_nodes, None
 
     def concern_graph(self) -> ConcernGraph:

@@ -97,43 +97,9 @@ def _json(s: str) -> str:
     return json.dumps(s)
 
 
-def test_writer_scaffolding_never_reaches_the_file(tmp_path):
-    """A writer that ECHOES its USER-turn scaffolding (and a stray tool-call) has it stripped
-    before the write, so no SOURCES & FINDINGS / TOOL OUTPUT / ACROSS-PARTS / file_update text
-    reaches the deliverable; the real content survives."""
-    leaked = (
-        "<!DOCTYPE html><html><body>\n"
-        "<h1>US-Iran Report</h1>\n"
-        "<p>Brent crude rose to $107.</p>\n"
-        "SOURCES & FINDINGS FROM PRIOR STEP n2 (use this content directly):\n"
-        "TOOL OUTPUT (file_write):\n"
-        "{'path': 'C:/proj/report.html'}\n"
-        "A document is being written ACROSS PARTS; earlier pages are on the file.\n"
-        'file_update(old="x", new="y")\n'
-        "</body></html>"
-    )
-
-    def reply(messages, **opts):
-        n = sum(1 for m in messages if m.get("role") == "assistant")
-        return leaked if n == 0 else DONE_SENTINEL
-
-    rt = AgentRuntime(
-        transport=FakeTransport([reply]), hook=_hook(tmp_path),
-        subagent_call_opts={"think": True, "temperature": 0},
-    )
-    rt.chain_sources = _SOURCES
-    dag = PlanDAG(
-        nodes=[PlanNode(id="w", task="Write the report to report.html.", tool="file_write")],
-        rationale="r", goal="Write report.html.",
-    )
-    out = _run(rt.run(dag))
-    assert out.ok
-    on_disk = open(out.results["w"].tool_value["path"], encoding="utf-8").read()
-
-    assert "Brent crude rose to $107." in on_disk            # real content kept
-    for leak in ("SOURCES & FINDINGS FROM PRIOR STEP", "TOOL OUTPUT (file_write)",
-                 "A document is being written ACROSS PARTS", "file_update(", "{'path'"):
-        assert leak not in on_disk, f"scaffolding leaked: {leak!r}"
+# AUTONOMY REBUILD P2: test_writer_scaffolding_never_reaches_the_file RETIRED — it exercised the deleted raw write loop /
+# deliverable_path routing (write nodes now run the unified self-select pull-writer;
+# see test_sb6_write_fold_antifab.py::test_write_route_has_no_flag_every_worker_takes_the_unified_loop).
 
 
 def test_strip_internal_scaffolding_unit():

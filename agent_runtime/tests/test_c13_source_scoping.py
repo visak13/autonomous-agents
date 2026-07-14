@@ -236,85 +236,14 @@ def _hook(tmp_path) -> ToolHook:
     return hook
 
 
-def test_scoped_synthesis_writes_section_to_real_file(tmp_path):
-    node = PlanNode(id="s1", task="Write the Military Losses section to report.md",
-                    role="synthesizer", source_ids=(2,))
-    section = "## Military Losses\nEach side reported losses. [Al Jazeera](https://aljazeera.com/losses)"
-    sub = SubAgent(
-        node,
-        # d242: the raw-loop SELF-SELECT front loads 'file' (then READY) before authoring.
-        transport=FakeTransport([_SS_FILE, "READY", section, "<<DONE>>"]),
-        hook=_hook(tmp_path),
-        chain_sources=_SOURCES,
-    )
-    raw, parsed, _v, _r = _run(sub._run_synthesis(None, "Write the report."))
-    written = parsed.get("written_path")
-    assert written is not None
-    text = (tmp_path / written).read_text(encoding="utf-8") if not (tmp_path / written).is_absolute() else open(written, encoding="utf-8").read()
-    assert "Military Losses" in text
-    assert "https://aljazeera.com/losses" in text  # the real cited URL landed
-
-
-# RP-3c (d330): the section 8 tests (MS3 R2 section-scoped PER-PAGE verify inside the write
-# loop) are RETIRED with the engine verify/revise lane they drove (``verify_lane`` gone). The
-# per-section no-fab self-review MOVED to the definition-layer writer doctrine; source-SCOPING
-# (which sources reach each section) is unchanged and still covered by the tests above.
-
 
 # --------------------------------------------------------------------------- #
-# SB-6/d299/d301 — a served REPORT WRITE node is now TOOL-LESS and routes to the EXISTING
-# served writer ``_run_file_delivery`` -> ``_run_raw_file_loop`` (which SELF-SELECTS
-# 'file'+'research_read') by DELIVERY-CONTEXT DATA: the runtime's ``deliverable_path``
-# (write-phase EXCLUSIVE), NOT a tool/role/spec stamp and NOT ``chain_sources`` (a follow-up
-# READER also carries chain_sources to resolve prior sources — keying the route on it was
-# over-broad, d301). The ``_run_tool_calling_writer`` PULLER is prod-DEAD (callsite removed) —
-# flagged for SB-7 cleanup. A write node WITHOUT deliverable_path that carries an EXPLICIT
-# file_write tool (the legacy acyclic web_search->file_write path) still routes to
-# ``_run_file_delivery`` via its authored tool; the scoped block is EMPTY → no body push.
+# AUTONOMY REBUILD P2C — the raw write loop behavior tests below are RETIRED.
+# The served raw-content write loop (_run_synthesis/_run_raw_file_loop/
+# _run_file_delivery and its riders: stepwise continuation, done-redirect,
+# close-continuation, is_detailed_task completeness nudge, re-emission drop,
+# csv-tabular rider) is DELETED — every node runs the unified self-select loop
+# and AUTHORS its file via file_write; delivery is verified by the
+# target-artifact gate (test_target_artifact_gate.py) and duplicate/restart
+# writes are governed at the TOOL BOUNDARY (file_write no-clobber refusal).
 # --------------------------------------------------------------------------- #
-def test_part_b_served_write_node_routes_to_file_delivery_by_deliverable_path(tmp_path):
-    sentinel = object()
-
-    async def _puller(self, inputs):
-        self._routed = "puller"
-        return sentinel
-
-    async def _raw(self, inputs):
-        self._routed = "raw"
-        return sentinel
-
-    # WITH a deliverable_path (write-phase delivery-context) → the served writer
-    # (_run_file_delivery). The node is TOOL-LESS (SB-6: no engine file_write stamp); the dead
-    # PULLER is never taken. chain_sources is fed for source resolution, but the ROUTE is on
-    # deliverable_path (d301).
-    node = PlanNode(id="w1", task="write report.html", role="worker", source_ids=(1,))
-    sub = SubAgent(node, transport=FakeTransport([]), hook=_hook(tmp_path),
-                   chain_sources=_SOURCES, deliverable_path=str(tmp_path / "report.html"))
-    sub._run_tool_calling_writer = _puller.__get__(sub)
-    sub._run_file_delivery = _raw.__get__(sub)
-    assert _run(sub.run({})) is sentinel
-    assert sub._routed == "raw"  # served writer (_run_file_delivery), NOT the dead puller
-    # the writer's source feed is the COMPACT INDEX (full_index) — no full-body push.
-    idx = sub._scoped_source_block(full_index=True)
-    assert idx and "june" not in idx.lower()  # ids/urls only, not the source body text
-
-    # A FOLLOW-UP READER carries chain_sources but NO deliverable_path → it must NOT be routed to
-    # the writer (d301 over-broad fix): it falls through to the unified loop (here, the generic
-    # produce path, since FakeTransport emits nothing) — it does NOT write a file.
-    node_r = PlanNode(id="wr", task="answer from prior research", role="worker", source_ids=(1,))
-    sub_r = SubAgent(node_r, transport=FakeTransport([]), hook=_hook(tmp_path),
-                     chain_sources=_SOURCES)  # chain_sources but NO deliverable_path
-    sub_r._run_tool_calling_writer = _puller.__get__(sub_r)
-    sub_r._run_file_delivery = _raw.__get__(sub_r)
-    _run(sub_r.run({}))
-    assert getattr(sub_r, "_routed", None) is None  # NOT routed to any writer loop
-
-    # WITHOUT deliverable_path but WITH an explicit file_write tool (legacy acyclic path) → the raw
-    # loop via the authored tool; scoped block is EMPTY (no push).
-    node2 = PlanNode(id="w2", task="write hello.txt", role="worker", tool="file_write")
-    sub2 = SubAgent(node2, transport=FakeTransport([]), hook=_hook(tmp_path))
-    sub2._run_tool_calling_writer = _puller.__get__(sub2)
-    sub2._run_file_delivery = _raw.__get__(sub2)
-    assert _run(sub2.run({})) is sentinel
-    assert sub2._routed == "raw"
-    assert sub2._scoped_source_block() == ""  # no sources → no body push on the raw path
