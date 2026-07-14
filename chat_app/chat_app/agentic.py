@@ -2940,17 +2940,28 @@ async def _run_generic_loop(
         # P3 GROUNDED FINALIZE: the write reviewer's model-authored status prose (what the
         # artifact ACTUALLY contains) rides the finalize call's memory_index input, so the
         # summary claims what was reviewed-in, never bare counts (kills the overclaiming).
+        # ACYCLIC PARITY (Gate-4 catch): the summary-as-chat-turn rule below keyed only
+        # on the WRITE-plan deliverable, so an acyclic run that wrote a real file still
+        # pushed its terminal node's whole document into the chat turn. When the acyclic
+        # route's model wrote a file via file_write, that file IS the deliverable —
+        # surface its (model-chosen) name to the synthesizer and apply the same rule.
+        # A chat-style acyclic answer (no file written) keeps its node-output response.
+        acyclic_written = (
+            _written_filename(acyclic_result) if produced == "acyclic" else ""
+        )
+        syn_out_name = out_name or acyclic_written
         agentic.synthesis_summary = await _run_terminal_synthesizer(
-            plane=plane, query=query, out_name=out_name, sources=sources,
+            plane=plane, query=query, out_name=syn_out_name, sources=sources,
             write_dag=write_dag, plans_authored=plans_authored, span=span,
             planner=reasoning_planner, overall_goal=overall_goal,
             reviewer_status=write_reviewer_prose,
         )
         # P3 CHAT TURN = SUMMARY + DOWNLOAD CARD (owner decision): when a file deliverable
-        # exists, the persisted chat response is the model-authored finalize SUMMARY; the
-        # document itself stays artifact-only (the artifact list drives the download card).
-        # A run with no fresh deliverable keeps its honest node-output response unchanged.
-        if deliverable_doc and out_name and agentic.synthesis_summary:
+        # exists (write-plan read-back OR an acyclic model-written file), the persisted chat
+        # response is the model-authored finalize SUMMARY; the document itself stays
+        # artifact-only (the artifact list drives the download card). A run with no fresh
+        # deliverable keeps its honest node-output response unchanged.
+        if (deliverable_doc or acyclic_written) and syn_out_name and agentic.synthesis_summary:
             agentic.final_response = agentic.synthesis_summary
         return agentic
 

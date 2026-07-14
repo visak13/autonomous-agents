@@ -103,9 +103,12 @@ self-select loop: it starts tool-less with `get_bundles` + `finish`, loads `file
 1. **Global workspace collision** — the file sandbox is app-global; identical
    model-chosen filenames leak across chats/runs. Needs per-chat namespacing (hook is
    built once at app boot). The two P2 gates make this honest, not fixed.
-2. **Acyclic route parity** — deliverable-target data, the target gate, and the
-   summary+card chat turn only cover the plan-chain route; the acyclic edit path
-   bypasses all three (Gate 4).
+2. **Acyclic route parity** — *partially fixed post-Gate-4*: the summary+card chat
+   turn now also applies when an acyclic run wrote a real file (`_written_filename`
+   keys the swap), so the whole-document-in-chat leak is closed on both routes.
+   Still open: acyclic nodes carry no deliverable-target data (so the target gate
+   never arms there) and the acyclic artifact body is the node's text output, not
+   the file's read-back bytes.
 3. **Follow-up artifact resolution** — a follow-up edit task does not reliably locate
    the prior artifact (Gate 4 n1: 10 failed attempts against an existing file);
    the conversation memory should hand the follow-up the artifact's real path/handle.
