@@ -13,6 +13,52 @@ or update the doc with a recorded decision; do not let them silently drift.
 
 ---
 
+## 0. The CoT-autonomy contract (2026-07-16 — supersedes any conflicting text below)
+
+The owner's ruling after live-trace review: **the model's own chain of thought drives
+the work; nothing spoon-feeds it.** No engine or tool text may command the next action
+("search done, now fetch"), script a bundle/tool sequence, or re-prompt a conclusion
+(all bounce-gates are deleted). Every behavior lives in exactly ONE owning text layer:
+
+| Layer | Owns | Single home |
+|---|---|---|
+| Identity | who the agent is + channel protocol ([TOOL RESULT] envelope, JSON-only-when-asked) | `llm_framework/transport.py AGENT_IDENTITY` |
+| Operating protocol | reason → ONE tool call → observe → … → finish; bootstrap via get_bundles | `bundles/base.py AGENT_OPERATING_PROTOCOL`, injected once per node system turn |
+| Role | one drive statement per role (worker / reviewer / synthesizer) | `roles.py ROLE_FRAMINGS` |
+| Shape | planner-only, step-by-step plan-AUTHORING strategy | `shapes/*.toml decompose_methodology` |
+| Specialization | how to drive a brief to its output (business logic + quality bar) | `specialization/seed.py` |
+| Bundle doctrine | domain knowledge, delivered once on the get_bundles LOAD ack | `bundles/*.py own_doctrine` |
+| Tool description | what the tool does + how to use it well | ToolDef / spec `description` |
+| Tool output | FACTS only — state, counts, caps, cursors, error_kind, real candidates | handlers / observation builders |
+| Engine | orchestration, messaging, resource caps — zero instructional text | runtime / agentic |
+
+Key consequences (each enforced by `agent_runtime/tests/test_no_steering_strings.py`
+over the single registry `scripts/promptlab/retired_strings.py`):
+
+- The first user turn carries only the brief + run DATA (a declared `DELIVERABLE
+  FILE`, nothing else); the fetch budget is stated on the research-bundle load ack —
+  the moment of relevance — never on every brief.
+- The gather-more / note / target-artifact bounce-gates are DELETED. Honesty is
+  downstream: the persistence-side staleness guard (unchanged bytes ⇒ no artifact),
+  truthful trace attrs, and the reviewer node reading the real file.
+- The write-plan strategy (one write node + one same-spec `final_review`, source-id
+  assignment, ground-or-drop) is the write-file SHAPE's methodology — not engine text.
+- The research review is a PLANNER-BRIEFED node: `Planner.author_review_brief` writes
+  its brief, it pulls from the research memory with the gather workers' specs, and its
+  prose is the single signal `decide_followup` reasons over (`review_research` is
+  deleted).
+- Channel robustness is not steering: a tool-shaped reply that breaks strict JSON gets
+  a parse-error FACT, and an unambiguous multi-KB call with one bad escape is
+  recovered verbatim (`_lenient_content_call`) — the model's own bytes, never composed.
+- Prompt texts are validated with `scripts/promptlab/run_batch.py` — live batches per
+  module, graded from traces including the model's captured thinking; a text ships at
+  zero failures in a batch.
+
+Sections below predating this contract remain accurate for structure (nouns, loops,
+memory) but any nudge/gate/directive wording they describe is historical.
+
+---
+
 ## 1. The core nouns (do not conflate them)
 
 | Concept | What it is | What it is NOT |
