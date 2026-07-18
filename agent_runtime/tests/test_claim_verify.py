@@ -228,12 +228,11 @@ def _research_node() -> PlanNode:
                     role="worker", tool="web_search", tool_args={"query": "iran"})
 
 
-def test_research_gather_more_deflagged_forces_fetch(tmp_path):
-    """RP-3c (d330): the no-fab gather-more gate is DE-FLAGGED (no ``verify_lane`` boolean).
-    A research-bundle node that answers FROM MEMORY (0 fetches) is STILL force-gathered — it
-    then searches + reads a real source before its findings are accepted. The gate now fires
-    on the output-agnostic signal alone (research bundle self-selected + answered-from-memory
-    + under cap), the correct flag-free always-on end-state."""
+def test_memory_answer_is_accepted_unbounced(tmp_path):
+    """CoT-autonomy P3 (owner ruling): the no-fab GATHER-MORE bounce-gate is DELETED. A
+    research-bundle node that answers from memory (0 fetches) is ACCEPTED on that turn —
+    the engine never re-prompts a conclusion. Grounding discipline lives in the research
+    specs/doctrine, and a 0-fetch gather surfaces honestly in the trace attrs."""
     hook = _FakeHook("https://news.un.org/iran")
     transport = _MemoryThenGatherTransport()
     agent = SubAgent(
@@ -242,13 +241,9 @@ def test_research_gather_more_deflagged_forces_fetch(tmp_path):
         call_opts={"think": False, "temperature": 0},
     )
     res = _run(agent.run({}))
-
-    # the memory answer was rejected; the stage actually fetched a real source — WITHOUT any
-    # flag being passed (the gate is now the flag-free default).
-    assert hook.fetches == ["https://news.un.org/iran"]
-    assert res.tool_value is not None and res.tool_value["fetched_count"] == 1
-    assert "180 missiles" in (res.output or "")  # the grounded findings, not the memory one
-
+    # the FIRST (memory) answer stood; no forced fetch ever happened.
+    assert hook.fetches == []
+    assert (res.output or "").strip() != ""
 
 class _MemoryNoBundleTransport:
     """Answers FROM MEMORY on the FIRST turn WITHOUT ever self-selecting the research bundle —

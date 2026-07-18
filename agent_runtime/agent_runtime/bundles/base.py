@@ -45,17 +45,31 @@ _FINISH_SPEC: dict[str, Any] = make_tool_spec(
     [],
 )
 
-# The universal doctrine every bundle inherits — the agentic-loop discipline + the
-# RAW-content / lightweight-args rule (d49/d50.1). Kept SHORT (d38 prompt-quality).
-_BASE_DOCTRINE = (
-    "You are an autonomous agent operating a small, well-described TOOLSET. Work "
-    "ITERATIVELY: reason → call ONE tool → observe the REAL result it returns → "
-    "reason again → … → finish. Ground every step on what the tools ACTUALLY "
-    "return, never on memory or assumption. The CONTENT you produce is RAW text "
-    "(prose / HTML / code / CSV — whatever the task asks), never wrapped in JSON; "
-    "tool calls carry only lightweight arguments (a filename, a query, a url, a "
-    "done marker). When the task is genuinely done, call finish."
+# THE OPERATING PROTOCOL (CoT-autonomy P1) — the ONE per-node anchor for how an
+# autonomous agent drives the tool layer. Injected ONCE into every role-carrying
+# node's SYSTEM turn by ``SubAgent._compose_system`` (its single owner), so a node
+# that has not yet loaded any bundle still knows how to operate; the bundle-load
+# observation carries only each capability's OWN doctrine. It sequences NOTHING —
+# the model's reasoning decides every next action; this states only the channel
+# (one tool call or raw output) and the loop shape.
+AGENT_OPERATING_PROTOCOL = (
+    "OPERATING PROTOCOL. You solve your task by driving a small, well-described "
+    "toolset. Work iteratively: reason, make ONE tool call, observe the real "
+    "result, reason again — and call finish when the task is genuinely done. "
+    "Every reply is EXACTLY ONE of:\n"
+    '- a single tool-call JSON object {"tool": "<name>", "args": {...}} — nothing else; or\n'
+    "- your work product as RAW text (prose / HTML / code / CSV — whatever the "
+    "task asks), never wrapped in JSON.\n"
+    "You start with only get_bundles and finish. The bundle catalog lists the "
+    "capability domains available; loading a bundle returns its tools and their "
+    "usage doctrine. Tool results are facts about what happened — YOU decide what "
+    "to do next. Tool calls carry only lightweight arguments (a filename, a "
+    "query, a url); the content you produce is never wrapped in JSON."
 )
+
+# Back-compat alias (the pre-P1 name; compose_doctrine no longer folds it — the
+# protocol's single owner is the system turn).
+_BASE_DOCTRINE = AGENT_OPERATING_PROTOCOL
 
 
 class ObjectBundle:

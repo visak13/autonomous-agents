@@ -62,6 +62,19 @@ class _ScriptedReasoning:
         usr = " ".join(
             str(m.get("content", "")) for m in messages if m.get("role") == "user"
         )
+        if "briefing its REVIEW node" in sys:
+            # P6: the engine review_research method is retired — the planner AUTHORS
+            # the review node's brief, and the node's prose is the review signal.
+            self.calls.append("author_review_brief")
+            return ChatResult(role="assistant", content=(
+                "Review the gathered research against the goal; report coverage, "
+                "gaps and the data's shape honestly."))
+        if "ROLE: REVIEWER" in sys:
+            # the P6 review NODE's model-authored prose — the single review signal.
+            self.calls.append("review_node_turn")
+            return ChatResult(role="assistant", content=(
+                "The research covers 5 facets; complex data. Coverage is sufficient "
+                "to support the deliverable; nothing material is missing."))
         if "LAST-STEP REVIEWER" in sys and "research_complete" in sys:
             self.calls.append("review_research")
             return ChatResult(role="assistant", content=json.dumps(
@@ -137,8 +150,17 @@ def _install_report_fakes(monkeypatch):
         calls["write_event"] = kw.get("write_planning_event")
         return PlanDAG(nodes=[], goal=query), _FakeWriteResult()
 
+    async def fake_review_node(goal, **kw):
+        # P6: the planner-briefed review NODE runs on the real runtime in production;
+        # this offline harness (empty registry/hook) fakes its model-authored prose,
+        # like the other phases. The prose IS the review signal (SB-5).
+        calls["review_node"] = calls.get("review_node", 0) + 1
+        return ("The research covers 5 facets; complex data. Coverage is sufficient "
+                "to support the deliverable; nothing material is missing.")
+
     monkeypatch.setattr(agentic, "_run_generic_research_phase", fake_generic)
     monkeypatch.setattr(agentic, "run_section_write_phase", fake_write)
+    monkeypatch.setattr(agentic, "_run_research_review_node", fake_review_node)
     return calls
 
 
@@ -167,11 +189,11 @@ def test_research_seed_drives_research_then_write_then_done_with_real_stages(mon
     assert result.deep_research["plans_authored"] == ["research", "write"]
     assert result.deep_research["engine"] == "generic-unroll"
     # the REAL reasoning stages fired (not the retired pure-fns / hardcoded loop)
-    assert transport.calls.count("review_research") == 1
+    assert calls.get("review_node") == 1  # P6: the briefed review node ran once
     assert transport.calls.count("decide_followup") == 2   # after research, after write
     assert transport.calls.count("finalize_summary") == 1  # the LLM terminal summary
     # the research reviewer's data-complexity handoff reached the write planner (d237)
-    assert calls["write_event"]["data_complexity"] == "5 facets; complex"
+    assert "5 facets; complex" in calls["write_event"]["data_complexity"]  # P6: review prose
     assert calls["write_event"]["memory_handle"] == "research_xyz"
     # the terminal synthesizer streamed + announced (its LLM summary is on the result)
     assert EVENT_RUN_SYNTHESIS in plane.kinds

@@ -438,10 +438,12 @@ def make_file_write(root: Path):
         target = _safe_resolve(path, root)
         existed = target.exists()
         if existed and not append and not overwrite:
+            # Fact-only refusal (CoT-autonomy P2): the state + the parameter contract
+            # (what append/overwrite mean is tool-contract data, not a next action).
+            size_now = target.stat().st_size
             raise ToolInputError(
-                f"{path!r} already exists — refusing a silent overwrite. To CONTINUE "
-                "the document, resend the SAME call with append=true; to REPLACE the "
-                "whole file, resend with overwrite=true."
+                f"{path!r} already exists ({size_now} bytes); nothing was written. "
+                "append=true adds to the existing file; overwrite=true replaces it."
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode(encoding)
@@ -452,11 +454,9 @@ def make_file_write(root: Path):
             # First step (create/open) or a full (over)write — both land here; an
             # empty ``content`` simply creates/truncates the file at the chosen name.
             target.write_bytes(data)
-        # TOOL-AUTHORED result note (eda-base3 tool-framing discipline; replaces the
-        # retired engine per-turn continuation riders): the structured result itself
-        # carries the file's REAL current tail + the neutral next-action cursor, so
-        # the model sees exactly where the file stands without any engine loop
-        # steering. Read from actual bytes; states facts, decides nothing.
+        # TOOL-AUTHORED result note (eda-base3 tool-framing discipline), CoT-autonomy
+        # P2: PURE STATE — the file's size, how this write landed, and the real on-disk
+        # tail as the cursor. No action menu: the model reasons its own next step.
         size = target.stat().st_size
         tail = ""
         try:
@@ -465,6 +465,7 @@ def make_file_write(root: Path):
                 tail = fh.read().decode(encoding, errors="replace")
         except OSError:  # pragma: no cover - tail is advisory, never fails the write
             tail = ""
+        landed = "created" if not existed else ("appended" if append else "overwritten")
         return {
             "path": str(target),
             "bytes": len(data),
@@ -472,12 +473,7 @@ def make_file_write(root: Path):
             "mime": mime_for_path(str(target)),
             "size": size,
             "appended": bool(append and existed),
-            "note": (
-                f"file is now {size} bytes and ends with:\n…{tail}\n"
-                "Continue it (file_write append=true), correct a span "
-                "(file_update), read it back (file_read), or finish if the "
-                "deliverable is complete."
-            ),
+            "note": f"file is now {size} bytes ({landed}) and ends with:\n…{tail}",
         }
 
     return file_write
@@ -525,8 +521,9 @@ def make_file_update(root: Path):
             # "nothing matched", never a silent no-op that masquerades as an applied edit
             # (and never a guessed region: a wrong structural edit is worse than a no-op).
             raise ToolInputError(
-                f"file_update found no exact occurrence of the 'old' snippet in {path!r} — "
-                "re-read the exact on-disk text (whitespace/newlines included) and resend it"
+                f"file_update found no exact occurrence of the 'old' snippet in {path!r}; "
+                "the file was not changed. Matching is exact — whitespace and newlines "
+                "included."
             )
         n = occurrences if int(count) <= 0 else min(int(count), occurrences)
         updated = text.replace(old, new, n)
@@ -576,10 +573,15 @@ def build_filesystem_tools(root: Optional[Path | str] = None) -> list[ToolDef]:
         name="file_write",
         description=(
             "Write a text file into the workspace at the filename+extension YOU choose "
-            "(.md/.txt/.csv/.html/...). Stepwise: call with just a path to create the "
-            "file, then with content (append=True to add sections). HARD-SANDBOXED: "
-            "REFUSES any path escaping the workspace root (.., absolute, symlink). "
-            "Returns {path, bytes, created, mime, size, appended}."
+            "(.md/.txt/.csv/.html/...). A document accumulates part by part: the first "
+            "call opens it, each later call with append=true adds the next part; an "
+            "existing file is never silently overwritten (overwrite=true replaces it). "
+            "Keep each call's content to ONE bounded part (roughly a section) — a very "
+            "large single call is fragile in the tool-call channel and can fail to "
+            "parse, losing the write. The result reports the file's real size and tail. "
+            "HARD-SANDBOXED: REFUSES any path escaping the workspace root (.., "
+            "absolute, symlink). Returns {path, bytes, created, mime, size, appended, "
+            "note}."
         ),
         args_model=FileWriteArgs,
         handler=make_file_write(base),

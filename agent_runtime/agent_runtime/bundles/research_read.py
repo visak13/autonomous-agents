@@ -30,26 +30,27 @@ from .base import ObjectBundle
 #      so you learn which source has what without pulling any verbatim text.
 #   2. load_source (EXPENSIVE) ONLY for the exact figure/quote you will CITE word-for-word.
 # Capability doctrine (how to operate the two read tools), not a role identity.
+# CoT-autonomy P4: cost KNOWLEDGE, not a prescribed call sequence — the model
+# reasons its own read strategy from the economics.
 _READ_DOCTRINE = (
-    "SOURCE READING (cost hierarchy) — never write a fact from memory of a source. READ on two "
-    "tiers, cheap first: (1) call read_notes FIRST — it returns each already-fetched [S#] "
-    "source's NOTE gist (summary, key_claims and open gaps), so you learn WHICH source holds the "
-    "figure or angle you need for the cost of almost nothing; (2) THEN call load_source only for "
-    "the source that holds an EXACT figure, date or quotation you will cite — it pulls that "
-    "source's bounded verbatim text on demand (sid='S3' for its lead, or chunk='S3.c2' for a "
-    "specific section). Cite every figure to the real [S#] / URL it came from, and cite ONLY "
-    "[S#] ids that appear in the SOURCE INDEX. When the section's source budget is spent "
-    "load_source tells you to write now from what you have already loaded; do so rather than "
-    "stalling."
+    "SOURCE READING (cost hierarchy) — never write a fact from memory of a source. Two "
+    "read tiers exist: read_notes is the CHEAP leg — each already-fetched [S#] source's "
+    "note gist (summary, key_claims, open gaps), which tells you WHICH source holds the "
+    "figure or angle you need for almost nothing; load_source is the EXPENSIVE leg — it "
+    "pulls ONE source's bounded verbatim text (sid='S3' for its lead, chunk='S3.c2' for "
+    "a specific section), most useful for the exact figure, date or quotation you will "
+    "cite word-for-word. Cite every figure to the real [S#] / URL it came from, and cite "
+    "ONLY [S#] ids that appear in the SOURCE INDEX. load_source reports when the "
+    "section's source budget is spent."
 )
 
 # Native schema for read_notes — the CHEAP first leg (handler built per-run via make_read_notes_tool).
 _READ_NOTES_SPEC: dict[str, Any] = make_tool_spec(
     "read_notes",
-    "CHEAP — call FIRST. Read the article-note gist of the already-fetched sources: each [S#] "
-    "source's summary, key_claims and open gaps, so you learn WHICH source has what WITHOUT "
-    "pulling verbatim text. read_notes() for the index of every source, or read_notes(sid='S3') "
-    "for one. THEN load_source only the [S#] that holds the exact figure/quote you will cite.",
+    "CHEAP — the inexpensive first leg of source reading. Returns the article-note gist "
+    "of the already-fetched sources: each [S#] source's summary, key_claims and open "
+    "gaps, so you learn WHICH source has what WITHOUT pulling verbatim text. "
+    "read_notes() for the index of every source, or read_notes(sid='S3') for one.",
     {"sid": {"type": "string"}},
     [],
 )
@@ -58,11 +59,12 @@ _READ_NOTES_SPEC: dict[str, Any] = make_tool_spec(
 # via load_source_tool / make_load_source_tool; this is the inspectable surface).
 _LOAD_SOURCE_SPEC: dict[str, Any] = make_tool_spec(
     "load_source",
-    "EXPENSIVE — use read_notes first. Load the verbatim text of ONE already-fetched source on "
-    "demand, by its [S#] id (sid='S3' for its lead, or chunk='S3.c2' for a specific section), "
-    "ONLY for an exact figure/quote you will cite. Returns a bounded verbatim excerpt; when the "
-    "section's source budget is spent it returns a 'write now from what you loaded' note. Cite "
-    "only [S#] ids from the SOURCE INDEX.",
+    "EXPENSIVE — the costly second leg of source reading (read_notes is the cheap "
+    "index). Loads the verbatim text of ONE already-fetched source on demand, by its "
+    "[S#] id (sid='S3' for its lead, or chunk='S3.c2' for a specific section) — most "
+    "useful for an exact figure, date or quote you will cite word-for-word. Returns a "
+    "bounded verbatim excerpt and reports when the section's source budget is spent. "
+    "Cite only [S#] ids from the SOURCE INDEX.",
     {"sid": {"type": "string"}, "chunk": {"type": "string"},
      "max_chars": {"type": "integer"}},
     ["sid"],

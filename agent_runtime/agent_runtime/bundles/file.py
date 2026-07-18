@@ -84,7 +84,13 @@ _FILE_DOCTRINE = (
     "load the research bundle (get_bundles name=\"research\") and use image_search — an <img> "
     "src must be an image_url COPIED VERBATIM from an image_search result. NEVER write a "
     "placeholder, invented or relative image path (placeholder_*.jpg is a defect); if no "
-    "real image was found, OMIT the image and say so in the surrounding text."
+    "real image was found, OMIT the image and say so in the surrounding text. "
+    "REVIEWING AN EXISTING FILE (P4 — the reviewer's file mechanics): read it in bounded "
+    "regions (file_read offset/length, or tail=N for the end) rather than one whole-file "
+    "blob; verify its claims against sources you can pull on demand; fix a defect with a "
+    "targeted file_update on the exact span — ground-or-remove: a claim no source backs is "
+    "corrected or removed, never invented around. Targeted edits, never a whole-document "
+    "re-emission."
 )
 
 

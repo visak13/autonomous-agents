@@ -120,8 +120,9 @@ def test_research_read_bundle_advertises_both_read_tools():
 def test_read_doctrine_sequences_cheap_first_and_owns_only_the_read_domain():
     doctrine = ResearchReadBundle().own_doctrine
     low = doctrine.lower()
-    # read_notes FIRST, then load_source.
-    assert "read_notes first" in low
+    # P4: cost KNOWLEDGE (cheap vs expensive), not a prescribed call sequence — the
+    # cheap leg is still presented before the expensive one.
+    assert "cheap" in low and "expensive" in low
     assert low.index("read_notes") < low.index("load_source")
     # research_read is the READ domain — it does NOT gather (no search/fetch here).
     assert "search" not in low and "web_fetch" not in low

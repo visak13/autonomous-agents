@@ -55,9 +55,6 @@ from .tracing import get_tracer, run_blocking_in_span
 
 from .article_note import coerce_article_note
 from .chunked_read import chunked_read as _chunked_read
-from .claim_verify import (
-    research_answered_from_memory,
-)
 from .research_tree import (
     first_native_call,
     make_tool_spec,
@@ -109,6 +106,7 @@ from .bundles import (
     expand_bundle,
     get_bundle,
 )
+from .bundles.base import AGENT_OPERATING_PROTOCOL
 from .bundles.file import REPORT_SEPARATION_GUIDANCE as _REPORT_SEPARATION_GUIDANCE
 # SoC ENGINE-THIN (SA-5/d254): the web URL/article/readability/record DISPATCH+INGEST
 # semantics are OWNED by the web bundle now; the engine imports the bundle's adapter +
@@ -333,99 +331,106 @@ _SEED_BUDGET_FRACTION = RESEARCH_SEED_BUDGET_FRACTION
 # ReAct loop NEVER re-pastes that doctrine into the per-turn task message — that was a pure
 # ~400-500-token-per-prompt duplication (trace 620d38fa); d263 further retired the pinned-head
 # copy, so the doctrine now rides the load observation ONCE and nothing re-pastes it.
-_RESEARCH_NUDGE = (
-    "Reply with EITHER a single tool-call JSON object (to search or fetch), OR your "
-    "FINDINGS as plain prose — nothing else."
+# CoT-autonomy P1: ONE fact-only recovery line for an unusable turn (no tool call,
+# no output). The reply channel's two legal forms live in the OPERATING PROTOCOL on
+# the system turn (single owner); this observation only states what happened.
+_UNUSABLE_TURN_NOTE = (
+    "Your last reply was neither a single tool-call JSON object nor your final output."
 )
-# The bundle-NEUTRAL twin (autonomy rebuild P2): a worker that did NOT load the
-# research bundle (e.g. a writer driving file tools) gets format guidance only —
-# never research vocabulary.
-_WORKER_NUDGE = (
-    "Reply with EITHER a single tool-call JSON object (one of the tools you loaded), "
-    "OR your final output as plain prose — nothing else."
+# Back-compat aliases (call sites collapsed to the one neutral note).
+_RESEARCH_NUDGE = _UNUSABLE_TURN_NOTE
+_WORKER_NUDGE = _UNUSABLE_TURN_NOTE
+# CoT-autonomy P3: the finalize prompts are a RESOURCE FACT — the loop is ending;
+# what a good conclusion looks like is the spec's knowledge, not a per-turn command.
+_TURN_BUDGET_NOTE = (
+    "Turn budget exhausted — this is your final turn; no further tool call will "
+    "execute."
 )
-_RESEARCH_FINALIZE = (
-    "Stop searching. Write your FINDINGS now as plain prose, drawn from the sources you "
-    "have already read — the key facts and figures, each attributed to its source URL, and "
-    "end with a line naming WHAT IS STILL MISSING or UNVERIFIED so the next layer can pursue "
-    "it. Output ONLY the findings (no JSON, no preamble)."
-)
-_WORKER_FINALIZE = (
-    "Turn budget reached. Emit your final output now as plain prose — what you completed "
-    "and anything left undone. Output ONLY that (no JSON, no preamble)."
-)
-# s9/N5 (d62/c15 part-e): the no-fabrication GATHER-MORE nudge — sent when a research
-# stage that self-selected the gather bundle wrote substantive findings with ZERO real
-# fetches (it answered FROM MEMORY; E4B does this on the bare ReAct path). The model MUST
-# search + read a real source before its findings are accepted. RP-3c (d330): this gate is
-# DE-FLAGGED — an output-agnostic no-fab research-grounding orchestration, no ``verify_lane``
-# boolean. Bounded by ``_RESEARCH_GATHER_MORE_MAX`` (NON-FLOW): a genuinely unfetchable topic
-# cannot loop forever — after the budget the findings stand (the writer-doctrine self-review
-# is what grounds-or-drops any remaining unbacked claim).
-_RESEARCH_GATHER_MORE_MAX = 2
+# Back-compat aliases (both call sites collapsed to the one budget fact).
+_RESEARCH_FINALIZE = _TURN_BUDGET_NOTE
+_WORKER_FINALIZE = _TURN_BUDGET_NOTE
+# CoT-autonomy P3 (owner ruling): the no-fab GATHER-MORE bounce-gate is DELETED —
+# no engine turn re-prompts a conclusion. Grounding lives in the research spec.
 
-# TARGET-ARTIFACT gate bound (autonomy rebuild P2): how many times a node with a
-# declared deliverable file may be bounced for concluding without writing it before
-# its prose findings are accepted anyway (honest failure downstream, never a loop).
-_TARGET_GATE_MAX = 2
-_RESEARCH_GATHER_MORE = (
-    "You answered from MEMORY — you fetched NO real source. A research task may NOT be "
-    "answered from memory: every fact must come from a source you actually read. SEARCH "
-    "now and FETCH at least one relevant result URL (up to {fetch_cap} fetches), THEN "
-    "write your findings from what you read. Reply with ONE tool-call JSON object "
-    '({{"tool":"web_search",...}} or {{"tool":"web_fetch",...}}) — nothing else.'
-)
-# s9/N2 (d60/c15 part-b): the per-article CONTROL-NOTE clause, appended to the research
-# instruction ONLY when ``emit_article_notes`` is enabled (default OFF → byte-identical
-# to N1). It asks the agent to record a SHORT structured note after reading each source
-# — a lightweight control record (like the c5 tool args), NOT the deliverable document
-# (content stays RAW, d50.1). The note steers the NEXT search via ``gaps_or_followups``.
-_RESEARCH_NOTE_CLAUSE = (
-    "\n\nYou are GATHERING evidence — your job this phase is to search, read, and NOTE. Do "
-    "NOT write the final report or any HTML/Markdown deliverable now (it is authored in a "
-    "LATER phase); even if your spec describes an output format, that format applies to that "
-    "later write phase, not to this gathering. "
-    "After you READ a source (web_fetch), record a SHORT note about it before moving "
-    "on — reply with ONLY this JSON and nothing else:\n"
-    '  {"tool": "note", "args": {"url": "<the source URL you just read>", '
-    '"summary": "<2-3 sentence summary>", "category": "<topic>", '
-    '"source_trust": "primary|secondary|reference-untrusted", '
-    '"key_claims": ["<short fact>", "..."], "relevance": "<why it serves the goal>", '
-    '"gaps_or_followups": ["<what to search next>", "..."]}}\n'
-    "ALWAYS fill gaps_or_followups with what this source did NOT settle — the unanswered "
-    "question, the figure it left unverified, the angle to search next. That field is the GAP "
-    "LANE that DIRECTS the next research layer, so it must not be empty while the facet is still "
-    "open. Keep the note SHORT — it STEERS your next search; it is NOT the final answer. Treat "
-    "Wikipedia as reference-untrusted (citable only if attributed, never sole backing)."
-)
-# s15/a6 (d182) — the MESSAGE-CHAINING lever for the gap lane is now the RESEARCH bundle's
-# web_fetch OUTPUT-MESSAGE OVERRIDE (d221): the research CONTEXT overrides web_fetch's
-# observation to prompt the model to record the note at the EXACT moment it has just read a
-# source (the just-in-time chain), instead of jumping straight to findings (the measured
-# notes=0 cause: E4B treats the separate note turn as optional, d79/d122). The text lives in
-# :data:`~agent_runtime.bundles.research.WEB_FETCH_NOTE_OVERRIDE` (single source of truth);
-# the runtime sources it from the LOADED research bundle
-# (:meth:`SubAgent._fetch_output_override`), so a plain (non-research) context gets no note
-# message and the served research path is byte-identical (research is always loaded there).
-# s15/a27 (d199 follow-on) — the NOTE GATE. The note ack + the fetch note override (a25/d199) made the
-# note RIGHT-MOMENT and role:'user'-visible, but on live Gemma the model still fetches ONE source
-# and jumps STRAIGHT to findings, skipping the (still optional) note — measured on trace
-# 1427f176 (the US-Iran report): every single-fetch research node emitted notes=0, so the
-# write-from-notes substrate (d184) and the gap lane go empty (the exact "research not used
-# downstream" data gap). When the lane is ON and the model tries to FINALISE with a fetched-but-
-# un-noted source, push it back to record THAT source's note first — bounded (``note_gate_max``,
-# ~fetch_cap) so an unwilling model cannot loop, and the salvaged findings still stand if it never
-# re-emits them. Robust feedback, NOT a seatbelt (the model authors the note); OFF (lane disabled)
-# the whole block is skipped → byte-identical to the pre-fix path.
-_RESEARCH_NOTE_GATE = (
-    "Before you finish: you READ <{title}> ({url}) but have NOT recorded its note yet "
-    "({remaining} read source(s) still un-noted). A SHORT structured note must land for EVERY "
-    "source you read — its key_claims and, crucially, gaps_or_followups (what it did NOT settle) "
-    "are the GAP LANE that directs the next research layer AND the substrate the report is "
-    'written from. Record it now — reply with ONLY {{"tool":"note","args":{{"url":"{url}", '
-    '...}}}} for THIS source. One note per turn; once every read source has a note, write your '
-    "FINDINGS."
-)
+# CoT-autonomy P3: the TARGET-ARTIFACT bounce-gate is DELETED (owner ruling).
+# Delivery honesty is downstream: the staleness guard + truthful deliverable_bytes.
+
+# MALFORMED TOOL-CALL feedback bound (CoT-autonomy P2): how many tool-shaped-but-
+# unparseable replies get the parse-error fact before the reply stands as prose.
+_MALFORMED_CALL_MAX = 3
+# CoT-autonomy P3: the per-run NOTE CLAUSE and the NOTE GATE are DELETED — note
+# discipline's owners are the note tool description + the research doctrine.
+
+
+
+def _unescape_lenient(s: str) -> str:
+    """Decode standard JSON string escapes, passing an INVALID escape through verbatim
+    (the tolerant half of the lenient tool-call recovery — never raises)."""
+    out: list[str] = []
+    i = 0
+    mapping = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/",
+               "b": "\b", "f": "\f"}
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n in mapping:
+                out.append(mapping[n])
+                i += 2
+                continue
+            if n == "u" and i + 6 <= len(s):
+                try:
+                    out.append(chr(int(s[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+            # invalid escape: keep the model's bytes verbatim
+            out.append(c)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _lenient_content_call(raw: str) -> Optional[tuple[str, dict]]:
+    """CHANNEL-ROBUSTNESS recovery (CoT-autonomy P6, live promptlab catch): a
+    tool-shaped reply carrying a MULTI-KB ``content`` string frequently breaks strict
+    JSON on a single bad escape (E4B one-shots whole documents), and the model retries
+    the same shape after the parse-error fact — losing the write entirely. When the
+    call's INTENT is unambiguous ({"tool": …, "args": {… "content": "…" …}}), recover
+    it: small fields via exact matches, the content span VERBATIM with a tolerant
+    unescape. The recovered bytes are the model's own — nothing is composed or fixed;
+    this is the tool channel accepting its own format leniently, like any real
+    function-calling runtime. Returns None when the shape is not unambiguous."""
+    # The trailing close tolerates a MISSING outer brace (a live failure mode: the
+    # model truncates the final '}' on a multi-KB call).
+    m = re.match(
+        r'\s*\{\s*"tool"\s*:\s*"([A-Za-z_]\w*)"\s*,\s*"args"\s*:\s*\{(.*?)\}?\s*\}\s*$',
+        raw, re.S,
+    )
+    if not m:
+        return None
+    tool, body = m.group(1), m.group(2)
+    if '"content"' not in body:
+        return None
+    args: dict[str, Any] = {}
+    for k in ("path", "sid", "url", "reason"):
+        km = re.search(r'"%s"\s*:\s*"([^"\n]*)"' % k, body)
+        if km:
+            args[k] = km.group(1)
+    for k in ("append", "overwrite"):
+        km = re.search(r'"%s"\s*:\s*(true|false)' % k, body)
+        if km:
+            args[k] = km.group(1) == "true"
+    cm = re.search(
+        r'"content"\s*:\s*"(.*)"(?=\s*(?:,\s*"\w+"\s*:|\s*$))', body, re.S,
+    )
+    if not cm:
+        return None
+    args["content"] = _unescape_lenient(cm.group(1))
+    return tool, args
 
 
 def _first_json_object(text: str) -> Optional[str]:
@@ -1467,13 +1472,23 @@ class SubAgent:
         try:
             result = handler(name=name)
         except Exception as exc:  # noqa: BLE001 - self-select must never crash a node
-            return (f"get_bundles failed: {exc}. Call get_bundles with no arguments to list "
-                    "the bundles, then load the one you need.")
+            # Fact-only (CoT-autonomy P2): the failure + the no-args list contract
+            # (get_bundles' own description carries its usage).
+            return f"get_bundles failed: {exc}. Called with no arguments it lists the bundles."
         if "loaded" in result:
-            tools = ", ".join(result.get("tools") or []) or "(none)"
-            obs = (f"Loaded bundle '{result['loaded']}'. Its tools are now available: "
-                   f"{tools}. Use them now to do your task; load another bundle only if you "
-                   "still need a capability you have not loaded.")
+            loaded_tools = list(result.get("tools") or [])
+            tools = ", ".join(loaded_tools) or "(none)"
+            obs = f"Loaded bundle '{result['loaded']}'. Tools now available: {tools}."
+            # PER-RUN DATA AT THE MOMENT OF RELEVANCE (P3/promptlab catch): the web
+            # fetch budget is stated when the bundle providing the fetch tool loads —
+            # never on every brief, where it nudged non-gather nodes into gathering.
+            # Keyed on the TOOL the bundle provides (data), not a bundle-name switch.
+            if self._fetch_tool in loaded_tools:
+                cap = (
+                    self._read_search_max_fetch
+                    if self._read_search_max_fetch > 0 else RESEARCH_DEFAULT_FETCH_CAP
+                )
+                obs += f" Web fetch budget this task: {cap} sources."
             # d263: the bundle's DOCTRINE (its how-to: the research ReAct loop, the file
             # author/read doctrine, …) rides this LOAD observation ONCE — delivered in-band
             # when the node self-selects the bundle, carried forward by the convo window —
@@ -1487,9 +1502,9 @@ class SubAgent:
         listing = "; ".join(f"{r['name']} ({r['summary']})" for r in rows) or "(none)"
         err = result.get("error")
         prefix = f"{err}. " if err else ""
-        return (f"{prefix}Bundles you can load — {listing}. Call "
-                "get_bundles(name=\"<NAME>\") to LOAD the one your task needs, then use its "
-                "tools.")
+        # Fact-only (P2): catalog rows + the load syntax as a contract fact.
+        return (f"{prefix}Bundles available — {listing}. "
+                'get_bundles(name="<NAME>") loads one.')
 
     # How many turns a RAW-emission loop (file-delivery / synthesis) may spend SELF-SELECTING
     # its bundles before the write phase. Small — a node typically loads 1-2 bundles.
@@ -1507,8 +1522,7 @@ class SubAgent:
         try:
             res = await self.hook.invoke(tool, **dict(args))
         except Exception as exc:  # noqa: BLE001 - a tool call must not crash the node
-            return (f"{tool} is not available — load its bundle with get_bundles first, or "
-                    f"answer from what you have ({exc}).", None)
+            return (f"'{tool}' failed: {exc}.", None)
         if not getattr(res, "ok", False):
             return (f"{tool} returned no usable result: {getattr(res, 'error', '')}.", None)
         return (f"{tool} result: {res.value}", res.value)
@@ -2015,9 +2029,10 @@ class SubAgent:
         the note's ``gaps_or_followups`` so the next turn can search those angles (the
         artifact DIRECTING the next search)."""
         if not fetched:
+            # Fact-only (P2): the state; a note's contract lives in its description.
             return (
-                "Record a NOTE only AFTER you web_fetch and READ a source. "
-                "Search or fetch a source first."
+                "Note not recorded: no source has been read this task — a note "
+                "records a source you actually read."
             )
         want = str(args.get("url") or args.get("link") or "").strip()
         src, idx = fetched[-1], len(fetched) - 1  # default: the source just read
@@ -2031,20 +2046,16 @@ class SubAgent:
             url=str(src.get("url") or ""), title=str(src.get("title") or ""),
         )
         if note is None:
-            return (
-                "Note not recorded (malformed). Continue: read another source or write "
-                "your FINDINGS."
-            )
+            return "Note not recorded: malformed arguments."
         notes.append(note.model_dump())
         followups = "; ".join(note.gaps_or_followups) or "none noted"
+        # Fact-only (P2): the recorded state + coverage counts + this note's gap lane.
+        # What findings should look like is the research spec/doctrine's knowledge.
+        noted_ids = {int(n.get("source_id") or 0) for n in notes}
         return (
-            f"Note recorded for <{note.title or note.url}> (trust: {note.source_trust}). "
-            f"Open follow-ups: {followups}. Continue: read another source, search a new "
-            "angle for those follow-ups, or — once every read source is noted — write your "
-            "FINDINGS as SUBSTANTIVE PROSE (the actual facts, figures, dates, and quotes you "
-            "found, with their sources). Do NOT reply with a meta-sentence such as 'the report "
-            "is complete' or 'research is done' — that is not findings; write the findings "
-            "themselves."
+            f"Note recorded for <{note.title or note.url}> (trust: {note.source_trust}) — "
+            f"{len(noted_ids)} of {len(fetched)} read source(s) now have notes. "
+            f"This note's open follow-ups: {followups}."
         )
 
     async def _run_research_loop(self, inputs: Mapping[str, Any]) -> "SubAgentResult":
@@ -2110,37 +2121,22 @@ class SubAgent:
         # placeholder, since the bundle text is shared and run-agnostic), and the article-note
         # clause when note emission is enabled (N2 — a separate operational instruction).
         base_user = self._compose_task(inputs, None)
-        # SB-RR (d293): the operational suffix is ROLE-NEUTRAL + TASK-DRIVEN — the SAME unified
-        # worker loop now serves gather / research-follow-up / trivial nodes, so it must not
-        # force a 'research' load. A node whose SPEC/task is to GATHER reads the 'to gather …'
-        # clause and self-selects research; a follow-up self-selects research_read; a trivial
-        # node reads 'if your task needs no tool, just write your answer' and answers in one
-        # turn. You start with no domain tools until you self-select them.
-        operational = (
-            "Self-select the bundle(s) your task needs via get_bundles before using their "
-            "tools — you start with no domain tools until you load them. To GATHER evidence "
-            "from the live web, FIRST call get_bundles(name=\"research\") for your search/fetch "
-            "tools, then search, read the real sources, and write your FINDINGS; call "
-            "get_bundles(name=\"research_read\") to read a fetched source or notes you saved "
-            "earlier this session. If your task needs no tool, just write your answer directly. "
-            f"When gathering you may web_fetch up to {fetch_cap} of the source URLs you find "
-            "this round."
-        )
-        if self._emit_article_notes:
-            operational += _RESEARCH_NOTE_CLAUSE
-        # PURE DELIVERY (d299 DP2 — the same ruling as chat_app's _normalize_write_dag):
-        # a node with a DECLARED deliverable target whose task does not already name it
-        # is told WHERE to write — the file name is delivery data (tool dispatch), never
-        # methodology. Reached by the folded SYNTHESIZER terminal (its acyclic-plan task
-        # rarely names the derived file); write-plan tasks already carry the name.
+        # CoT-autonomy P3: the operational suffix is RUN DATA only. The bundle-selection
+        # script (the gather-first tool sequence it used to dictate) and the
+        # article-note clause are DELETED — how to
+        # operate lives in the OPERATING PROTOCOL (system turn), which bundles serve
+        # what in the catalog advert, and note discipline in the note tool description +
+        # research doctrine. What remains is the declared deliverable file (delivery
+        # data, d299 DP2 — a fact, never a load-this-then-do-that sequence). The
+        # concrete FETCH CAP now rides the research-bundle LOAD ack instead (delivered
+        # at the moment of relevance — a live promptlab catch: naming a web-fetch
+        # budget on every brief nudged WRITE nodes into gathering).
+        operational = ""
         if self._deliverable_path and self._deliverable_path not in (self.node.task or ""):
-            operational += (
-                f" Your deliverable is the FILE '{self._deliverable_path}' — load the "
-                'file tools (get_bundles(name="file")) and write it there.'
-            )
+            operational = f"DELIVERABLE FILE: '{self._deliverable_path}'."
         convo: list[dict[str, Any]] = [{
             "role": "user",
-            "content": base_user + "\n\n" + operational,
+            "content": (base_user + "\n\n" + operational) if operational else base_user,
         }]
         fetched: list[dict[str, str]] = []
         notes: list[dict[str, Any]] = []  # per-article CONTROL notes (N2; additive)
@@ -2156,20 +2152,14 @@ class SubAgent:
         # model RE-GROUNDS (robust tool feedback, not a hard seatbelt).
         offered_urls: set[str] = set()
         searches = fetches = unproductive = 0
-        gather_more = 0  # N5: how many times we forced a 0-fetch stage to gather (bounded)
-        # s15/a27 — NOTE-GATE state: how many times we forced a fetched-but-un-noted source to be
-        # noted before accepting findings, bounded by note_gate_max (~fetch_cap so every read
-        # source can be reached), and the salvaged findings the model already wrote (used if a
-        # gate-driven model never re-emits them, so the gate never DISCARDS real findings).
-        note_gate = 0
-        note_gate_max = max(2, fetch_cap) if self._emit_article_notes else 0
+        # CoT-autonomy P3: the gather-more / note-gate / target-artifact bounce state is
+        # DELETED with the gates. ``wrote_target`` survives as trace DATA only (whether
+        # a write-shaped result landed on the declared target — read by the span attrs).
         pending_findings = ""
         findings = ""
-        # TARGET-ARTIFACT gate state (autonomy rebuild P2, Gate-2e lesson): whether any
-        # write-shaped tool result landed on this node's declared deliverable path, and
-        # how many times a no-write conclusion was bounced (bounded like the other gates).
         wrote_target = False
-        target_gate = 0
+        # MALFORMED-CALL channel feedback bound (CoT-autonomy P2).
+        malformed_calls = 0
 
         # The turn ceiling rises proportionally with the fetch cap so a high-breadth
         # gather can read MANY sources without the flat ceiling clipping it (N1). A
@@ -2184,11 +2174,11 @@ class SubAgent:
             RESEARCH_MAX_TURNS, fetch_cap + RESEARCH_SEARCH_HEADROOM + note_budget
         ) + 2
         # DELIVERABLE headroom (autonomy rebuild P2): a node writing a declared file
-        # spends turns on pulls (read_notes/load_source) plus one file_write per part
-        # plus the target-gate bounces — the gather-sized ceiling would clip a whole-
-        # document write loop. Data-gated on the declared target; still a NON-FLOW cap.
+        # spends turns on pulls (read_notes/load_source) plus one file_write per part —
+        # the gather-sized ceiling would clip a whole-document write loop. Data-gated
+        # on the declared target; still a NON-FLOW cap.
         if self._deliverable_path:
-            max_turns += _TARGET_GATE_MAX + 8
+            max_turns += 10
 
         tracer = get_tracer("agent_runtime.research")
         with tracer.start_as_current_span("research.react") as span:
@@ -2239,129 +2229,67 @@ class SubAgent:
                         raw = _fin_text
                     call = None
                 # TRUE self-select guard (d242): a gather tool the node has NOT yet loaded is
-                # not callable — the string parser can name one before its bundle is loaded,
-                # so nudge the model to self-select first instead of dispatching it.
+                # not callable — the string parser can name one before its bundle is loaded.
+                # Fact-only (P2): state what is loaded; the protocol + catalog own the how.
                 if call is not None and call[0] not in accepted:
                     span.set_attribute(f"research.turn.{turn + 1}.tool", "unloaded")
-                    convo.append({"role": "user", "content": (
-                        f"You have not loaded the tool '{call[0]}' yet. Self-select its bundle "
-                        "first via get_bundles (e.g. get_bundles(name=\"research\") for "
-                        "web search/fetch tools), then use it.")})
+                    convo.append({"role": "tool", "content": (
+                        f"'{call[0]}' is not loaded — no loaded bundle provides it. "
+                        f"Currently loaded tools: {', '.join(accepted) or '(none)'}.")})
                     continue
+                # MALFORMED TOOL CALL (CoT-autonomy P2, live promptlab catch): a reply
+                # that LOOKS like a tool call ({"tool": …) but parses as nothing must
+                # not be silently accepted as findings — that is the engine MISREADING
+                # the model (a 9KB file_write with one escaping slip became "findings"
+                # and the write was lost). Report the real parse error as a TOOL fact —
+                # channel feedback, not a next-action command; the model decides how to
+                # recover (retry, smaller parts, different form). Bounded: after
+                # _MALFORMED_CALL_MAX the reply stands as prose (never an infinite loop).
+                # LENIENT RECOVERY first (P6): an unambiguous tool-shaped reply whose
+                # big content string broke strict JSON is recovered verbatim — the
+                # model's own bytes dispatch instead of dying to a parse error.
+                if call is None and '"tool"' in (raw or "").lstrip()[:40]:
+                    _len_call = _lenient_content_call(raw or "")
+                    if _len_call is not None and _len_call[0] in accepted:
+                        call = _len_call
+                        span.set_attribute(
+                            f"research.turn.{turn + 1}.lenient_parse", True
+                        )
+                if call is None and '"tool"' in (raw or "").lstrip()[:40]:
+                    if malformed_calls < _MALFORMED_CALL_MAX:
+                        malformed_calls += 1
+                        try:
+                            json.loads(raw)
+                            perr = "parsed as JSON but not as a {tool, args} call"
+                        except Exception as exc:  # noqa: BLE001 — the error IS the data
+                            perr = f"{type(exc).__name__}: {str(exc)[:140]}"
+                        span.set_attribute(
+                            f"research.turn.{turn + 1}", "malformed_call"
+                        )
+                        convo.append({"role": "tool", "content": (
+                            "That reply was NOT dispatched: it looks like a tool call "
+                            f"but is not valid JSON ({perr})."
+                        )})
+                        continue
                 if call is None:
                     # No tool call → the model wrote its FINDINGS (RAW prose) = done.
                     findings = _strip_synth_fence(raw or "").strip()
+                    # CoT-autonomy P3 (owner ruling — no babysitting): the three bounce-
+                    # gates that re-prompted a conclusion here (no-fab GATHER-MORE, the
+                    # NOTE GATE, the TARGET-ARTIFACT gate) are DELETED. The model's own
+                    # conclusion stands; a postcondition failure surfaces HONESTLY
+                    # downstream instead (the persistence-side staleness guard ships no
+                    # stale artifact, deliverable_bytes stays truthful, and the reviewer
+                    # node reads the real file). The burden moved to the operating
+                    # protocol + tool descriptions + specs, iterated in promptlab.
                     if findings:
-                        # NO-FAB GATHER-MORE: substantive findings with ZERO real fetches =
-                        # answered FROM MEMORY (E4B does this on the bare ReAct path) — a
-                        # no-fabrication FAILURE. Force the stage to actually search+read a real
-                        # source before accepting, bounded so an unfetchable topic cannot loop
-                        # forever. RP-3c (d330): DE-FLAGGED — this is a no-fab research GROUNDING
-                        # ORCHESTRATION (it forces a real fetch; it never edits the model's
-                        # bytes), the SAME KEEP-class as the re-emission guard (RP-2 ruling). It
-                        # no longer hangs off a ``verify_lane`` boolean; the served-route→always-
-                        # on expansion is the correct flag-free end-state (d65: flag-off gating
-                        # was BUILD SCAFFOLDING). It stays narrowly signal-gated on OUTPUT-AGNOSTIC
-                        # conditions only, so a legitimate non-gathering worker is never touched.
-                        if (
-                            # SB-RR (d293): the no-fab GATHER-MORE gate fires ONLY for a node
-                            # that actually self-selected the GATHER bundle. The unified worker
-                            # loop also serves trivial/follow-up workers that legitimately
-                            # answer WITHOUT fetching — they must NEVER be force-gathered. Gating
-                            # on the SELF-SELECTED ``research`` bundle (not a role) is what makes
-                            # "answered from memory with zero fetches" a failure only when the
-                            # node was supposed to gather.
-                            BUNDLE_RESEARCH in self._loaded_bundles
-                            and gather_more < _RESEARCH_GATHER_MORE_MAX
-                            and research_answered_from_memory(findings, fetches)
-                        ):
-                            gather_more += 1
-                            findings = ""
-                            span.set_attribute(
-                                f"research.turn.{turn + 1}", "gather_more"
-                            )
-                            convo.append({
-                                "role": "user",
-                                "content": _RESEARCH_GATHER_MORE.format(fetch_cap=fetch_cap),
-                            })
-                            continue
-                        # s15/a27 NOTE GATE: a structured note must LAND for (nearly) every
-                        # fetched source before the findings are accepted (the d199 follow-on:
-                        # the role/chain fix made noting POSSIBLE; this makes it HAPPEN). A note
-                        # carries source_id = its 1-based position in ``fetched``; any fetched
-                        # source whose position has no note yet is un-noted. Force the FIRST such
-                        # source to be noted (naming it explicitly), bounded by note_gate_max.
-                        # Salvage the findings the model wrote so a re-prompted model that keeps
-                        # noting never loses them. OFF (note_gate_max == 0) → skipped entirely.
-                        if note_gate < note_gate_max:
-                            noted_ids = {int(n.get("source_id") or 0) for n in notes}
-                            missing = [
-                                (i, f) for i, f in enumerate(fetched, start=1)
-                                if i not in noted_ids
-                            ]
-                            if missing:
-                                note_gate += 1
-                                pending_findings = findings  # salvage; never discard real findings
-                                findings = ""
-                                _, src = missing[0]
-                                span.set_attribute(
-                                    f"research.turn.{turn + 1}", "note_gate"
-                                )
-                                convo.append({"role": "user", "content": _RESEARCH_NOTE_GATE.format(
-                                    title=src.get("title") or src.get("url") or "the source",
-                                    url=src.get("url") or "",
-                                    remaining=len(missing),
-                                )})
-                                continue
-                        # TARGET-ARTIFACT ACCEPTANCE GATE (autonomy rebuild P2 — the
-                        # Gate-2e lesson): the node's plan declared a deliverable FILE
-                        # (``deliverable_path`` — model-named via name_deliverable and
-                        # stamped by the write phase as DATA, never an engine regex),
-                        # but the node is concluding without EVER having written it.
-                        # Live Gate-2e: the one-node write plan answered turn 1 with
-                        # the whole document as PROSE — never loaded the file bundle —
-                        # and the run then shipped a STALE file from a previous session.
-                        # Same KEEP-class as the no-fab GATHER-MORE gate above: it
-                        # verifies a planner-declared postcondition with an actionable
-                        # TOOL error; it never edits or composes the model's bytes.
-                        # Bounded; on exhaustion the prose findings stand and the
-                        # persistence layer reports honestly that no file was produced.
-                        if (
-                            self._deliverable_path
-                            and not wrote_target
-                            and target_gate < _TARGET_GATE_MAX
-                            # P3: a REVIEWER verifies/fixes the deliverable — it is not
-                            # the node that must PRODUCE it, so a clean-artifact review
-                            # legitimately concludes with no write (role = planner data).
-                            and self.node.role != ROLE_REVIEWER
-                        ):
-                            target_gate += 1
-                            pending_findings = findings  # salvage; never discard prose
-                            findings = ""
-                            span.set_attribute(
-                                f"research.turn.{turn + 1}", "target_gate"
-                            )
-                            convo.append({"role": "tool", "content": (
-                                f"ERROR: nothing has been written to "
-                                f"'{self._deliverable_path}' — text in this "
-                                "conversation is NOT saved to disk, so finishing now "
-                                "delivers NOTHING. Load the file tools first: "
-                                'get_bundles(name="file"). Then write your document '
-                                f"to '{self._deliverable_path}' with file_write, and "
-                                "finish only after the write is acknowledged."
-                            )})
-                            continue
                         span.set_attribute(f"research.turn.{turn + 1}", "findings")
                         break
                     unproductive += 1
                     if unproductive >= 2:
                         break
-                    # Bundle-aware wording: research vocabulary only for a node that
-                    # actually loaded the research bundle (autonomy rebuild P2).
-                    convo.append({"role": "user", "content": (
-                        _RESEARCH_NUDGE if BUNDLE_RESEARCH in self._loaded_bundles
-                        else _WORKER_NUDGE
-                    )})
+                    # ONE fact-only recovery line for an unusable turn (P1).
+                    convo.append({"role": "user", "content": _UNUSABLE_TURN_NOTE})
                     continue
                 tool, args = call
                 if tool == self._note_tool:
@@ -2423,15 +2351,15 @@ class SubAgent:
                         )
                         cand = "\n".join(f"- {u}" for u in list(offered_urls)[:8])
                         convo.append({"role": "tool", "content": (
-                            f"ERROR: <{want}> was NOT in the search results — do not invent or "
-                            "guess a URL. web_fetch ONLY a url COPIED VERBATIM from the search "
-                            f"results. Choose one of:\n{cand}"
+                            f"web_fetch refused <{want}> [ungrounded_url]: this URL was "
+                            "not returned by any search this task; only returned URLs "
+                            f"load. URLs actually returned include:\n{cand}"
                         )})
                         continue
                     if fetches >= fetch_cap:
                         convo.append({"role": "tool", "content": (
-                            f"ERROR: fetch limit ({fetch_cap}) reached. Write your FINDINGS "
-                            "now from the sources you have read."
+                            f"web_fetch refused [fetch_limit]: {fetch_cap} of {fetch_cap} "
+                            "fetches used this task; no further fetch will execute."
                         )})
                         continue
                 obs = await self._dispatch_research_tool(
@@ -2451,10 +2379,8 @@ class SubAgent:
                 convo.append({"role": "tool", "content": obs})
 
             # Fallback: the model never wrote findings (kept calling tools / stalled) →
-            # salvage ONE final emission grounded in whatever it has read. s15/a27: if the NOTE
-            # GATE held findings the model already wrote (it spent its remaining turns recording
-            # notes), reuse them verbatim instead of forcing another generation — the gate must
-            # never cost the model its real findings.
+            # ONE final emission after the turn-budget FACT (P3: the note states only
+            # that the loop is ending; the spec owns what a conclusion looks like).
             if not findings and pending_findings:
                 findings = pending_findings
             if not findings:
@@ -2472,7 +2398,6 @@ class SubAgent:
             span.set_attribute("research.sources", len(fetched) + len(records))
             span.set_attribute("research.records", len(records))
             span.set_attribute("research.notes", len(notes))
-            span.set_attribute("research.gather_more", gather_more)  # N5 no-fab forces
             span.set_attribute("research.chars", len(findings))
 
         # Attach the read sources so a downstream node grounds in them (d17). The
@@ -2544,6 +2469,11 @@ class SubAgent:
         turn, with the shaping framing + ruleset (+ role) below it."""
         role = self.node.role
         framing = role_framing(role) if role else None
+        # CoT-autonomy P1 — THE OPERATING PROTOCOL rides the SYSTEM turn once per
+        # role-carrying node (its single owner): a node that has not yet loaded any
+        # bundle still knows the reason→act→observe loop and the reply channel. The
+        # model's reasoning sequences the work; the protocol states only the channel.
+        protocol = AGENT_OPERATING_PROTOCOL if role else ""
         # NODE-SELF-SELECT (d221): advertise the bundle catalog in every ROLE-carrying
         # node's system prompt (the in-plan agent roles: researcher/worker/reviewer +
         # the terminal synthesizer) so the model can REASON about which capability
@@ -2553,10 +2483,12 @@ class SubAgent:
         # (back-compat). Appended LAST so it sits closest to the task.
         catalog = self._bundle_catalog_advert() if role else ""
         if not self.spec_body:
-            # bare step (identity only) or bare-role call (identity + framing).
-            body = "\n\n".join(p for p in (framing, catalog) if p) or None
+            # bare step (identity only) or bare-role call (identity + protocol + framing).
+            body = "\n\n".join(p for p in (protocol, framing, catalog) if p) or None
             return with_identity(body)
         base = f"{_SHAPING_FRAMING}\n\n{self.spec_body}"
+        if protocol:
+            base = f"{protocol}\n\n{base}"
         shaping = f"{base}\n\n{framing}" if framing else base
         if catalog:
             shaping = f"{shaping}\n\n{catalog}"

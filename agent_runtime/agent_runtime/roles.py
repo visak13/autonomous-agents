@@ -81,63 +81,31 @@ READ_NOT_DESCRIBE = (
 # position framing injected into the task (see POSITION_FRAMINGS) — the two
 # compose: the generic worker posture here + the specific research/critic/verify
 # behavior in the task.
+# CoT-autonomy P1 — MINIMAL ROLE DRIVE STATEMENTS. A role says what the node is FOR;
+# it never scripts HOW (the methodology lives in the node's specialization(s), domain
+# knowledge in the bundle doctrine/tool descriptions, the loop in the operating
+# protocol). The retired researcher/reviewer/synthesizer how-to bodies moved to those
+# owners (P4); ROLE_RESEARCHER (retired role, back-compat) maps to the worker drive.
+_WORKER_DRIVE = (
+    "ROLE: WORKER. Work your brief through to its finished output, following your "
+    "specialization ruleset(s) as the business logic. Produce the deliverable "
+    "itself — no meta-commentary, no preamble."
+)
+
 ROLE_FRAMINGS: dict[str, str] = {
-    ROLE_WORKER: (
-        "ROLE: WORKER. Do the task directly and completely, following your "
-        "specialization ruleset(s) as combined guidelines and using the inputs and "
-        "any tool findings provided. Produce the deliverable itself — no "
-        "meta-commentary, no preamble."
-    ),
-    ROLE_RESEARCHER: (
-        "ROLE: RESEARCHER. You GATHER grounded evidence to answer your assigned "
-        "concern, using the search / fetch / note tools your bundle gives you. "
-        "Work the canonical loop: DECOMPOSE the concern, SEARCH it, READ the most "
-        "relevant chunks of the real sources you fetch, and — your PRIMARY act after "
-        "each read — take a NOTE that records what you learned AND the GAPS it left. "
-        + READ_NOT_DESCRIBE + " Cover the breadth of the concern before drilling one "
-        "part; expand a sub-concern only by actually running another search/read/note "
-        "round, and STOP once every concern is settled-in-a-note or collapsed. Report "
-        "concrete FINDINGS attributed to the real [S#]/URL you read them from, plus the "
-        "OPEN QUESTIONS that remain — never write from memory and never cite a page you "
-        "did not fetch."
-    ),
+    ROLE_WORKER: _WORKER_DRIVE,
+    ROLE_RESEARCHER: _WORKER_DRIVE,
     ROLE_REVIEWER: (
-        "ROLE: REVIEWER — the DEFAULT LAST STEP of the plan. The deliverable is "
-        "ALREADY produced by the upstream nodes; do NOT re-emit it. Inspect it by "
-        "BOUNDED REGION (file_read a slice/tail — never the whole file at once) and "
-        "GROUND your checks in the sources you can pull on demand (load_source against "
-        "the SOURCE INDEX). Where you find a gap, an unsupported claim, a citation that "
-        "does not resolve to a real [S#], or a coherence/structure defect, FIX it IN "
-        "PLACE with a single anchored file_update (ground-or-remove; never fabricate a "
-        "source). Make only targeted edits — never rewrite the whole document. THEN emit "
-        "the plan's FINAL STATUS: a short, honest summary of what the plan accomplished, "
-        "whether it met its goal, and — when the goal still needs a further plan — WHAT "
-        "the next plan should produce (kind + shape, derived from the work just done, "
-        "e.g. the desired sectioned output a write plan should author). Reply with that "
-        "status as plain prose — never a verdict or findings object."
+        "ROLE: REVIEWER. The deliverable already exists upstream — do not "
+        "re-produce it. Review it against the same specialization(s) its author "
+        "worked to, fix defects in place where a bounded grounded edit can, and "
+        "finish with an honest plain-prose status: what it actually contains, "
+        "whether it meets the goal, and what is still missing."
     ),
     ROLE_SYNTHESIZER: (
-        "ROLE: SYNTHESIZER. You produce the FINAL DELIVERABLE itself — the actual "
-        "answer the user receives. Integrate ALL upstream work (researched layers + "
-        "critic notes, or the prior step's output) into ONE coherent, well-supported "
-        "response to the original task, built from the concrete facts the layers took "
-        "from their fetched sources, NOT from a description of which sources were "
-        "consulted. PRESERVE AND CITE THE SOURCES: every upstream finding arrives "
-        "attributed to the real URL it was read from — carry those source URLs/domains "
-        "THROUGH into your deliverable (attribute the key facts and figures to the "
-        "domain or URL they came from, and close with a Sources list of the URLs you "
-        "actually used); never strip the sourcing into an unattributed summary. HONOR "
-        "THE REQUESTED DEPTH: when the task asks for a detailed / thorough / in-depth "
-        "report, write a SUBSTANTIVE one that covers every part the findings support — "
-        "do not collapse rich researched material into a short paragraph. Resolve "
-        "contradictions, keep only substantiated claims, and match the format/length "
-        "the task asks for — no verdict, no meta-commentary, no "
-        "'I will…' preamble. You write the deliverable to a FILE one bounded section "
-        "per turn via the file_write tool (append each next section), READ THE FILE "
-        "BACK with file_read to confirm the actual content, then call finish (the "
-        "per-turn protocol + the file path are spelled out in the task). If the task "
-        "is a simple conversational reply, write it in one file_write, read it back, "
-        "and finish — directly and warmly."
+        "ROLE: SYNTHESIZER. Deliver the run's result to the user: the final answer "
+        "or a brief summary naming the produced artifact, integrating the upstream "
+        "work — never redoing it and never stripping its source attributions."
     ),
 }
 

@@ -108,23 +108,23 @@ class WebGatherAdapter:
                 args.get("query") or args.get("q") or args.get("search") or ""
             ).strip()
             if not query:
-                return "web_search needs a non-empty \"query\". Try again."
+                return "web_search was not executed: it needs a non-empty \"query\"."
             try:
                 res = await invoke(self.search_tool, query=query)
             except Exception as exc:  # noqa: BLE001 - a failed search must not crash the node
-                return f"web_search failed: {exc}. Try a different query or write your findings."
+                return f"web_search failed: {exc}."
             if not getattr(res, "ok", False):
-                return f"web_search returned no results ({getattr(res, 'error', '')}). Try another query."
+                return f"web_search returned no results ({getattr(res, 'error', '')})."
             rows = (res.value or {}).get("results") if isinstance(res.value, Mapping) else None
             rows = rows or []
             if not rows:
-                return "web_search returned 0 results. Try a broader query."
+                return "web_search returned 0 results for this query."
             # s15/a25 LEVER 1 (d186): PRESENT the offered URLs as the EXPLICIT choice set so
             # the small model treats them as the actionable list to pick from (the role:tool
             # result was not clearly actionable, so the model fabricated dead URLs instead of
             # copying a real one). Each row's url is recorded in ``offered_urls`` (the grounding
             # set LEVER 3 validates the next web_fetch against).
-            lines = ["SEARCH RESULTS — these are the ONLY URLs you may web_fetch:"]
+            lines = [f"SEARCH RESULTS for \"{query}\" — only URLs returned by a search this task will load in web_fetch:"]
             urls_seen: list[str] = []
             displayed = 0
             for row in rows:
@@ -145,32 +145,26 @@ class WebGatherAdapter:
                     snip = str(row.get("snippet") or "").strip()[:200]
                     lines.append(f"- {title} <{url}>\n  {snip}")
                     displayed += 1
-            if urls_seen:
-                lines.append(
-                    "\nTo read one, reply with ONLY a web_fetch call whose \"url\" is COPIED "
-                    "VERBATIM from this list (e.g. " + urls_seen[0] + "). NEVER invent, guess, "
-                    "or placeholder a URL — only a URL above will load."
-                )
+            # Fact-only (CoT-autonomy P2): the rows ARE the data; the verbatim-URL
+            # contract lives in web_fetch's tool description (its one owner) and the
+            # header above states the grounding constraint as a fact.
             return "\n".join(lines)
 
         # web_fetch
         url = str(args.get("url") or args.get("link") or "").strip()
         if not url:
-            return "web_fetch needs a non-empty \"url\". Choose one from the search results."
+            return "web_fetch was not executed: it needs a non-empty \"url\"."
         if url in seen_urls:
-            return f"Already read <{url}>. Fetch a DIFFERENT source or write your findings."
+            return f"Already read <{url}> this task."
         seen_urls.add(url)
         if not looks_like_article_url(url):
-            return (
-                f"<{url}> is not a readable HTML article (PDF/file/binary). "
-                "Choose a different source."
-            )
+            return f"<{url}> is not a readable HTML article (PDF/file/binary)."
         try:
             res = await invoke(self.fetch_tool, url=url)
         except Exception as exc:  # noqa: BLE001 - a dead link must not fail the node
-            return f"Could not fetch <{url}>: {exc}. Try another source."
+            return f"Could not fetch <{url}>: {exc}."
         if not getattr(res, "ok", False):
-            return f"Could not fetch <{url}>. Try another source."
+            return f"Could not fetch <{url}>."
         val = res.value if isinstance(res.value, Mapping) else {}
         # web_fetch surfaces a STRUCTURED failure (ok=False + a DISTINCT error_kind)
         # so the agent reacts correctly to WHY a read failed: a 403/blocked/denied
@@ -180,11 +174,10 @@ class WebGatherAdapter:
         if val.get("ok") is False:
             kind = str(val.get("error_kind") or "error")
             detail = str(val.get("error") or "").strip()
-            return (f"Could not read <{url}> [{kind}]: {detail} "
-                    "Choose a DIFFERENT source from the search results.")
+            return f"Could not read <{url}> [{kind}]: {detail}"
         md = str(val.get("markdown") or "").strip()
         if not md or not is_readable_fetch(val):
-            return f"<{url}> had no readable article text. Try another source."
+            return f"<{url}> had no readable article text."
         title = str(val.get("title") or "").strip() or url.rsplit("/", 1)[-1]
         final_url = str(val.get("final_url") or url)
         record: dict[str, str] = {"title": title, "url": final_url, "markdown": md}
@@ -222,21 +215,20 @@ class WebGatherAdapter:
         elif len(body) < full_chars:
             read_note = (
                 f"FETCHED <{title}> <{final_url}> — showing the first {len(body)} of "
-                f"{full_chars} chars; this source has MORE. Note follow-ups or fetch it "
-                "again to cover the rest. "
+                f"{full_chars} chars; {full_chars - len(body)} chars of this source "
+                "are unread. "
             )
         else:
             read_note = f"FETCHED <{title}> <{final_url}> — you have now READ this source. "
-        observation = read_note + READ_NOT_DESCRIBE + f"\n\n{body}"
-        # s15/a6 (d182) — when the note lane is on, CHAIN the observation into recording a note
-        # for the source just read (with its gaps_or_followups), so the gap lane actually
-        # populates instead of the model skipping the optional note turn. Trailing so it is the
-        # most salient instruction; gated on the lane so the OFF path stays byte-identical.
-        if emit_article_notes:
-            # d221 bundle-override: the take-a-note suffix comes from the LOADED research
-            # bundle's web_fetch output override (byte-identical to the prior
-            # ``_FETCH_NOTE_CHAIN`` when research is loaded); a plain context adds nothing.
-            observation += fetch_note_suffix
+        # Fact-only (CoT-autonomy P2): the coverage counts + the body ARE the
+        # observation. The per-fetch READ_NOT_DESCRIBE doctrine append and the
+        # take-a-note chain (WEB_FETCH_NOTE_OVERRIDE via ``fetch_note_suffix``) are
+        # RETIRED — read-don't-describe lives ONCE in the research spec, and note
+        # discipline lives in the note tool's description + the research bundle
+        # doctrine (their single owners). ``emit_article_notes``/``fetch_note_suffix``
+        # params are kept for signature stability but no longer append anything.
+        del emit_article_notes, fetch_note_suffix  # explicitly unused (P2)
+        observation = read_note + f"\n\n{body}"
         return observation
 
 

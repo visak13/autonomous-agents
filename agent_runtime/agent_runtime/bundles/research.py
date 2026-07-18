@@ -51,26 +51,19 @@ from .web_ingest import (
 # placeholder is filled by the loop with ``.format(fetch_cap=...)`` — keep the doubled
 # braces so a literal ``{ }`` in the JSON example survives ``str.format``.
 # --------------------------------------------------------------------------- #
+# CoT-autonomy P4: the loop instruction is DOMAIN KNOWLEDGE only. The reply-format
+# protocol ("reply with ONLY a JSON object", "ONE tool call per turn") moved to the
+# OPERATING PROTOCOL on the system turn; the findings quality bar (attribute each
+# fact to its URL, close with what's missing) moved to the research-methodology
+# SPEC; the concrete fetch cap is per-run data on the task turn. What remains is
+# what only this bundle knows: how web evidence-gathering works.
 RESEARCH_LOOP_INSTRUCTION = (
     "----\n"
-    "You are a RESEARCH AGENT with two tools. Gather REAL evidence with them before "
-    "you answer — do not rely on memory.\n\n"
-    "To call a tool, reply with ONLY a JSON object and NOTHING else:\n"
-    '  {{"tool": "web_search", "args": {{"query": "<search terms>"}}}}\n'
-    '  {{"tool": "web_fetch", "args": {{"url": "<one URL COPIED VERBATIM from the search '
-    'results>"}}}}\n\n'
-    "Workflow: search the topic, then READ the most relevant results by fetching their "
-    "URLs (up to {fetch_cap} fetches), then write your findings. web_fetch ONE OF the URLs "
-    "the search results listed — copy it EXACTLY; NEVER invent, guess, or placeholder a URL "
-    "(a made-up URL will not load and wastes the turn). Fetch a source before relying on it; "
-    "never invent facts or cite a page you have not read. Issue ONE tool call per turn.\n\n"
-    "Once you have read the sources that answer your sub-question, write your FINDINGS as "
-    "plain prose (NOT JSON): the key facts, figures and events, each attributed to the source "
-    "URL you read it from — be specific and substantive. THEN, in a closing line, RECORD WHAT "
-    "IS STILL MISSING: the open questions, the figures only one source gave, the claims no "
-    "second source confirmed, and the follow-ups a deeper pass should chase. Those gaps DIRECT "
-    "the next research layer, so name them honestly — do NOT treat a facet as settled when it "
-    "rests on a single source."
+    "WEB EVIDENCE GATHERING. web_search finds candidate sources; web_fetch reads one. "
+    "Only a URL a search actually returned will load — a URL from memory is rejected "
+    "as ungrounded, so copy fetch URLs exactly from the results. A search listing is "
+    "not evidence: the facts come from sources you actually read. Never rely on a "
+    "page you have not fetched, and never invent facts, figures or URLs."
 )
 
 # d191 — the template-then-grow-out flavor that distinguishes the research bundle. Added
@@ -103,22 +96,13 @@ _TEMPLATE_GROW_FLAVOR = (
 # investigative steering no longer comes from the research-analyst SPEC (now quality-only).
 RESEARCH_METHODOLOGY = _TEMPLATE_GROW_FLAVOR
 
-# d221 — the web_fetch OUTPUT-MESSAGE OVERRIDE. The research bundle's CONTEXT overrides
-# the base web_fetch tool's observation to PROMPT take-a-note after a read (the plain
-# WEB / base context returns no such message). The runtime appends this to a web_fetch
-# observation when the research bundle is LOADED and the note lane is active — the text
-# is byte-identical to the prior runtime ``_FETCH_NOTE_CHAIN`` so behaviour is unchanged,
-# but the MESSAGE now belongs to the bundle that owns the note doctrine (single source).
-WEB_FETCH_NOTE_OVERRIDE = (
-    "\n\n----\nYou have just READ this source. You are still GATHERING — do NOT write the "
-    "final report, an HTML/Markdown document, or any deliverable now (that is a LATER phase); "
-    "your only outputs this phase are tool calls, short notes, and brief prose findings. "
-    'BEFORE you fetch another or write your findings, record a STRUCTURED note for it — reply '
-    'with ONLY {"tool":"note","args":{...}}: its summary, key_claims AND, crucially, '
-    "gaps_or_followups naming what this source did NOT settle (a figure left unverified, an open "
-    "question, the angle to search next). That structured note is the GAP LANE that DIRECTS the "
-    "next research layer — do not skip it while the facet is still open."
-)
+# CoT-autonomy P2 — the per-fetch take-a-note OVERRIDE is RETIRED (it commanded the
+# model's next action after every read: "record a STRUCTURED note BEFORE you fetch
+# another"). Note discipline's single owners are the ``note`` TOOL DESCRIPTION (what a
+# note is and why the gap lane matters) and this bundle's doctrine — knowledge the
+# model reasons over, delivered once, never a per-turn command. Kept as an empty
+# string so the tool_output_override seam stays wire-compatible.
+WEB_FETCH_NOTE_OVERRIDE = ""
 
 _CROSS_VERIFY_FLAVOR = (
     "GROUNDING DISCIPLINE — before you rely on a claim, CROSS-VERIFY it against the "

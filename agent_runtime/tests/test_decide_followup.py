@@ -109,26 +109,17 @@ class _ScriptedReview:
         return self.chat(messages, **opts).content
 
 
-def test_review_research_honors_reasoned_status():
-    """A reasoning transport's legal research-review status + data complexity are honored."""
-    planner = Planner(_ScriptedReview("research_complete", "8 points; complex"), _factory())
-    status = asyncio.run(
-        planner.review_research("report on X", "found a, b, c", sources=8)
-    )
-    assert isinstance(status, ResearchReviewStatus)
-    assert status.status == "research_complete" and status.complete
-    assert "8 points" in status.data_complexity
+def test_review_research_is_retired_review_is_a_briefed_node():
+    """CoT-autonomy P6: the engine-authored reviewer prompt is DELETED — the research
+    review runs as a PLANNER-BRIEFED node; the planner only AUTHORS the brief."""
+    assert not hasattr(Planner, "review_research")
+    assert hasattr(Planner, "author_review_brief")
 
 
-def test_review_research_fails_open_to_derived():
-    """A prose-only transport derives the status from what was gathered (complete with sources,
-    thin without) so the served route + offline tests stay green."""
+def test_author_review_brief_returns_prose_and_fails_safe():
     planner = Planner(_ProseOnly(), _factory())
-    with_src = asyncio.run(planner.review_research("report on X", "found facts", sources=5))
-    assert with_src.status == "research_complete"
-    no_src = asyncio.run(planner.review_research("report on X", "", sources=0))
-    assert no_src.status == "research_thin"
-
+    brief = asyncio.run(planner.author_review_brief("report on X", memory_index="m1"))
+    assert isinstance(brief, str)  # prose (or "" on a degenerate transport) — never raises
 
 class _ProseSummary:
     """A transport returning a scripted prose summary (the live synthesizer path)."""

@@ -197,11 +197,14 @@ def test_hook_passes_the_one_node_directive_forbidding_the_n_chain(monkeypatch):
     asyncio.run(_make_hook()(rt, dag, "write_plan"))
 
     directive = captured["directive"]
-    # the O4 ONE-NODE contract is the prompt lever that steers the model to ONE coherent document.
-    assert "ONE COHERENT DOCUMENT" in directive
-    assert "EXACTLY ONE write node" in directive
-    assert "final_review" in directive  # a single review IS permitted (O4)
-    # the per-turn SOURCE-ID mandate is appended (sources present → the model assigns [S#]).
+    # P5: the ONE-NODE contract rides the write-file SHAPE's decompose_methodology
+    # (planner-only strategy layer); the per-turn directive is ONLY the source-id lever.
+    from chat_app.agentic import _WRITE_FILE_SHAPE
+    methodology = getattr(_WRITE_FILE_SHAPE, "decompose_methodology", "")
+    assert "EXACTLY ONE write node" in methodology
+    assert "final_review" in methodology  # the single reviewer node is part of the strategy
+    assert "ONE COHERENT DOCUMENT" not in directive  # the engine constant stays deleted
+    # the per-turn SOURCE-ID mandate is the directive (sources present → assign [S#]).
     assert "source_ids" in directive
 
 

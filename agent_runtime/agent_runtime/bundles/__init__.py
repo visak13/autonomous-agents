@@ -82,15 +82,16 @@ def get_bundle(name: str) -> ObjectBundle:
 
 
 def compose_doctrine(names) -> str:
-    """The UNION doctrine for a SET of bundle names (d212 #1): the base agentic-loop
-    doctrine ONCE, then each loaded capability's own doctrine, de-duplicated and in a
-    stable order. This is what a node that COMPOSES bundles injects as its usage text."""
+    """The UNION doctrine for a SET of bundle names (d212 #1): each loaded capability's
+    OWN doctrine, de-duplicated and in a stable order. CoT-autonomy P1: the base
+    agentic-loop protocol is NO LONGER folded here — its single owner is the node's
+    SYSTEM turn (``AGENT_OPERATING_PROTOCOL`` via ``_compose_system``), so the load
+    observation delivers only the capability's domain knowledge (one-owner rule)."""
     bundles = [get_bundle(n) for n in sorted(set(names or []))]
     if not bundles:
         bundles = [_REGISTRY[BUNDLE_OBJECT]]
-    base = bundles[0].base_doctrine
-    parts = [base]
-    seen = {base.strip()}
+    parts: list[str] = []
+    seen: set[str] = set()
     for b in bundles:
         own = (b.own_doctrine or "").strip()
         if own and own not in seen:

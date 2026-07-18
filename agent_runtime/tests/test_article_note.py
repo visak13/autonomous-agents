@@ -217,7 +217,7 @@ def test_note_is_emitted_additively_and_directs_next_search():
     assert n["gaps_or_followups"] == ["search casualty figures"]
 
     # the note STEERS the next search: its follow-ups are fed back into the loop.
-    assert "Open follow-ups: search casualty figures" in _full_convo(transport)
+    assert "open follow-ups: search casualty figures" in _full_convo(transport)
     # findings prose is still the RAW node output.
     assert "summit reached an accord" in (res.output or "")
 
@@ -259,7 +259,7 @@ def test_note_before_any_read_is_refused():
         read_search_max_fetch=5, emit_article_notes=True, call_opts={"think": False},
     )
     res = asyncio.run(agent.run({}))
-    assert "Record a NOTE only AFTER" in _full_convo(transport)
+    assert "no source has been read this task" in _full_convo(transport)
     # no phantom note was recorded; the real fetch still produced its source.
     assert "article_notes" not in res.tool_value
     assert res.tool_value["fetched_count"] == 1

@@ -98,6 +98,7 @@ from agent_runtime.synth_tools import (
 )
 from agent_runtime.shapes import ShapeSpec, load_shape
 from agent_runtime.factory import PlanNode
+from agent_runtime.planner import ResearchReviewStatus
 
 # Back-compat: the names the s6 workflow producer (chat_app.workflow) + existing
 # specs/tests still reference. ``markdown-writer`` / ``html-writer`` are the two
@@ -1437,46 +1438,14 @@ def _compose_write_goal(
     # run2 died at the UNSCOPED planner ingesting the blob). Degrades to the legacy
     # findings/catalog grounding when no index is available (no sources / notes), so that
     # path stays byte-identical.
+    # CoT-autonomy P5: the goal is DATA ONLY — the query, the deliverable file, the
+    # planning event, the outline hint, and the grounding context (narrative + [S#]
+    # index, or the legacy findings/catalog). ALL authoring strategy (one write node
+    # + one final_review, grounding/no-fabricate rules, source-id assignment) moved
+    # to the write-file SHAPE's decompose_methodology — the planner-only strategy
+    # layer (shapes/write-file.toml), which incremental.py routes into planner
+    # prompts exclusively.
     compact = bool(source_index)
-    grounding_noun = "RESEARCH NARRATIVE and the SOURCE INDEX" if compact else (
-        "RESEARCH FINDINGS and AVAILABLE SOURCES"
-    )
-    source_noun = "SOURCE INDEX" if compact else "AVAILABLE SOURCES"
-    # EMPTY-NODE-NO-FABRICATE (s13/FX d106 #6, d60-critical): every section must be
-    # grounded in the context below. A section with no supporting source must be
-    # DROPPED or written as an explicit UNSUPPORTED line — NEVER fabricated from memory.
-    no_fabricate_clause = (
-        f"\n\nGROUND EVERY SECTION in the {grounding_noun} below. "
-        "If a planned section has NO supporting source/finding (its research yielded "
-        "nothing), DROP it or write only a single line marking it UNSUPPORTED — do NOT "
-        "invent timelines, dates, figures, names, quotes, or citations from memory. Do "
-        f"NOT write a placeholder or 'sources to be added later' section; cite only the "
-        f"REAL fetched URLs from the {source_noun}."
-    )
-    # s14/P3A Stage B item 4 — SOURCE-ID ASSIGNMENT MANDATE (the PRIMARY, prompt-driven fix
-    # for the a3 collapse where the planner authored 0 source_ids on every write node and the
-    # writers — source-starved — wrote literal "[Source Placeholder]" into a table's citation
-    # column). In compact mode the [S#] index is right there to assign FROM, so the planner
-    # MUST do it. This is reliability via prompt quality (d147/d148), NOT a deterministic
-    # seatbelt — the coverage backstop below only redistributes REAL ids as a last resort and
-    # is recorded separately so a reviewer can confirm THIS mandate worked on its own.
-    source_ids_mandate = (
-        f"\n\nSOURCE-ID ASSIGNMENT IS MANDATORY: EVERY write section MUST carry a "
-        f"NON-EMPTY source_ids list of [S#] numbers taken from the {source_noun} — never "
-        "author a section with source_ids: []. Each [S#] in the index grounds specific "
-        "facts; route every [S#] to the section that uses it (a source may serve more than "
-        "one section). When a section presents a TABLE or any per-row/per-figure citation "
-        "column, fill EVERY citation cell with a REAL [S#] (and/or its URL) from that "
-        "section's assigned sources — NEVER write a worded stand-in such as '[Source "
-        "Placeholder]', 'Source Placeholder', 'URL Placeholder for X', 'Source N Title', "
-        "'TBD', 'source here', or any similar filler. If you cannot ground a row in a real "
-        "[S#], drop the row rather than placeholder it."
-        if compact else
-        "\n\nEVERY write section MUST carry a NON-EMPTY source_ids list (the SOURCE "
-        "NUMBERS it uses); fill every table/citation cell with a REAL source — never write "
-        "a worded stand-in such as '[Source Placeholder]', 'Source Placeholder', 'URL "
-        "Placeholder for X', 'Source N Title', 'TBD', or any similar filler."
-    )
     if compact:
         context_block = (
             (f"\n\n{narrative}" if narrative else "")
@@ -1484,27 +1453,13 @@ def _compose_write_goal(
         )
     else:
         context_block = (
-            "\n\nRESEARCH FINDINGS (decide the sections AND which sources each uses "
-            f"FROM these — do NOT re-research):\n{findings}"
+            f"\n\nRESEARCH FINDINGS:\n{findings}"
             + (f"\n\n{catalog}" if catalog else "")
         )
     return (
-        f"{query}\n\nWrite the deliverable to the file '{out_name}'. Do NOT bind a "
-        "tool to the write nodes — each is a TOOL-LESS worker that self-selects its "
-        "file-authoring tools at runtime and writes per its writer spec (SB-6/d299). "
-        f"Set each write node's source_ids to the SOURCE NUMBERS (from the {source_noun} "
-        "below) whose facts/figures/URLs it uses — assign every relevant source to the "
-        "part it belongs to, so each write node is given ONLY its own sources. "
-        "DISJOINT SECTIONS (live duplication catch): the nodes together write ONE "
-        "document, so assign each node a DISTINCT, NON-OVERLAPPING set of sections — "
-        "never task two nodes with the same topic/section, and never re-state another "
-        "node's figures as its own section. Exactly ONE node — the FINAL one — closes "
-        "the document (the single sources/references section and the wrapper close); "
-        "no other node's task may include sources sections or closing the document."
+        f"{query}\n\nDELIVERABLE FILE: '{out_name}'."
         + _render_write_planning_event(write_planning_event)
         + _render_outline_hint(outline_hint)
-        + no_fabricate_clause
-        + source_ids_mandate
         + context_block
     )
 
@@ -1569,27 +1524,11 @@ def _compose_write_planner_inputs(
     return write_goal, prior_memory, source_id_directive
 
 
-# RP-6c B2 (O4, DESIGN §b/§f) — the ONE-NODE write-authoring contract. The write-file shape's
-# DESCRIPTION still biases the planner toward the N-section CHAIN (one whole-document node per
-# section — Bug B; the stale write-file.toml text cleanup is RP-6d). Until that lands, the
-# one-drive hook steers the planner to ONE coherent-document node via the per-turn AUTHORING
-# DIRECTIVE (the sanctioned prompt lever, strongest on E4B) — NOT by editing the shape file and
-# NOT by the engine authoring structure (the MODEL still authors the topology via
-# ``IncrementalPlanner.plan``; this only DIRECTS it, like the source-id mandate). O4 permits an
-# additional single ``final_review`` node; it forbids the N-way whole-document chain.
-_ONE_WRITE_NODE_DIRECTIVE = (
-    "AUTHOR THE WRITE PLAN AS ONE COHERENT DOCUMENT. The deliverable is a SINGLE file: author "
-    "EXACTLY ONE write node that produces the WHOLE document — its own file_write -> file_read -> "
-    "continue -> finish loop accumulates every part of that one document IN ORDER, so the "
-    "'sections' are that single node's WITHIN-NODE structure, never separate nodes. Do NOT author "
-    "one node per section, and do NOT chain N whole-document nodes (that re-emits and DUPLICATES "
-    "the document). ALSO author EXACTLY ONE 'final_review' node with role='reviewer' that "
-    "depends_on the write node, binding the SAME format spec as its review rubric: the reviewer "
-    "READS the finished file itself (file_read), verifies it against the goal and that spec, "
-    "FIXES any defect it finds ITSELF via file_update (grounded, minimal edits — never a rewrite "
-    "from scratch), and reports an honest final status of what the document actually contains "
-    "(and anything still missing). Author NO other nodes."
-)
+# CoT-autonomy P5: the ONE-NODE write-authoring contract (_ONE_WRITE_NODE_DIRECTIVE)
+# is DELETED as an engine constant — the strategy now lives in the write-file SHAPE's
+# decompose_methodology (shapes/write-file.toml), the planner-only strategy layer.
+# The per-turn source-id directive (the measured strongest E4B lever) survives until
+# the plan_author promptlab batch proves the shape methodology holds without it.
 
 
 def make_write_phase_author(
@@ -1659,14 +1598,13 @@ def make_write_phase_author(
             research_notes=research_notes, write_planning_event=write_planning_event,
             research_memory_handle=memory_handle,
         )
-        # DIRECTIVE = the O4 ONE-NODE contract FIRST, then the per-turn source-id mandate.
-        directive = _ONE_WRITE_NODE_DIRECTIVE + (
-            "\n\n" + source_id_directive if source_id_directive else ""
-        )
+        # P5: the ONE-NODE strategy rides the write-file SHAPE's decompose_methodology
+        # (threaded by _build_incremental_planner); only the per-turn source-id lever
+        # remains as an authoring directive.
         write_planner = _build_incremental_planner(
             transport=transport, registry=registry, hook=hook,
             shape_spec=_WRITE_FILE_SHAPE, allow_web=False,
-            requested_specs=_requested, authoring_directive=directive,
+            requested_specs=_requested, authoring_directive=source_id_directive,
         )
         # The MODEL authors the write topology (engine composes only the DATA above + INVOKES the
         # planner). ``_normalize_write_dag`` names the output file in each node's task (pure
@@ -1765,18 +1703,13 @@ async def run_section_write_phase(
     # SF-1 (d310/d311) — the framework review injection is RETIRED (the model authors the whole
     # document; no engine reviewer edits it), so the write planner authors the body-node DAG
     # with no review twins.
-    # P2 (Gate-2d live catch): the write planner gets the ONE-write-node directive on
-    # THIS (two-drive) path too — 4 write nodes × (~62s/call self-select + pull + write
-    # turns) starve each node to ~5 turns inside the phase budget, yielding one thin
-    # section apiece. ONE node accumulating the whole document through its own
-    # write → read-back → continue loop (exactly the file doctrine's design) spends
-    # the same budget on ONE coherent artifact. Planner-directive prompt lever
-    # (sanctioned, same as the one-drive hook) — the model still authors the topology.
+    # P5: the ONE-write-node strategy rides the write-file SHAPE's
+    # decompose_methodology (threaded by _build_incremental_planner from
+    # shapes/write-file.toml); only the per-turn source-id lever remains here.
     write_planner = _build_incremental_planner(
         transport=transport, registry=registry, hook=hook,
         shape_spec=_WRITE_FILE_SHAPE, allow_web=False, requested_specs=requested_specs,
-        authoring_directive=(_ONE_WRITE_NODE_DIRECTIVE + "\n\n" + write_directive
-                             if write_directive else _ONE_WRITE_NODE_DIRECTIVE),
+        authoring_directive=write_directive,
     )
     write_runtime, _ = _build_acyclic_runtime(
         transport=transport, registry=registry, hook=hook, plane=plane,
@@ -2286,6 +2219,66 @@ def _build_write_planning_event(
     }
 
 
+async def _run_research_review_node(
+    goal: str,
+    *,
+    transport,
+    registry: SpecRegistry,
+    hook: ToolHook,
+    plane: EventPlane,
+    planner,
+    memory_handle: str,
+    sources,
+    notes,
+    timeout: float = 600.0,
+) -> str:
+    """CoT-autonomy P6 — run the PLANNER-BRIEFED research review NODE.
+
+    The planner authors the brief (``author_review_brief`` — its own words, no
+    engine-authored reviewer prompt); the node runs the SAME unified worker loop as
+    every node, bound to the run's research memory (it PULLS via read_notes /
+    load_source with the SAME research specs the gather workers carried); its
+    model-authored prose IS the review. Fail-safe: any error returns "" and the
+    caller derives a minimal status — the loop never stalls on the reviewer."""
+    try:
+        brief = await planner.author_review_brief(
+            goal, phase="research", memory_index=memory_handle or ""
+        )
+    except Exception:  # noqa: BLE001 — brief authoring is fail-safe
+        brief = ""
+    if not brief.strip():
+        # Minimal DERIVED brief (data, not methodology) — used only when the planner
+        # call failed; the reviewer's specs own how to review.
+        brief = (
+            f"Review the research gathered for: {goal}. Report honestly whether it can "
+            "support the deliverable, what is well covered, what is thin or "
+            "unsupported, and the shape/complexity of the data."
+        )
+    node = PlanNode(
+        id="research_review",
+        task=brief,
+        role="reviewer",
+        specs=("research-methodology", "research-analyst"),
+        memory_index=(memory_handle or "").strip(),
+        research_memory_handle=(memory_handle or "").strip() or None,
+    )
+    try:
+        rt, _ = _build_acyclic_runtime(
+            transport=transport, registry=registry, hook=hook, plane=plane,
+            shape_spec=None, allow_web=False,
+        )
+        rt.chain_sources = sources
+        rt.chain_notes = notes
+        res = await rt.run(
+            PlanDAG(nodes=[node], goal=goal), timeout=timeout,
+            run_id=f"research-review-{uuid.uuid4().hex[:8]}",
+        )
+        out = res.results.get(node.id)
+        return str(getattr(out, "output", "") or "")
+    except Exception:  # noqa: BLE001 — a failed review degrades, never stalls
+        return ""
+
+
 def _compose_reviewer_summary(status) -> str:
     """Compose the research reviewer's OVERALL SUMMARY (the (summary, index) pair text) from its
     ONE model emission — SB-5 (d285/d289).
@@ -2694,12 +2687,30 @@ async def _run_generic_loop(
                     span.set_attribute(
                         "plan_chain.depth_ceiling", int(grow_trace.get("max_layers", 0) or 0)
                     )
-                # REAL last-step reviewer (replaces the faked _research_plan_final_status): a
-                # genuine LLM reviewer REASONS the status + the data complexity (d214/d237).
-                research_status = await reasoning_planner.review_research(
-                    overall_goal or query, findings, sources=len(sources)
+                # CoT-autonomy P6 — the research reviewer is a PLANNER-BRIEFED NODE in
+                # the unified worker loop, not an engine method with an engine-authored
+                # reviewer prompt: the planner writes its brief (author_review_brief),
+                # the node binds the SAME research specs the gather workers carried and
+                # PULLS its evidence from the research memory (read_notes/load_source),
+                # and its model-authored review prose is the single signal decide
+                # reasons over (SB-5). The structured enum survives only as a DERIVED
+                # fail-safe so the loop never stalls on a degenerate review.
+                review_prose = await _run_research_review_node(
+                    overall_goal or query,
+                    transport=transport, registry=registry, hook=hook, plane=plane,
+                    planner=reasoning_planner, memory_handle=memory_handle,
+                    sources=sources,
+                    notes=(cum_notes or grow_trace.get("article_notes")),
+                )
+                _derived_ok = bool(review_prose.strip()) and len(sources) > 0
+                research_status = ResearchReviewStatus(
+                    status="research_complete" if _derived_ok else "research_thin",
+                    data_complexity=(review_prose.strip()[:400]
+                                     or f"{len(sources)} sources gathered"),
+                    rationale="derived from the review node's prose (P6)",
                 )
                 span.set_attribute("plan_chain.research_reviewer_status", research_status.status)
+                span.set_attribute("plan_chain.review_node_prose_chars", len(review_prose))
                 span.set_attribute("plan_chain.research_memory_handle", memory_handle)
                 span.set_attribute(
                     "plan_chain.research_data_complexity", research_status.data_complexity[:200]
@@ -2718,7 +2729,10 @@ async def _run_generic_loop(
                 # emission. The bare structured data_complexity is no longer passed SEPARATELY to
                 # decide (it rides INSIDE the summary) — write_planning_event above still reads the
                 # SAME single emission, so there is ONE non-divergent data-complexity source.
-                reviewer_summary = _compose_reviewer_summary(research_status)
+                # P6: the review NODE's own prose IS the reviewer summary when present.
+                reviewer_summary = (
+                    review_prose.strip()[:2000] or _compose_reviewer_summary(research_status)
+                )
                 # RP-6b (d359/d361) — the safe-baseline next plan is the SHAPE's DECLARED next
                 # phase after ``research`` (``research → write``), not a hardcoded ``"write_plan"``.
                 default_next = dr_shape.next_phase_plan("research")

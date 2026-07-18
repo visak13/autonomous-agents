@@ -23,13 +23,10 @@ import chat_app.agentic as agentic
 
 # The exact behavior the former hardcoded constant carried (relocate, don't rewrite).
 _EXPECTED_DESCRIPTION = (
-    "A WRITE-FILE plan: the document is decomposed into the sections it needs, ONE "
-    "write node PER section, CHAINED so each node continues the previous one "
-    "(section 2 depends_on section 1, …). EVERY section is written to the SAME single "
-    "output document; the sections are appended in order. Use this shape's sequential "
-    "chain to fill a large/multi-section document one part at a time. (Each write node "
-    "is a tool-less worker — it SELF-SELECTS its file-authoring tools from its spec; "
-    "the shape only fixes the topology, never the tool.)"
+    "A WRITE-FILE plan: ONE node authors the whole document into a single deliverable "
+    "file (accumulating it part by part within the node), plus ONE final_review "
+    "reviewer node bound to the same specialization. Select for any goal whose outcome "
+    "is a written document/file."
 )
 
 

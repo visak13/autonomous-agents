@@ -671,97 +671,46 @@ class Planner:
         )
         return result.summary
 
-    async def review_research(
+    # CoT-autonomy P6 — ``review_research`` (the engine-authored reviewer system
+    # prompt) is RETIRED. The research review is a PLANNER-BRIEFED NODE in the unified
+    # worker loop (``author_review_brief`` below writes its brief; the node pulls its
+    # evidence from the research memory and its prose is the review signal, SB-5).
+    # ``ResearchReviewStatus`` survives as the derived fail-safe enum shape only.
+
+    async def author_review_brief(
         self,
         goal: str,
-        findings: str,
         *,
-        sources: int = 0,
-    ) -> ResearchReviewStatus:
-        """The research plan's LAST-STEP REVIEWER: reason over the gathered research (d214/d237).
-
-        A native structured Gemma call (same think=True regime as the other reviewer/decision
-        calls) that REASONS over the accumulated findings + source count and emits a structured
-        status — research_complete vs research_thin — plus the DATA COMPLEXITY (the shape of the
-        researched data over N points), which the planner reads to reason one-pass-vs-sectioned
-        for the write plan (d237). It replaces the retired ``_research_plan_final_status`` pure
-        function that ALWAYS hardcoded write-plan; now a REAL reviewer reasons the status.
-
-        FAIL-SAFE: any malformed / schema-blind reply (the offline FakeTransport seam) yields a
-        DERIVED status — research_complete when there are findings/sources, else research_thin,
-        with a source-count data-complexity note — so the served route + offline tests stay
-        green while the live thinking model gets the real reviewed status."""
-        n_src = int(sources or 0)
-        derived = "research_complete" if ((findings or "").strip() or n_src) else "research_thin"
-        derived_status = ResearchReviewStatus(
-            status=derived,
-            data_complexity=f"{n_src} source(s) gathered",
-            rationale="derived (no reviewed decision)",
-        )
+        phase: str = "research",
+        memory_index: str = "",
+    ) -> str:
+        """AUTHOR the review node's BRIEF (CoT-autonomy P6) — the planner writes the
+        reviewer's context the same way it authors worker briefs, so no engine-authored
+        reviewer prompt exists. One think call; the returned prose IS the node task.
+        Fail-safe: empty string (the caller supplies a minimal derived brief)."""
         system = with_identity(
-            self.factory.description
-            + "\n\nYou are the research plan's LAST-STEP REVIEWER. Read the gathered research "
-            "and emit a status:\n"
-            "- 'research_complete': the research can SUPPORT the desired deliverable (the key "
-            "parts are covered with sources).\n"
-            "- 'research_thin': a key part is unsupported / more gathering is needed before "
-            "writing.\n"
-            "Also report DATA COMPLEXITY in one line: the shape of the researched data over N "
-            "points — roughly how many distinct concerns/parts it covers and how complex — so "
-            "the planner can reason whether the write should be one pass or sectioned. Do NOT "
-            "dictate the write structure; just REPORT. Emit STRICT JSON {\"status\": "
-            "<research_complete|research_thin>, \"data_complexity\": <one line>, \"rationale\": "
-            "<one line>}."
+            "You are the PLANNER. A plan phase just completed and you are briefing its "
+            "REVIEW node — one reviewer that will inspect the actual work product and "
+            "report honestly. Write the reviewer's BRIEF in your own words: what to "
+            "review, against what, and what its status must cover. Reply with ONLY the "
+            "brief text (plain prose, 2-5 sentences) — no preamble, no JSON."
         )
         user = (
-            f"DESIRED DELIVERABLE / GOAL:\n{goal}\n\n"
-            f"SOURCES GATHERED: {n_src}\n"
-            f"GATHERED RESEARCH (bounded):\n{(findings or '')[:6000]}\n\n"
-            "Return ONLY the JSON research review status."
+            f"GOAL the plan serves: {goal}\n"
+            f"PHASE just completed: {phase}\n"
+            + (f"RESEARCH MEMORY the reviewer can pull from: {memory_index}\n" if memory_index else "")
+            + "Author the review brief now."
         )
-        chain = Chain()
-        chain.use(prompt_assembly())
-        chain.use(call_stage(self.transport, **_RESEARCH_REVIEW_OPTS))
-        chain.use(
-            structured_output(self.transport, max_repair_attempts=self.max_repair_attempts)
-        )
-        ctx = Context(system=system, user=user, transport=self.transport)
-        tracer = get_tracer("agent_runtime.planner")
-        with tracer.start_as_current_span("planner.review_research") as span:
-            span.set_attribute("planner.research_review.goal", str(goal)[:500])
-            span.set_attribute("planner.research_review.sources", n_src)
-            try:
-                ctx = await run_blocking_in_span(chain.run, ctx)
-            except Exception:  # noqa: BLE001 - fail-safe: derive from what was gathered
-                span.set_attribute("planner.research_review.status", derived_status.status)
-                span.set_attribute("planner.research_review.fail_open", True)
-                return derived_status
-            parsed = ctx.structured
-            status = (
-                str(parsed.get("status")).strip().lower()
-                if isinstance(parsed, Mapping) and parsed.get("status") is not None
-                else None
-            )
-            if status not in _RESEARCH_REVIEW_STATUSES:
-                span.set_attribute("planner.research_review.status", derived_status.status)
-                span.set_attribute("planner.research_review.fail_open", True)
-                return derived_status
-            data_complexity = (
-                str(parsed.get("data_complexity", "")).strip()
-                if isinstance(parsed, Mapping)
-                else ""
-            ) or derived_status.data_complexity
-            rationale = (
-                str(parsed.get("rationale", "")) if isinstance(parsed, Mapping) else ""
-            )
-            span.set_attribute("planner.research_review.status", status)
-            span.set_attribute("planner.research_review.fail_open", False)
-            return ResearchReviewStatus(
-                status=status,
-                data_complexity=data_complexity,
-                rationale=rationale,
-                raw=ctx.raw_output,
-            )
+        try:
+            ctx = Context(system=system, user=user, transport=self.transport)
+            chain = Chain()
+            chain.use(prompt_assembly())
+            chain.use(call_stage(self.transport, think=True, temperature=0.2,
+                                 num_predict=2048))
+            ctx = await run_blocking_in_span(chain.run, ctx)
+            return (ctx.raw_output or "").strip()[:1500]
+        except Exception:  # noqa: BLE001 — the caller derives a minimal brief
+            return ""
 
     async def name_deliverable(
         self,

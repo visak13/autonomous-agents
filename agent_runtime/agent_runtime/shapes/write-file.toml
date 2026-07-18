@@ -1,20 +1,38 @@
 # =============================================================================
-# WRITE-FILE shape (RP-6a / d359/d361) — the sectioned single-document WRITE shape.
+# WRITE-FILE shape — the single-document write plan (planner-only strategy).
 # =============================================================================
-# RELOCATED from a HARDCODED in-engine constant (agentic.py:_WRITE_FILE_SHAPE) to a
-# DECLARATIVE DISK SHAPE FILE, per the d341/d319 charter (behavior lives in SHAPES on
-# disk, NOT baked in engine code) — mirroring schedule-leg.toml / codebase-summary.toml.
-# BEHAVIOR-PRESERVING move: the name/description/execution are byte-identical to the
-# former constant; the engine now LOADS this shape from disk via the same load_shape
-# mechanism the other shapes use. NO new engine conditional, no flow/format branch.
-#
-# The write path drives the SEQUENTIAL execution discipline (one write node in flight at
-# a time, section by section). Each write node is a TOOL-LESS worker that SELF-SELECTS its
-# file-authoring tools from its spec — the shape fixes only the topology, never the tool.
+# CoT-autonomy P5: this shape now OWNS the write-plan authoring strategy that used
+# to live in engine constants (agentic.py:_ONE_WRITE_NODE_DIRECTIVE + the strategy
+# halves of _compose_write_goal). Shapes are step-by-step plan-AUTHORING guidance
+# read ONLY by the planner (incremental.py routes decompose_methodology into
+# planner prompts exclusively); worker/reviewer nodes never see this text — their
+# behavior comes from their briefs, specializations and bundle doctrine.
 
 name = "write-file"
 
-description = "A WRITE-FILE plan: the document is decomposed into the sections it needs, ONE write node PER section, CHAINED so each node continues the previous one (section 2 depends_on section 1, …). EVERY section is written to the SAME single output document; the sections are appended in order. Use this shape's sequential chain to fill a large/multi-section document one part at a time. (Each write node is a tool-less worker — it SELF-SELECTS its file-authoring tools from its spec; the shape only fixes the topology, never the tool.)"
+description = "A WRITE-FILE plan: ONE node authors the whole document into a single deliverable file (accumulating it part by part within the node), plus ONE final_review reviewer node bound to the same specialization. Select for any goal whose outcome is a written document/file."
 
-# One write node in flight at a time — sections are written/appended in order.
+# One node in flight at a time — the reviewer follows the writer.
 execution = "sequential"
+
+decompose_methodology = """
+Author the write plan as ONE coherent document:
+- EXACTLY ONE write node (role 'worker') that authors the WHOLE document into the
+  single deliverable file, accumulating it part by part within the node — the
+  'sections' are that one node's within-node structure, never separate nodes. Never
+  author one node per section, and never chain whole-document nodes (a chain
+  re-emits and duplicates the document).
+- Author that node's BRIEF yourself: the goal, the deliverable file name, the format
+  specialization to bind, and a NON-EMPTY source_ids list naming every [S#] from the
+  SOURCE INDEX whose facts the document uses (never source_ids: []). Ground every
+  part in a listed source: a part with no supporting source is dropped or marked
+  UNSUPPORTED in one line, never invented; every citation carries a real [S#] or its
+  URL — never a worded stand-in such as '[Source Placeholder]', 'Source URL for X',
+  'TBD' or similar filler. Do not plan a 'sources to be added later' section.
+- EXACTLY ONE 'final_review' node (role 'reviewer') that depends_on the write node,
+  briefed by you the same way — with the SAME format specialization and the SAME
+  source grounding the writer received: a reviewer reviews against the specs its
+  worker wrote to, reads the finished file itself, fixes grounded defects in place,
+  and reports an honest final status.
+Author these two nodes and no others, then finalize the plan.
+"""

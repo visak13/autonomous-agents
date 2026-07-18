@@ -73,10 +73,11 @@ def test_compose_write_goal_is_tool_neutral():
     goal = _compose_write_goal("Write a report.", "report.html", "findings",
                                "SOURCES: [S1] ...")
     assert "file_write" not in goal, "the planner must NOT be told to author file_write nodes (B)"
-    # RP-1 (d319/d311): the engine 'CHAINED ... depends_on' topology framing is RETIRED — the
-    # planner authors topology by reasoning over the write shape; the source_ids assignment
-    # guidance (grounding, not structure) stays.
-    assert "source_ids" in goal
+    # P5: the goal is DATA only; the source_ids assignment strategy now rides the
+    # write-file SHAPE's decompose_methodology (planner-only strategy layer).
+    from chat_app.agentic import _WRITE_FILE_SHAPE
+    assert "source_ids" in getattr(_WRITE_FILE_SHAPE, "decompose_methodology", "")
+    assert "source_ids" not in goal
 
 
 def test_write_file_shape_description_is_tool_neutral():

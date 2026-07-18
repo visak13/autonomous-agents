@@ -1,23 +1,24 @@
-"""TARGET-ARTIFACT acceptance gate (autonomy rebuild P2 — the Gate-2e lesson).
+"""CoT-autonomy P3 — the TARGET-ARTIFACT bounce-gate is DELETED (owner ruling:
+no babysitting; no engine turn ever re-prompts the model's conclusion).
 
-A node whose plan declared a deliverable FILE (``deliverable_path`` — model-named
-DATA stamped by the write phase, never an engine regex) must not conclude as if it
-delivered when it never wrote the file. Live Gate-2e: the one-node write plan
-answered turn 1 with the whole document as PROSE — never loaded the file bundle —
-and the run then shipped a STALE file from a previous session as the artifact.
+What remains here:
+* the finish-reason parse-to-read contract (a finish call's model-authored reason is
+  the node output, never the raw tool-call JSON),
+* the plain-worker path (one prose turn, no spurious tool use),
+* self-policing that the gate stays deleted.
 
-The gate is the same KEEP-class as the no-fab GATHER-MORE gate: it verifies a
-planner-declared postcondition with an actionable TOOL error observation; it never
-edits or composes the model's bytes; it is bounded (on exhaustion the prose stands
-and persistence reports honestly that no file was produced).
+Delivery honesty now lives DOWNSTREAM: the persistence-side staleness guard (unchanged
+bytes ⇒ no artifact), the truthful ``plan_chain.deliverable_bytes`` trace attr, and the
+reviewer node reading the real file.
 """
 
 import asyncio
+import inspect
 
 from llm_framework.transport import ChatResult
 
 from agent_runtime.factory import PlanNode
-from agent_runtime.runtime import SubAgent, _TARGET_GATE_MAX
+from agent_runtime.runtime import SubAgent
 
 
 class _FileHook:
@@ -57,70 +58,6 @@ def _write_node(task: str = "Write the report.\n\nWrite to the file 'report.html
     return PlanNode(id="n1", task=task, role="worker")
 
 
-def test_prose_only_conclusion_is_bounced_then_write_is_accepted():
-    """Turn-1 prose on a deliverable node bounces with an actionable tool error;
-    after a real file_write lands on the target, the conclusion is accepted."""
-    hook = _FileHook()
-    transport = _Script([
-        "<!DOCTYPE html><html>the whole report as prose</html>",   # bounced
-        '{"tool": "get_bundles", "args": {"name": "file"}}',
-        '{"tool": "file_write", "args": {"path": "report.html", "content": "<!DOCTYPE html>..."}}',
-        "Report written to report.html.",                          # accepted
-    ])
-    agent = SubAgent(
-        _write_node(), transport=transport, hook=hook,
-        deliverable_path="report.html",
-    )
-    out = asyncio.run(agent.run({}))
-    assert "file_write" in hook.calls
-    assert "Report written" in (out.output or "")
-    # the bounce really happened (4 turns consumed, not 1)
-    assert transport.calls == 4
-
-
-def test_gate_error_names_the_declared_target_and_the_file_bundle():
-    hook = _FileHook()
-    seen: list[list] = []
-
-    class _Spy(_Script):
-        def chat(self, messages, **opts):
-            seen.append([m for m in messages])
-            return super().chat(messages, **opts)
-
-    transport = _Spy([
-        "prose conclusion without any write",   # bounced → error observation
-        '{"tool": "get_bundles", "args": {"name": "file"}}',
-        '{"tool": "file_write", "args": {"path": "report.html", "content": "x"}}',
-        "done.",
-    ])
-    agent = SubAgent(
-        _write_node(), transport=transport, hook=hook,
-        deliverable_path="report.html",
-    )
-    asyncio.run(agent.run({}))
-    # the SECOND call's history carries the gate observation as a TOOL turn
-    flat = "\n".join(str(m) for m in seen[1])
-    assert "report.html" in flat
-    assert "get_bundles" in flat and "file_write" in flat
-    assert "NOT saved to disk" in flat
-
-
-def test_gate_is_bounded_and_salvages_the_prose_on_exhaustion():
-    """A model that never writes is bounced _TARGET_GATE_MAX times, then its prose
-    stands (honest downstream: persistence sees no fresh file and drops the artifact)."""
-    hook = _FileHook()
-    prose = "the report as prose, never written to disk"
-    transport = _Script([prose] * (_TARGET_GATE_MAX + 1))
-    agent = SubAgent(
-        _write_node(), transport=transport, hook=hook,
-        deliverable_path="report.html",
-    )
-    out = asyncio.run(agent.run({}))
-    assert hook.calls == []                          # nothing was ever written
-    assert transport.calls == _TARGET_GATE_MAX + 1   # bounded, no infinite loop
-    assert prose in (out.output or "")               # prose salvaged, not discarded
-
-
 def test_finish_reason_becomes_the_findings_not_the_call_json():
     """A finish tool call's model-authored reason is the node output (parse-to-read);
     the raw tool-call JSON syntax must not leak as the findings (live Gate-2f wart)."""
@@ -138,8 +75,25 @@ def test_finish_reason_becomes_the_findings_not_the_call_json():
     assert (out.output or "").strip() == "Report authored and written to report.html."
 
 
-def test_no_deliverable_node_is_untouched_by_the_gate():
-    """A plain worker (no declared deliverable) still answers in ONE prose turn."""
+def test_prose_conclusion_is_accepted_unbounced_even_with_a_declared_target():
+    """P3: a node with a declared deliverable that concludes in prose is ACCEPTED on
+    that turn — no engine bounce. The dishonesty is surfaced downstream (staleness
+    guard / deliverable_bytes), never by re-prompting the model."""
+    hook = _FileHook()
+    prose = "the report as prose, never written to disk"
+    transport = _Script([prose])
+    agent = SubAgent(
+        _write_node(), transport=transport, hook=hook,
+        deliverable_path="report.html",
+    )
+    out = asyncio.run(agent.run({}))
+    assert transport.calls == 1          # ONE turn — no bounce, no re-prompt
+    assert hook.calls == []              # nothing was written (honest downstream)
+    assert prose in (out.output or "")
+
+
+def test_no_deliverable_node_is_untouched():
+    """A plain worker (no declared deliverable) answers in ONE prose turn."""
     hook = _FileHook()
     transport = _Script(["Hello! How can I help you today?"])
     agent = SubAgent(
@@ -150,3 +104,32 @@ def test_no_deliverable_node_is_untouched_by_the_gate():
     assert transport.calls == 1
     assert hook.calls == []
     assert "How can I help" in (out.output or "")
+
+
+def test_bounce_gates_stay_deleted():
+    """Self-policing: no gate state or bounce constants return to the loop."""
+    src = inspect.getsource(SubAgent._run_research_loop)
+    for gone in ("target_gate", "note_gate", "gather_more",
+                 "_RESEARCH_GATHER_MORE", "_RESEARCH_NOTE_GATE"):
+        assert gone not in src, f"{gone} must stay deleted from the loop (P3)"
+
+
+def test_lenient_recovery_dispatches_a_big_content_call_with_one_bad_escape():
+    """P6 channel robustness: an unambiguous tool-shaped reply whose multi-KB content
+    string breaks strict JSON (bad escape / missing outer brace) is recovered VERBATIM
+    and dispatched — the model's own bytes, nothing composed."""
+    from agent_runtime.runtime import _lenient_content_call
+
+    BS = chr(92)
+    raw = (
+        '{"tool": "file_write", "args": {"append": false, "content": '
+        '"<!DOCTYPE html>' + BS + 'n<p>a ' + BS + 'x bad escape and a '
+        + BS + '"quote' + BS + '"</p>", "path": "r.html"}'  # missing outer brace too
+    )
+    r = _lenient_content_call(raw)
+    assert r is not None
+    tool, args = r
+    assert tool == "file_write"
+    assert args["path"] == "r.html" and args["append"] is False
+    assert '<p>a ' + BS + 'x bad escape and a "quote"</p>' in args["content"]
+    assert "\n" in args["content"]  # standard escapes decoded

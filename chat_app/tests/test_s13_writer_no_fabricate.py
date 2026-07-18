@@ -74,11 +74,15 @@ def test_compose_write_goal_carries_no_fabricate_clause():
         outline_hint=_OUTLINE,
     )
     low = goal.lower()
-    assert "ground every section" in low
-    assert "unsupported" in low
-    assert "do not" in low and "from memory" in low
-    assert "placeholder" in low
-    # outline-as-primary clause is present (composes with the no-fabricate clause)
+    # P5: grounding strategy moved to the write-file SHAPE methodology (planner-only).
+    from chat_app.agentic import _WRITE_FILE_SHAPE
+    meth = getattr(_WRITE_FILE_SHAPE, "decompose_methodology", "").lower()
+    assert "ground every" in meth and "never invented" in meth
+    assert "unsupported" in meth
+    assert "placeholder" in meth
+    # the GOAL itself is data only (P5): no strategy prose rides it
+    assert "ground every section" not in low
+    # outline-as-primary clause is present (grounding DATA, not strategy)
     assert "PRIMARY" in goal
 
 
@@ -88,5 +92,6 @@ def test_compose_write_goal_empty_outline_still_has_no_fabricate_and_no_scaffold
     goal = _compose_write_goal(
         "topic", "out.md", "findings", "", outline_hint=[],
     )
-    assert "ground every section" in goal.lower()
+    from chat_app.agentic import _WRITE_FILE_SHAPE as _wfs
+    assert "never invented" in getattr(_wfs, "decompose_methodology", "").lower()
     assert "PRIMARY scaffold" not in goal

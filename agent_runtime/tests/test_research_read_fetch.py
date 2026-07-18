@@ -178,7 +178,7 @@ def test_fetch_cap_is_a_non_flow_bound():
     )
     res = asyncio.run(agent.run({}))
     assert hook.fetches == [_URLS[0]]  # the 2nd fetch was capped, never invoked
-    assert "fetch limit (1) reached" in _full_convo(transport).lower()
+    assert "web_fetch refused [fetch_limit]" in _full_convo(transport)  # P3 fact-only
     assert res.tool_value["fetched_count"] == 1
 
 
@@ -352,7 +352,7 @@ def test_fabricated_or_placeholder_fetch_url_is_rejected_and_regrounds():
     assert hook.fetches == [_URLS[0]]
     convo = _full_convo(transport)
     # the role:tool error fired for the ungrounded attempts and surfaced the real candidates
-    assert "was NOT in the search results" in convo
+    assert "[ungrounded_url]" in convo  # P3: tool-layer refusal fact + error_kind
     assert _URLS[0] in convo
     # capture LANDS once the model grounds on a real url (the d186 fix's whole point)
     assert res.tool_value["fetched_count"] == 1
@@ -400,23 +400,15 @@ def test_gather_lands_sources_and_notes():
 # The gate forces a note to LAND for each fetched-but-un-noted source before findings are
 # accepted, bounded so an unwilling model cannot loop and never discarding real findings.
 # --------------------------------------------------------------------------- #
-def test_note_gate_forces_a_note_for_an_un_noted_fetched_source():
-    """The model fetches a source then jumps STRAIGHT to findings without noting it. The
-    NOTE GATE pushes it back to record THAT source's note first; once the note lands the
-    findings are accepted. Proves a structured note LANDS per fetched source (>0), not the
-    notes=0 the live trace showed."""
+def test_findings_without_a_note_are_accepted_unbounced():
+    """CoT-autonomy P3 (owner ruling): the NOTE GATE is DELETED — a model that fetches a
+    source and concludes without noting it is ACCEPTED on that turn; no engine re-prompt.
+    Note discipline lives in the note tool description + research doctrine (knowledge),
+    and a notes=0 gather surfaces honestly in the trace attrs."""
     hook = _FakeHook()
     transport = _ScriptedTransport([
         '{"tool": "web_search", "args": {"query": "world summit"}}',
         '{"tool": "web_fetch", "args": {"url": "https://news.example.com/world"}}',
-        # the live failure: findings WITHOUT a note for the source just read
-        "FINDINGS: a summit reached an accord (https://news.example.com/world).",
-        # the gate pushed back → the model now records the missing note
-        '{"tool": "note", "args": {"url": "https://news.example.com/world", '
-        '"summary": "a summit reached an accord", '
-        '"key_claims": ["the summit reached an accord"], '
-        '"gaps_or_followups": ["economic terms not yet confirmed"]}}',
-        # now every read source has a note → findings are accepted
         "FINDINGS: a summit reached an accord (https://news.example.com/world).",
     ])
     agent = SubAgent(
@@ -425,63 +417,13 @@ def test_note_gate_forces_a_note_for_an_un_noted_fetched_source():
         call_opts={"think": False, "temperature": 0},
     )
     res = asyncio.run(agent.run({}))
-
-    convo = _full_convo(transport)
-    # the gate fired: the model was told its read source was still un-noted (role:'user')
-    assert "have NOT recorded its note yet" in convo
-    # the note LANDED (the whole point) — the gap lane / write substrate is non-empty
-    assert res.tool_value["fetched_count"] == 1
-    assert res.tool_value["article_notes"]
-    assert res.tool_value["article_notes"][0]["gaps_or_followups"] == [
-        "economic terms not yet confirmed"
-    ]
-    # the findings still stand (the gate adds a note turn, it does not drop the answer)
+    # 4 calls = the auto-prepended get_bundles load + the 3 scripted turns;
+    # no fifth (bounce) turn was ever injected (P3).
+    assert len(transport.calls) == 4
     assert "summit reached an accord" in (res.output or "")
-
-
-def test_note_gate_is_bounded_and_never_discards_findings():
-    """A model that REFUSES to note (keeps emitting findings) is gated only a BOUNDED number
-    of times, then its findings are accepted from the salvaged emission — the gate can never
-    loop forever nor cost the model its real findings. With fetch_cap=1 the bound is
-    max(2, 1) == 2, so the loop terminates well inside the turn ceiling."""
-    hook = _FakeHook()
-    transport = _ScriptedTransport([
-        '{"tool": "web_search", "args": {"query": "world summit"}}',
-        '{"tool": "web_fetch", "args": {"url": "https://news.example.com/world"}}',
-        # the model keeps answering without ever noting; the gate fires twice then yields
-        "FINDINGS attempt one, no note.",
-        "FINDINGS attempt two, still no note.",
-        "FINDINGS attempt three, accepted.",
-        # extra turns must NOT be needed — if the loop asks again the script falls back
-    ])
-    agent = SubAgent(
-        _ws_node(), transport=transport, hook=hook,
-        read_search_max_fetch=1, emit_article_notes=True,
-        call_opts={"think": False, "temperature": 0},
-    )
-    res = asyncio.run(agent.run({}))
-
     convo = _full_convo(transport)
-    # the gate DID fire (bounded), surfacing the un-noted source
-    assert "have NOT recorded its note yet" in convo
-    # it terminated with the model's own findings, not the FALLBACK salvage or an empty answer
-    assert "FINDINGS attempt" in (res.output or "")
-    assert "FALLBACK FINDINGS" not in (res.output or "")
-    # no note was ever recorded (the model refused) → the notes lane is simply empty, not looping
-    assert res.tool_value["fetched_count"] == 1
-    assert "article_notes" not in res.tool_value
+    assert "have NOT recorded its note" not in convo  # the gate text is gone
 
-
-# --------------------------------------------------------------------------- #
-# s16/SA-3 (d263, refines d229) — PINNED-REBROADCAST REMOVAL. The failed pinned-head +
-# SWA-tail re-injection (which re-pasted the goal + bundle doctrine + task as always-in-
-# view blocks every turn) is REMOVED. The research DOCTRINE now rides the ``get_bundles``
-# LOAD observation EXACTLY ONCE (delivered in-band when the node self-selects the bundle,
-# carried forward by the convo window), is NEVER re-pasted into the per-turn task, and
-# there is NO pinned-head / SWA-tail block anywhere. The goal rides convo[0] ONCE and the
-# SHAPING system rides ``Context(system=…)`` ONCE — none re-pasted per turn. Proven on a
-# REAL prompt build, with the research loop still firing search → fetch → findings.
-# --------------------------------------------------------------------------- #
 class _CapturingTransport(_ScriptedTransport):
     """A scripted transport that ALSO records the FULL message list of every chat call,
     so a test can inspect the real assembled prompt (system + turns)."""
@@ -498,7 +440,7 @@ class _CapturingTransport(_ScriptedTransport):
 # A phrase that lives ONLY in the full research loop instruction (RESEARCH_LOOP_INSTRUCTION),
 # never in the bundle's short catalog summary — so counting it across the whole prompt counts
 # the DOCTRINE itself.
-_DOCTRINE_PHRASE = "Workflow: search the topic"
+_DOCTRINE_PHRASE = "WEB EVIDENCE GATHERING"  # P4: the slimmed bundle doctrine's unique head
 
 # Retired markers (d263): no pinned head, no SWA tail, ever again.
 _RETIRED_MARKERS = ("[Pinned context", "[Active context", "never lose sight", "REMINDER — stay")
@@ -560,9 +502,12 @@ def test_research_doctrine_rides_load_obs_once_no_pin_no_repaste():
         "the per-turn task message must NOT re-paste the research doctrine"
     )
     # the per-turn task DID keep the per-RUN operational fetch-cap bound (not the doctrine)
-    assert "up to 5 of the source URLs" in str(task_turn.get("content", "")), (
-        "the concrete per-run fetch cap should still reach the model on the task turn"
+    # P3/promptlab: the fetch cap now rides the research-bundle LOAD ack (the
+    # moment of relevance), never the per-brief task turn.
+    assert "Web fetch budget this task: 5" in whole, (
+        "the concrete per-run fetch cap should ride the research LOAD observation"
     )
+    assert "web fetches" not in str(task_turn.get("content", ""))
 
 
 def test_system_composed_once_goal_sent_once_across_turns():
@@ -675,5 +620,5 @@ def test_research_loop_self_selects_before_gathering():
     # the premature search NEVER reached the hook; only the post-load one did.
     assert hook.searches == ["world summit accord"]
     convo = _full_convo(transport)
-    assert "have not loaded the tool 'web_search'" in convo  # the self-select nudge fired
+    assert "'web_search' is not loaded" in convo  # the unloaded-tool FACT fired (P2)
     assert "summit reached an accord" in (res.output or "")
