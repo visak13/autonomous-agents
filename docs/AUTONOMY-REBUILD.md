@@ -209,3 +209,52 @@ in live batches using the thinking channel in traces.
    (pre-refactor: US-Iran mean 6,015 prompt tokens/call; Maratha mean 9,173).
 4. Open judgment calls to validate: the source-id per-turn directive retirement;
    the placeholder-filler tendency under one-shot writes.
+
+
+## Live validation results (2026-07-23, GPU restored)
+
+**Module batches** (zero-failure bar; each earlier failure produced a text-layer or
+channel fix, never an engine nudge):
+
+| Module | Final score | Journey |
+|---|---|---|
+| write | **5/5** | 2/5 → 4/5 → 5/5 (lenient tool-call recovery + junk/fence normalization; the memory-binding harness bug) |
+| review | **3/3** | first try |
+| plan_author | **3/3 with ZERO directives** | 0/3 → 3/3 (S-prefixed source-id parsing); then re-proven with the per-turn source-id directive DELETED — write strategy is 100% shape-owned |
+| gather | **3/4** | 0/4 → 3/4 (traceability clause, finish-description contract, note-knowledge in doctrine; grader re-scoped to SYSTEM traceability per the pull architecture) — residual: ~1 in 4 runs concludes via a one-line finish instead of full findings; disclosed, not gated |
+
+**Live Gate B — full pipeline, twice:**
+
+*Run 1 (Ottoman decline, 25.9 min, 106 calls):* PASS. Research → briefed review node
+(2,785 chars of model prose) → write plan (worker + same-spec reviewer) → the FLAGSHIP
+moment: the write reviewer honestly reported "structurally sound but appears
+incomplete (cuts off mid-section)… lacks specific source citations", and
+`decide_followup` — overriding its `done` default — ordered a second write plan, which
+completed the document; only then did the planner conclude. A self-correcting
+plan→review→re-plan loop driven purely by model-authored signals, with every bounce-
+gate deleted. Fresh 11.3 KB artifact, 6/6 citations grounded, chat turn = 347-char
+summary + download card, ZERO retired steering strings in the trace. Wart: the
+document opens without `<!DOCTYPE html>` (we ship exactly what the model wrote).
+
+*Run 2 (quantum error correction, 28.0 min, 113 calls):* PARTIAL. Pipeline mechanics
+held (review node 4,731 chars; 8/8 citations grounded; zero retired strings) but the
+write phase misfired: the writer wrote to its own filename (`body.md`) instead of the
+declared deliverable, duplicated the document shell (two doctypes), and the second
+write plan's reviewer emitted document text instead of a status. The honesty machinery
+did its job: `deliverable_bytes=0`, the staleness guard shipped nothing stale, and the
+chat turn honestly fell back to node output. Defects recorded for the next campaign:
+deliverable-name adherence, shell re-emission on continuation, reviewer role
+adherence in second-pass write plans.
+
+**Token economy vs the pre-refactor baseline:** run 1 mean 8,230 prompt tokens/call
+(106 calls), run 2 mean 6,986 (113 calls), vs baseline 6,015 (123 calls, US-Iran) and
+9,173 (99 calls, Maratha). Roughly parity per call — the system turn grew by the
+operating protocol while per-turn steering tails shrank — but wall-clock dropped
+sharply (26–28 min vs 36–82 min pre-refactor) with the model doing MORE (a briefed
+review node and self-corrective second write passes now happen inside that time).
+
+**Verdict:** the CoT-autonomy contract is live end to end — the model's own reasoning
+sequences the work, engine text is data-only, and quality control happens through
+model-authored review signals, demonstrated self-correcting in run 1. Open items are
+model-behavior residuals (gather's occasional one-line finish; run 2's filename and
+shell-duplication class), all visible in traces and none papered over by code.
