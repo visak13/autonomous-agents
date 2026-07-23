@@ -213,6 +213,16 @@ class PlanNode:
             raw_sids = (raw_sids,)
         clean_sids: list[int] = []
         for s in raw_sids:
+            # PARSE-TO-READ (CoT-autonomy, live plan_author catch): the prompts DISPLAY
+            # sources as [S1]/[S2], so the planner reasonably echoes "S1" — an
+            # unambiguous reference to source 1. Accept the S-prefixed form; a value
+            # that is neither an int nor S<int> is still dropped.
+            if isinstance(s, str):
+                st = s.strip().strip("[]")
+                if st[:1] in ("S", "s") and st[1:].isdigit():
+                    s = st[1:]
+                else:
+                    s = st
             try:
                 v = int(s)
             except (TypeError, ValueError):

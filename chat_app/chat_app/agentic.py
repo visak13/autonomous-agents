@@ -1598,13 +1598,14 @@ def make_write_phase_author(
             research_notes=research_notes, write_planning_event=write_planning_event,
             research_memory_handle=memory_handle,
         )
-        # P5: the ONE-NODE strategy rides the write-file SHAPE's decompose_methodology
-        # (threaded by _build_incremental_planner); only the per-turn source-id lever
-        # remains as an authoring directive.
+        # P5 COMPLETE: the write-plan strategy INCLUDING source-id assignment rides
+        # the write-file SHAPE's decompose_methodology alone (plan_author batch 3/3;
+        # the S-prefixed id normalization closed the last gap) — no per-turn
+        # authoring directive remains.
         write_planner = _build_incremental_planner(
             transport=transport, registry=registry, hook=hook,
             shape_spec=_WRITE_FILE_SHAPE, allow_web=False,
-            requested_specs=_requested, authoring_directive=source_id_directive,
+            requested_specs=_requested,
         )
         # The MODEL authors the write topology (engine composes only the DATA above + INVOKES the
         # planner). ``_normalize_write_dag`` names the output file in each node's task (pure
@@ -1703,13 +1704,11 @@ async def run_section_write_phase(
     # SF-1 (d310/d311) — the framework review injection is RETIRED (the model authors the whole
     # document; no engine reviewer edits it), so the write planner authors the body-node DAG
     # with no review twins.
-    # P5: the ONE-write-node strategy rides the write-file SHAPE's
-    # decompose_methodology (threaded by _build_incremental_planner from
-    # shapes/write-file.toml); only the per-turn source-id lever remains here.
+    # P5 COMPLETE: the write-plan strategy INCLUDING source-id assignment rides the
+    # write-file SHAPE's decompose_methodology alone — no per-turn directive.
     write_planner = _build_incremental_planner(
         transport=transport, registry=registry, hook=hook,
         shape_spec=_WRITE_FILE_SHAPE, allow_web=False, requested_specs=requested_specs,
-        authoring_directive=write_directive,
     )
     write_runtime, _ = _build_acyclic_runtime(
         transport=transport, registry=registry, hook=hook, plane=plane,

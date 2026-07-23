@@ -37,10 +37,11 @@ FINISH_TOOL = "finish"
 
 _FINISH_SPEC: dict[str, Any] = make_tool_spec(
     "finish",
-    "Signal this task is COMPLETE. Call it only AFTER you have produced the "
-    "deliverable / finding and confirmed the REAL result (read back what you wrote, "
-    "or the observations you actually gathered) — never from memory of what you "
-    "intended. Give a one-line reason.",
+    "Signal this task is COMPLETE. Call it only AFTER your work product actually "
+    "exists — a file written and confirmed by reading it back, or your full "
+    "findings/answer already stated as prose in a reply. finish's reason is a "
+    "one-line receipt, NEVER a substitute for the product: for a prose task, "
+    "state the complete findings first, then finish.",
     {"reason": {"type": "string"}},
     [],
 )

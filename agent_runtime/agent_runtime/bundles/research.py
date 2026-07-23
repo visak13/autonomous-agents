@@ -63,7 +63,11 @@ RESEARCH_LOOP_INSTRUCTION = (
     "Only a URL a search actually returned will load — a URL from memory is rejected "
     "as ungrounded, so copy fetch URLs exactly from the results. A search listing is "
     "not evidence: the facts come from sources you actually read. Never rely on a "
-    "page you have not fetched, and never invent facts, figures or URLs."
+    "page you have not fetched, and never invent facts, figures or URLs. A "
+    "structured NOTE recorded per read source is how learning persists: the note "
+    "store keeps each source's canonical URL and open gaps, so your findings stay "
+    "traceable and the next round knows what is unsettled — a read source without "
+    "a note leaves nothing behind."
 )
 
 # d191 — the template-then-grow-out flavor that distinguishes the research bundle. Added

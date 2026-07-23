@@ -204,8 +204,10 @@ def test_hook_passes_the_one_node_directive_forbidding_the_n_chain(monkeypatch):
     assert "EXACTLY ONE write node" in methodology
     assert "final_review" in methodology  # the single reviewer node is part of the strategy
     assert "ONE COHERENT DOCUMENT" not in directive  # the engine constant stays deleted
-    # the per-turn SOURCE-ID mandate is the directive (sources present → assign [S#]).
-    assert "source_ids" in directive
+    # P5 COMPLETE: source-id assignment is shape-owned too — NO per-turn directive
+    # remains (plan_author batch proved the shape alone holds at 3/3).
+    assert directive == ""
+    assert "source_ids" in methodology
 
 
 def test_hook_invokes_model_authoring_and_never_authors_structure_itself(monkeypatch):

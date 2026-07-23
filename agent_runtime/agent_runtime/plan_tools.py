@@ -186,6 +186,16 @@ def _clean_source_ids(raw: Any) -> list[int]:
         return []
     out: list[int] = []
     for s in raw:
+        # PARSE-TO-READ (CoT-autonomy, live plan_author catch): prompts DISPLAY
+        # sources as [S1]/[S2], so the model reasonably echoes "S1" — an unambiguous
+        # reference to source 1. Accept the S-prefixed form (mirrors PlanNode's own
+        # normalization); anything else non-int is still dropped.
+        if isinstance(s, str):
+            st = s.strip().strip("[]")
+            if st[:1] in ("S", "s") and st[1:].isdigit():
+                s = st[1:]
+            else:
+                s = st
         try:
             v = int(s)
         except (TypeError, ValueError):

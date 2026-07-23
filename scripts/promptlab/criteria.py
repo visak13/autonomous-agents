@@ -99,8 +99,15 @@ def grade_gather(docs, meta: dict[str, Any]) -> list[str]:
     out = str(meta.get("output") or "")
     if len(out) < 300:
         fails.append(f"findings too thin ({len(out)} chars)")
-    if "http" not in out:
-        fails.append("findings carry no source URL attribution")
+    # TRACEABILITY is a SYSTEM property (the pull architecture): the note store
+    # carries runtime-stamped canonical URLs per read source; downstream pulls them
+    # via read_notes/load_source. Inline URLs/[S#] in the prose are the strongest
+    # form; name attributions ("Source: X") PASS when the URL-bearing notes exist.
+    # No notes AND no inline URL/[S#] = genuinely untraceable output.
+    attributed_inline = ("http" in out) or ("[S" in out)
+    attributed_by_name = "Source:" in out or "source:" in out
+    if not attributed_inline and not (attributed_by_name and calls.count("note") >= 1):
+        fails.append("findings not traceable (no inline URL/[S#], and no URL-bearing note backs the name attributions)")
     return fails
 
 

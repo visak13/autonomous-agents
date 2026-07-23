@@ -404,6 +404,18 @@ def _lenient_content_call(raw: str) -> Optional[tuple[str, dict]]:
     unescape. The recovered bytes are the model's own — nothing is composed or fixed;
     this is the tool channel accepting its own format leniently, like any real
     function-calling runtime. Returns None when the shape is not unambiguous."""
+    # NORMALIZE channel junk first (live failure modes): a markdown fence around
+    # the call, and trailing non-JSON tokens after the close — e.g. a stray ')'
+    # (the model writes pythonic call syntax tails on big calls).
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = raw.lstrip("`").lstrip()
+        if raw[:4].lower() == "json":
+            raw = raw[4:]
+        raw = raw.rstrip("`").rstrip()
+    # XML-ish channel wrappers (live variant: the reply ends '})</tool_call>').
+    raw = re.sub(r"^<[a-zA-Z_]+>\s*", "", raw)
+    raw = re.sub(r"(\s*</?[a-zA-Z_]+>\s*|[)\];`\s])+$", "", raw)
     # The trailing close tolerates a MISSING outer brace (a live failure mode: the
     # model truncates the final '}' on a multi-KB call).
     m = re.match(
